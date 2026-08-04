@@ -9,13 +9,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements & install dependencies
-COPY pyproject.toml .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -e .
+# Upgrade pip and build tools
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# Copy application source code
+# Copy application source code & install (using CPU PyTorch for lightweight gateway/registry container)
 COPY . .
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir .
 
 # Expose HTTP port
 EXPOSE 8000

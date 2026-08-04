@@ -1,0 +1,9 @@
+.git
+.gitignore
+models/
+notebooks/
+benchmarks/results/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
