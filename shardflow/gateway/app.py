@@ -256,6 +256,18 @@ async def startup_event():
             logger.warning("Could not auto-initialize Orchestrator on startup (waiting for active nodes): %s", e)
 
 
+@app.get("/")
+def read_root():
+    return {
+        "service": "ShardFlow OpenAI-Compatible API Gateway",
+        "status": "online",
+        "version": "0.1.0",
+        "docs_url": "/docs",
+        "health_url": "/health",
+        "metrics_url": "/metrics",
+    }
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "orchestrator_ready": _orchestrator is not None}
