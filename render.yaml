@@ -1,0 +1,26 @@
+services:
+  # 1. Topology Registry Service
+  - type: web
+    name: shardflow-registry
+    env: docker
+    dockerfilePath: Dockerfile
+    dockerCommand: uvicorn shardflow.registry.app:app --host 0.0.0.0 --port $PORT
+    plan: free
+    healthCheckPath: /topology
+
+  # 2. OpenAI API Gateway Service
+  - type: web
+    name: shardflow-gateway
+    env: docker
+    dockerfilePath: Dockerfile
+    dockerCommand: uvicorn shardflow.gateway.app:app --host 0.0.0.0 --port $PORT
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: SHARDFLOW_REGISTRY_URL
+        fromService:
+          type: web
+          name: shardflow-registry
+          property: host
+      - key: SHARDFLOW_MODEL_PATH
+        value: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"

@@ -234,6 +234,28 @@ async def cancel_session(session_id: str):
     raise HTTPException(status_code=503, detail="Orchestrator not ready")
 
 
+@app.on_event("startup")
+async def startup_event():
+    """Auto-initialize orchestrator if environment variables are set."""
+    global _orchestrator
+    import os
+    registry_url = os.getenv("SHARDFLOW_REGISTRY_URL")
+    model_path = os.getenv("SHARDFLOW_MODEL_PATH", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    if _orchestrator is None and registry_url:
+        logger.info("Auto-initializing Orchestrator from environment (Registry: %s, Model: %s)", registry_url, model_path)
+        try:
+            orch = Orchestrator(
+                model_path=model_path,
+                registry_url=registry_url,
+                device="cpu",
+            )
+            await orch.initialize()
+            set_orchestrator(orch)
+            logger.info("Orchestrator successfully initialized on startup.")
+        except Exception as e:
+            logger.warning("Could not auto-initialize Orchestrator on startup (waiting for active nodes): %s", e)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "orchestrator_ready": _orchestrator is not None}

@@ -1,0 +1,24 @@
+# ShardFlow System Configuration
+
+model:
+  path: "./models/TinyLlama-1.1B-Chat-v1.0"
+  dtype: "bfloat16"
+
+registry:
+  host: "0.0.0.0"
+  port: 8001
+  ttl: 30.0
+
+gateway:
+  host: "0.0.0.0"
+  port: 8000
+
+node:
+  listen_host: "0.0.0.0"
+  listen_port: 9000
+  kv_timeout: 60.0
+  max_sessions: 32
+
+orchestrator:
+  device: "cpu"
+  recv_timeout: 120.0

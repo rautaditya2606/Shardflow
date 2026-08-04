@@ -1,0 +1,30 @@
+{
+  "model": "./models/TinyLlama-1.1B-Chat-v1.0",
+  "num_nodes": 2,
+  "device": "cpu",
+  "num_runs": 3,
+  "avg_tokens_per_second": 1.12,
+  "runs": [
+    {
+      "prompt": "Once upon a time",
+      "max_tokens": 20,
+      "generated_tokens": 21,
+      "duration_seconds": 17.544,
+      "tokens_per_second": 1.2
+    },
+    {
+      "prompt": "The secret to building scalable distributed systems is",
+      "max_tokens": 20,
+      "generated_tokens": 21,
+      "duration_seconds": 19.996,
+      "tokens_per_second": 1.05
+    },
+    {
+      "prompt": "In artificial intelligence, transformer models are",
+      "max_tokens": 20,
+      "generated_tokens": 21,
+      "duration_seconds": 19.175,
+      "tokens_per_second": 1.1
+    }
+  ]
+}

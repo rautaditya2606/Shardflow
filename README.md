@@ -134,12 +134,15 @@ curl http://localhost:8000/v1/chat/completions \
 
 ## Benchmark Results
 
-Using TinyLlama 1.1B split across 2 pipeline nodes:
+Using TinyLlama 1.1B split across 2 pipeline nodes on localhost:
 
-| Phase | Decode Strategy | Speed (tok/s) | Duration (20 tokens) |
+| Device | Framework / Strategy | Speed (tok/s) | Duration (20 tokens) |
 |---|---|---|---|
-| **Phase 1** | No KV Cache (O(n²) full sequence resend) | 0.1 tok/s | 258.5s |
-| **Phase 2+** | Per-Node `DynamicCache` Incremental Decode | **0.9 tok/s** | **23.0s (11x speedup)** |
+| **CPU** | No KV Cache (Phase 1) | 0.1 tok/s | 258.5s |
+| **CPU** | Initial DynamicCache baseline | 0.9 tok/s | 23.0s |
+| **CPU** | **Optimized ShardFlow** (DynamicCache + Zero-Copy) | **1.12 tok/s** | **18.7s** |
+| **RTX 3050 GPU** | Initial TCP Protocol baseline (64KB Logits Relay) | 1.8 tok/s | 11.75s |
+| **RTX 3050 GPU** | **Optimized ShardFlow** (GPU Sampling + Zero-Copy + `TCP_NODELAY`) | **23.0 tok/s** | **0.91s (13x speedup)** |
 
 ---
 

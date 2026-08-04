@@ -211,19 +211,24 @@ class Orchestrator:
                 msg_type=MessageType.ACTIVATION,
                 session_id=session_id,
                 tensor=hidden_states.cpu(),
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                sample_on_node=True,
             )
             response = await self._node0_client.send_recv(msg)
 
-        if response is None or response.msg_type != MessageType.LOGITS:
-            raise RuntimeError(f"Expected LOGITS from prefill, got {response.msg_type if response else 'None'}")
+        if response is None:
+            raise RuntimeError("No response from prefill phase")
 
-        logits = response.tensor[0, -1, :]  # [vocab_size]
-        next_token = sample_next_token(
-            logits,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-        )
+        if response.msg_type == MessageType.TOKEN_ID:
+            next_token = response.token_id
+        elif response.msg_type == MessageType.LOGITS:
+            logits = response.tensor[0, -1, :]
+            next_token = sample_next_token(logits, temperature=temperature, top_k=top_k, top_p=top_p)
+        else:
+            raise RuntimeError(f"Expected TOKEN_ID or LOGITS from prefill, got {response.msg_type}")
+
         generated_tokens.append(next_token)
 
         token_text = self.tokenizer.decode([next_token])
@@ -249,19 +254,21 @@ class Orchestrator:
                 msg_type=MessageType.ACTIVATION,
                 session_id=session_id,
                 tensor=hidden_states.cpu(),
-            )
-            response = await self._node0_client.send_recv(msg)
-
-            if response.msg_type != MessageType.LOGITS:
-                raise RuntimeError(f"Expected LOGITS, got {response.msg_type}")
-
-            logits = response.tensor[0, -1, :]  # [vocab_size]
-            next_token = sample_next_token(
-                logits,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
+                sample_on_node=True,
             )
+            response = await self._node0_client.send_recv(msg)
+
+            if response.msg_type == MessageType.TOKEN_ID:
+                next_token = response.token_id
+            elif response.msg_type == MessageType.LOGITS:
+                logits = response.tensor[0, -1, :]
+                next_token = sample_next_token(logits, temperature=temperature, top_k=top_k, top_p=top_p)
+            else:
+                raise RuntimeError(f"Expected TOKEN_ID or LOGITS, got {response.msg_type}")
+
             generated_tokens.append(next_token)
 
             token_text = self.tokenizer.decode([next_token])

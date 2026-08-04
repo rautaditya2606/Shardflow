@@ -20,6 +20,7 @@ import torch
 
 from shardflow.node.layer_loader import load_layer_slice, ModelSlice
 from shardflow.node.kv_cache import KVCacheStore
+from shardflow.orchestrator.sampler import sample_next_token
 from shardflow.transport.connection import NodeServer, NodeClient
 from shardflow.transport.protocol import (
     MessageType,
@@ -106,12 +107,11 @@ class PipelineNode:
         For CLEAR: evict KV cache for session_id.
         For ACTIVATION:
         - Run hidden states through local layers using cached KV
-        - If last node: return logits
-        - If not last: forward to next node, wait for logits, pass them back
+        - If last node: return sampled token ID (or logits if requested)
+        - If not last: forward to next node, wait for response, pass back
         """
         if msg.msg_type == MessageType.CLEAR:
             self.kv_store.evict(msg.session_id)
-            # Forward CLEAR to next node too (best-effort during shutdown/cleanup)
             if not self.is_last_node and self._next_client and self._next_client.is_connected:
                 try:
                     await self._next_client.send(msg)
@@ -124,25 +124,41 @@ class PipelineNode:
             return None
 
         # Process activation
-        hidden_states = msg.tensor.to(self.model_slice.device)
+        hidden_states = msg.tensor.to(self.model_slice.device, non_blocking=True)
         output = self._forward(hidden_states, session_id=msg.session_id)
 
         if self.is_last_node:
-            # Return logits back through the chain
-            return TensorMessage(
-                msg_type=MessageType.LOGITS,
-                session_id=msg.session_id,
-                tensor=output.cpu(),
-            )
+            if msg.sample_on_node:
+                logits = output[0, -1, :]
+                token_id = sample_next_token(
+                    logits,
+                    temperature=msg.temperature,
+                    top_k=msg.top_k,
+                    top_p=msg.top_p,
+                )
+                return TensorMessage(
+                    msg_type=MessageType.TOKEN_ID,
+                    session_id=msg.session_id,
+                    token_id=token_id,
+                )
+            else:
+                return TensorMessage(
+                    msg_type=MessageType.LOGITS,
+                    session_id=msg.session_id,
+                    tensor=output.cpu(),
+                )
         else:
-            # Forward to next node and wait for logits to pass back
             forward_msg = TensorMessage(
                 msg_type=MessageType.ACTIVATION,
                 session_id=msg.session_id,
                 tensor=output.cpu(),
+                temperature=msg.temperature,
+                top_k=msg.top_k,
+                top_p=msg.top_p,
+                sample_on_node=msg.sample_on_node,
             )
             response = await self._next_client.send_recv(forward_msg)
-            return response  # Pass logits back to the caller (orchestrator or prev node)
+            return response
 
     @torch.inference_mode()
     def _forward(self, hidden_states: torch.Tensor, session_id: str) -> torch.Tensor:

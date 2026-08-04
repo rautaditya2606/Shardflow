@@ -8,6 +8,7 @@ Provides:
 
 import asyncio
 import logging
+import socket
 from typing import Callable, Awaitable, Optional
 
 from shardflow.transport.protocol import (
@@ -67,22 +68,21 @@ class NodeServer:
         peer = writer.get_extra_info("peername")
         logger.info("New connection from %s", peer)
 
+        sock = writer.get_extra_info("socket")
+        if sock:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
         try:
             while True:
                 try:
                     msg = await recv_message(reader, timeout=self.recv_timeout)
                 except asyncio.TimeoutError:
-                    # No message in recv_timeout — connection is likely idle
-                    # Keep the connection alive, just loop
                     continue
                 except (asyncio.IncompleteReadError, ConnectionError):
                     logger.info("Connection closed by %s", peer)
                     break
 
-                # Dispatch to handler
                 response = await self.handler(msg)
-
-                # If handler returns a message, send it back (e.g., logits)
                 if response is not None:
                     await send_message(writer, response)
 
@@ -109,11 +109,6 @@ class NodeServer:
 class NodeClient:
     """
     Async TCP client for connecting to a pipeline node.
-
-    Used by:
-    - Orchestrator to send activations to Node 0
-    - Node N to send activations to Node N+1
-    - Orchestrator to receive logits from the final node
     """
 
     def __init__(
@@ -138,6 +133,9 @@ class NodeClient:
             asyncio.open_connection(self.host, self.port),
             timeout=self.send_timeout,
         )
+        sock = self._writer.get_extra_info("socket")
+        if sock:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._connected = True
         logger.info("Connected to %s:%d", self.host, self.port)
 
