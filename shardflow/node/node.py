@@ -254,6 +254,10 @@ def main():
     parser.add_argument("--next-host", default=None, help="Next node host (omit for last node)")
     parser.add_argument("--next-port", type=int, default=None, help="Next node port")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--registry-url", default=None, help="Topology Registry URL for auto-registration")
+    parser.add_argument("--public-host", default=None, help="Public address accessible by other nodes")
+    parser.add_argument("--public-port", type=int, default=None, help="Public port accessible by other nodes")
+    parser.add_argument("--node-id", default=None, help="Unique node identifier")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -273,6 +277,34 @@ def main():
         include_lm_head=is_last,
         device=args.device,
     )
+
+    # Optional Auto-Registration with Topology Registry
+    if args.registry_url:
+        import requests, uuid
+        node_id = args.node_id or f"node-{uuid.uuid4().hex[:6]}"
+        pub_host = args.public_host or args.host
+        pub_port = args.public_port or args.port
+        vram = 0.0
+        if torch.cuda.is_available():
+            vram = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
+        try:
+            resp = requests.post(
+                f"{args.registry_url.rstrip('/')}/register",
+                json={
+                    "node_id": node_id,
+                    "addr": pub_host,
+                    "port": pub_port,
+                    "layer_start": args.layer_start,
+                    "layer_end": args.layer_end,
+                    "vram_available_mb": vram,
+                    "vram_total_mb": vram,
+                },
+                timeout=5.0,
+            )
+            if resp.status_code in (200, 201):
+                logger.info("Registered node %s with registry at %s", node_id, args.registry_url)
+        except Exception as e:
+            logger.warning("Failed to register node with registry: %s", e)
 
     # Create and run node
     node = PipelineNode(
