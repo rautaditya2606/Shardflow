@@ -1,0 +1,246 @@
+"""
+Layer 2 — API Gateway (FastAPI)
+
+Exposes an OpenAI-compatible /v1/chat/completions endpoint.
+Delegates generation requests to the Inference Orchestrator.
+Supports standard JSON responses and SSE streaming (`stream=True`).
+Includes session cancellation endpoint DELETE /v1/sessions/{session_id}.
+"""
+
+import argparse
+import asyncio
+import json
+import logging
+import time
+import uuid
+from typing import Optional, AsyncGenerator
+
+from fastapi import FastAPI, HTTPException, status, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+
+from shardflow.gateway.schemas import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    Choice,
+    ChoiceMessage,
+    UsageInfo,
+    ChatCompletionChunk,
+    ChunkChoice,
+    DeltaMessage,
+)
+from shardflow.orchestrator.orchestrator import Orchestrator
+
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="ShardFlow OpenAI API Gateway",
+    description="OpenAI-compatible LLM endpoint for distributed inference across N nodes",
+    version="0.1.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global orchestrator reference
+_orchestrator: Optional[Orchestrator] = None
+
+
+def set_orchestrator(orchestrator: Orchestrator) -> None:
+    global _orchestrator
+    _orchestrator = orchestrator
+
+
+def _format_prompt(messages: list) -> str:
+    """Format messages list into a plain text prompt."""
+    prompt_parts = []
+    for msg in messages:
+        role = msg.role.lower()
+        content = msg.content.strip()
+        if role == "system":
+            prompt_parts.append(f"System: {content}\n")
+        elif role == "user":
+            prompt_parts.append(f"User: {content}\n")
+        elif role == "assistant":
+            prompt_parts.append(f"Assistant: {content}\n")
+    prompt_parts.append("Assistant:")
+    return "\n".join(prompt_parts)
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
+    """OpenAI-compatible chat completions endpoint."""
+    if _orchestrator is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Orchestrator not initialized or nodes not ready",
+        )
+
+    # Format messages to prompt string
+    if hasattr(_orchestrator.tokenizer, "apply_chat_template"):
+        try:
+            msg_dicts = [{"role": m.role, "content": m.content} for m in req.messages]
+            prompt = _orchestrator.tokenizer.apply_chat_template(
+                msg_dicts, tokenize=False, add_generation_prompt=True
+            )
+        except Exception:
+            prompt = _format_prompt(req.messages)
+    else:
+        prompt = _format_prompt(req.messages)
+
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created_ts = int(time.time())
+
+    # Handle streaming SSE response
+    if req.stream:
+        async def event_generator() -> AsyncGenerator[str, None]:
+            # Initial chunk with role
+            role_chunk = ChatCompletionChunk(
+                id=completion_id,
+                created=created_ts,
+                model=req.model,
+                choices=[ChunkChoice(index=0, delta=DeltaMessage(role="assistant"), finish_reason=None)],
+            )
+            yield f"data: {json.dumps(role_chunk.model_dump())}\n\n"
+
+            # Stream tokens
+            # We can capture tokens as orchestrator generates
+            # For streaming, we generate tokens incrementally
+            try:
+                # Custom async token yield generator calling orchestrator logic
+                session_id = str(uuid.uuid4())
+                input_ids = _orchestrator.tokenizer(prompt, return_tensors="pt")["input_ids"]
+                prompt_len = input_ids.shape[1]
+
+                hidden_states = _orchestrator._embed(input_ids)
+                from shardflow.transport.protocol import TensorMessage, MessageType
+                from shardflow.orchestrator.sampler import sample_next_token
+
+                msg = TensorMessage(
+                    msg_type=MessageType.ACTIVATION,
+                    session_id=session_id,
+                    tensor=hidden_states.cpu(),
+                )
+                response = await _orchestrator._node0_client.send_recv(msg)
+                logits = response.tensor[0, -1, :]
+                next_token = sample_next_token(logits, temperature=req.temperature, top_k=req.top_k, top_p=req.top_p)
+
+                token_text = _orchestrator.tokenizer.decode([next_token])
+                chunk = ChatCompletionChunk(
+                    id=completion_id,
+                    created=created_ts,
+                    model=req.model,
+                    choices=[ChunkChoice(index=0, delta=DeltaMessage(content=token_text), finish_reason=None)],
+                )
+                yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+
+                for _ in range(1, req.max_tokens):
+                    if next_token == _orchestrator.tokenizer.eos_token_id:
+                        break
+
+                    # Check client disconnect
+                    if await raw_request.is_disconnected():
+                        logger.info("Client disconnected during stream for session %s", session_id)
+                        break
+
+                    import torch
+                    token_ids = torch.tensor([[next_token]], dtype=torch.long)
+                    hidden_states = _orchestrator._embed(token_ids)
+                    msg = TensorMessage(
+                        msg_type=MessageType.ACTIVATION,
+                        session_id=session_id,
+                        tensor=hidden_states.cpu(),
+                    )
+                    response = await _orchestrator._node0_client.send_recv(msg)
+                    logits = response.tensor[0, -1, :]
+                    next_token = sample_next_token(logits, temperature=req.temperature, top_k=req.top_k, top_p=req.top_p)
+
+                    token_text = _orchestrator.tokenizer.decode([next_token])
+                    chunk = ChatCompletionChunk(
+                        id=completion_id,
+                        created=created_ts,
+                        model=req.model,
+                        choices=[ChunkChoice(index=0, delta=DeltaMessage(content=token_text), finish_reason=None)],
+                    )
+                    yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+
+                # Final chunk
+                final_chunk = ChatCompletionChunk(
+                    id=completion_id,
+                    created=created_ts,
+                    model=req.model,
+                    choices=[ChunkChoice(index=0, delta=DeltaMessage(), finish_reason="stop")],
+                )
+                yield f"data: {json.dumps(final_chunk.model_dump())}\n\n"
+                yield "data: [DONE]\n\n"
+
+            except Exception as e:
+                logger.exception("Error during SSE streaming")
+            finally:
+                # Cleanup session on finish or disconnect
+                clear_msg = TensorMessage(msg_type=MessageType.CLEAR, session_id=session_id, tensor=None)
+                try:
+                    await _orchestrator._node0_client.send(clear_msg)
+                except Exception:
+                    pass
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    # Non-streaming JSON response
+    completion_text = await _orchestrator.generate(
+        prompt=prompt,
+        max_tokens=req.max_tokens,
+        temperature=req.temperature,
+        top_k=req.top_k,
+        top_p=req.top_p,
+        stream=False,
+    )
+
+    prompt_tokens = len(_orchestrator.tokenizer.encode(prompt))
+    comp_tokens = len(_orchestrator.tokenizer.encode(completion_text))
+
+    return ChatCompletionResponse(
+        id=completion_id,
+        created=created_ts,
+        model=req.model,
+        choices=[
+            Choice(
+                index=0,
+                message=ChoiceMessage(role="assistant", content=completion_text),
+                finish_reason="stop",
+            )
+        ],
+        usage=UsageInfo(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=comp_tokens,
+            total_tokens=prompt_tokens + comp_tokens,
+        ),
+    )
+
+
+@app.delete("/v1/sessions/{session_id}")
+async def cancel_session(session_id: str):
+    """Explicit session cancellation endpoint."""
+    if _orchestrator and _orchestrator._node0_client:
+        from shardflow.transport.protocol import TensorMessage, MessageType
+        clear_msg = TensorMessage(msg_type=MessageType.CLEAR, session_id=session_id, tensor=None)
+        await _orchestrator._node0_client.send(clear_msg)
+        return {"status": "cancelled", "session_id": session_id}
+    raise HTTPException(status_code=503, detail="Orchestrator not ready")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "orchestrator_ready": _orchestrator is not None}
+
+
+@app.get("/metrics")
+def get_metrics():
+    """Return runtime metrics summary."""
+    from shardflow.orchestrator.metrics import metrics
+    return metrics.get_summary()

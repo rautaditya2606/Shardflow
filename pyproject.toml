@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "shardflow"
+version = "0.1.0"
+description = "Distributed inference framework — partition any HuggingFace transformer across N machines"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+dependencies = [
+    "torch>=2.1.0",
+    "transformers>=4.36.0",
+    "tokenizers>=0.15.0",
+    "safetensors>=0.4.0",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "pydantic>=2.5.0",
+    "sse-starlette>=1.8.0",
+    "flask>=3.0.0",
+    "requests>=2.31.0",
+    "accelerate>=0.25.0",
+]
+
+[project.optional-dependencies]
+quantization = [
+    "bitsandbytes>=0.41.0",
+    "auto-gptq>=0.5.0",
+    "autoawq>=0.1.6",
+]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[project.scripts]
+shardflow-orchestrator = "shardflow.orchestrator.orchestrator:main"
+shardflow-node = "shardflow.node.node:main"
+shardflow-registry = "shardflow.registry.app:main"
+shardflow-gateway = "shardflow.gateway.app:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["shardflow*"]
