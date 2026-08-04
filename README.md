@@ -1,12 +1,12 @@
-# ShardFlow ⚡
+# ShardFlow
 
 A general-purpose distributed inference framework that automatically partitions any HuggingFace transformer across N GPU machines, manages per-node KV caches, schedules concurrent requests through a micro-batch pipeline, and exposes a single OpenAI-compatible endpoint.
 
-> **Status:** All build phases (Phase 1 to Phase 5) completed!
+> **Status:** All build phases (Phase 1 to Phase 5) completed.
 
 ---
 
-## 🏗️ System Architecture
+## System Architecture
 
 ```
 Client (OpenAI SDK / curl)
@@ -47,7 +47,7 @@ Client (OpenAI SDK / curl)
 
 ---
 
-## 📦 Components & Services
+## Components & Services
 
 | Service | Script / Entrypoint | Description |
 |---|---|---|
@@ -59,12 +59,12 @@ Client (OpenAI SDK / curl)
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Installation
 
 ```bash
-git clone https://github.com/adityaraut/Shardflow.git
+git clone https://github.com/rautaditya2606/Shardflow.git
 cd Shardflow
 pip install -e ".[dev]"
 ```
@@ -96,7 +96,7 @@ python benchmarks/run_benchmarks.py \
 
 ---
 
-## 🌐 OpenAI API Usage Example
+## OpenAI API Usage Example
 
 Start the API Gateway:
 
@@ -132,7 +132,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 ---
 
-## 🎯 Benchmark Results
+## Benchmark Results
 
 Using TinyLlama 1.1B split across 2 pipeline nodes:
 
@@ -143,6 +143,6 @@ Using TinyLlama 1.1B split across 2 pipeline nodes:
 
 ---
 
-## 📄 License
+## License
 
 MIT License
