@@ -125,10 +125,19 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
                     msg_type=MessageType.ACTIVATION,
                     session_id=session_id,
                     tensor=hidden_states.cpu(),
+                    temperature=req.temperature,
+                    top_k=req.top_k,
+                    top_p=req.top_p,
+                    sample_on_node=True,
                 )
                 response = await _orchestrator._node0_client.send_recv(msg)
-                logits = response.tensor[0, -1, :]
-                next_token = sample_next_token(logits, temperature=req.temperature, top_k=req.top_k, top_p=req.top_p)
+                if response.msg_type == MessageType.TOKEN_ID:
+                    next_token = response.token_id
+                elif response.msg_type == MessageType.LOGITS:
+                    logits = response.tensor[0, -1, :]
+                    next_token = sample_next_token(logits, temperature=req.temperature, top_k=req.top_k, top_p=req.top_p)
+                else:
+                    raise RuntimeError(f"Expected TOKEN_ID or LOGITS, got {response.msg_type}")
 
                 token_text = _orchestrator.tokenizer.decode([next_token])
                 chunk = ChatCompletionChunk(
@@ -155,10 +164,19 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
                         msg_type=MessageType.ACTIVATION,
                         session_id=session_id,
                         tensor=hidden_states.cpu(),
+                        temperature=req.temperature,
+                        top_k=req.top_k,
+                        top_p=req.top_p,
+                        sample_on_node=True,
                     )
                     response = await _orchestrator._node0_client.send_recv(msg)
-                    logits = response.tensor[0, -1, :]
-                    next_token = sample_next_token(logits, temperature=req.temperature, top_k=req.top_k, top_p=req.top_p)
+                    if response.msg_type == MessageType.TOKEN_ID:
+                        next_token = response.token_id
+                    elif response.msg_type == MessageType.LOGITS:
+                        logits = response.tensor[0, -1, :]
+                        next_token = sample_next_token(logits, temperature=req.temperature, top_k=req.top_k, top_p=req.top_p)
+                    else:
+                        raise RuntimeError(f"Expected TOKEN_ID or LOGITS, got {response.msg_type}")
 
                     token_text = _orchestrator.tokenizer.decode([next_token])
                     chunk = ChatCompletionChunk(
