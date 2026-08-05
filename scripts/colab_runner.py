@@ -14,7 +14,7 @@ import time
 import requests
 import torch
 
-from shardflow.transport.tunnel import start_cloudflare_tcp_tunnel
+from shardflow.transport.tunnel import start_cloudflare_tcp_tunnel, start_bore_tunnel
 from shardflow.node.layer_loader import load_layer_slice
 from shardflow.node.node import PipelineNode
 
@@ -23,9 +23,10 @@ logger = logging.getLogger("shardflow.colab_runner")
 
 def main():
     parser = argparse.ArgumentParser(description="ShardFlow Colab Node Runner")
-    parser.add_argument("--registry-url", required=True, help="Registry URL (e.g. https://your-registry.onrender.com)")
-    parser.add_argument("--model", default="meta-llama/Meta-Llama-3-8B", help="Model path or HF model ID")
-    parser.add_argument("--port", type=int, default=9000, help="Local TCP port")
+    parser.add_argument("--registry-url", required=True, help="Registry URL (e.g. https://shardflow-v0-1-0.onrender.com)")
+    parser.add_argument("--model", default="Qwen/Qwen2.5-14B-Instruct", help="Model path or HF model ID")
+    parser.add_argument("--port", type=int, default=9500, help="Local TCP port")
+    parser.add_argument("--tunnel", choices=["bore", "cloudflare"], default="bore", help="Tunnel backend (default: bore)")
     parser.add_argument("--node-id", default=None, help="Unique node identifier")
     args = parser.parse_args()
 
@@ -37,8 +38,13 @@ def main():
     node_id = args.node_id or f"colab-node-{int(time.time())}"
     local_port = args.port
 
-    logger.info("Starting Cloudflare TCP tunnel on local port %d...", local_port)
-    tunnel_proc, pub_host, pub_port = start_cloudflare_tcp_tunnel(local_port)
+    if args.tunnel == "bore":
+        logger.info("Starting bore tunnel on local port %d...", local_port)
+        tunnel_proc, pub_host, pub_port = start_bore_tunnel(local_port)
+    else:
+        logger.info("Starting Cloudflare TCP tunnel on local port %d...", local_port)
+        tunnel_proc, pub_host, pub_port = start_cloudflare_tcp_tunnel(local_port)
+
     logger.info("Tunnel established at %s:%d", pub_host, pub_port)
 
     vram = 0.0

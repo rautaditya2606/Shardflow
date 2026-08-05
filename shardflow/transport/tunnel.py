@@ -67,5 +67,56 @@ def start_cloudflare_tcp_tunnel(local_port: int) -> Tuple[subprocess.Popen, str,
         proc.terminate()
         raise RuntimeError("Failed to obtain Cloudflare tunnel URL within timeout")
 
-    # Cloudflare tunnel hostname defaults to port 7844 or 443 TCP depending on routing
-    return proc, public_url, 443
+def install_bore() -> str:
+    """Ensure bore binary is installed and executable."""
+    bin_path = shutil.which("bore")
+    if bin_path:
+        return bin_path
+
+    target = "/tmp/bore"
+    if os.path.exists(target):
+        return target
+
+    logger.info("Downloading bore binary...")
+    url = "https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-unknown-linux-musl.tar.gz"
+    tar_path = "/tmp/bore.tar.gz"
+    subprocess.run(["curl", "-sL", "-o", tar_path, url], check=True)
+    subprocess.run(["tar", "-xzf", tar_path, "-C", "/tmp"], check=True)
+    subprocess.run(["chmod", "+x", target], check=True)
+    return target
+
+
+def start_bore_tunnel(local_port: int, server: str = "bore.pub") -> Tuple[subprocess.Popen, str, int]:
+    """
+    Start bore tunnel on local_port.
+
+    Returns:
+        (process, public_host, public_port)
+    """
+    bin_path = install_bore()
+    cmd = [bin_path, "local", str(local_port), "--to", server]
+
+    logger.info("Starting bore tunnel for localhost:%d to %s...", local_port, server)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    pub_port = None
+    start_time = time.time()
+
+    while time.time() - start_time < 30:
+        line = proc.stdout.readline()
+        if not line:
+            time.sleep(0.2)
+            continue
+
+        match = re.search(r"bore\.pub:(\d+)", line) or re.search(r"bound_port=(\d+)", line) or re.search(r"port (\d+)", line)
+        if match:
+            pub_port = int(match.group(1))
+            logger.info("bore.pub Tunnel established at %s:%d", server, pub_port)
+            break
+
+    if not pub_port:
+        proc.terminate()
+        raise RuntimeError("Failed to obtain bore tunnel port within timeout")
+
+    return proc, server, pub_port
+
