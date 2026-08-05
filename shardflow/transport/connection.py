@@ -55,6 +55,7 @@ class NodeServer:
             self._handle_connection,
             self.host,
             self.port,
+            reuse_address=True,
         )
         addr = self._server.sockets[0].getsockname()
         logger.info("Node server listening on %s:%d", addr[0], addr[1])
