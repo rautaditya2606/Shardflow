@@ -101,8 +101,23 @@ def main():
         listen_port=local_port,
     )
 
-    logger.info("Pipeline node running...")
-    asyncio.run(node.serve_forever())
+    async def heartbeat_loop():
+        """Periodically ping Topology Registry to keep node alive."""
+        hb_url = f"{args.registry_url.rstrip('/')}/heartbeat"
+        hb_payload = {"node_id": node_id}
+        while True:
+            await asyncio.sleep(10.0)
+            try:
+                requests.post(hb_url, json=hb_payload, timeout=5.0)
+            except Exception as e:
+                logger.debug("Heartbeat ping error: %s", e)
+
+    async def run_node():
+        asyncio.create_task(heartbeat_loop())
+        await node.serve_forever()
+
+    logger.info("Pipeline node running with background heartbeat...")
+    asyncio.run(run_node())
 
 
 if __name__ == "__main__":
