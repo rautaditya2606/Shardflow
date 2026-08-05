@@ -117,21 +117,9 @@ class Orchestrator:
         return self._cached_topology
 
     async def initialize(self) -> None:
-        """Load tokenizer and token embedding matrix, connect to Node 0."""
-        logger.info("Initializing Orchestrator with model %s...", self.model_path)
+        """Load tokenizer (zero model weights on CPU) and connect to Node 0."""
+        logger.info("Initializing Zero-Weight Orchestrator for tokenizer %s...", self.model_path)
         self.tokenizer = load_tokenizer(self.model_path)
-
-        # Load only embedding layer
-        slice_obj = load_layer_slice(
-            model_path=self.model_path,
-            layer_start=0,
-            layer_end=1,
-            include_embed=True,
-            device=str(self.device),
-            dtype=self.dtype,
-        )
-        self.embed_tokens = slice_obj.embed_tokens
-        self.config = slice_obj.config
 
         # Connect to Node 0
         nodes = self.fetch_topology(force=True)
@@ -143,18 +131,9 @@ class Orchestrator:
         self._node0_client = NodeClient(node0_host, node0_port)
         await self._node0_client.connect()
 
-    @torch.inference_mode()
     def _embed(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Embed token IDs to hidden states.
-
-        Args:
-            token_ids: [1, seq_len] token IDs
-
-        Returns:
-            hidden_states: [1, seq_len, hidden_dim]
-        """
-        return self.embed_tokens(token_ids.to(self.device))
+        """Pass token IDs integer tensor directly (embedding executes on Node 0 GPU)."""
+        return token_ids
 
     async def generate(
         self,

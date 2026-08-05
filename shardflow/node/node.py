@@ -123,8 +123,16 @@ class PipelineNode:
             logger.warning("Unknown message type: %s", msg.msg_type)
             return None
 
-        # Process activation
-        hidden_states = msg.tensor.to(self.model_slice.device, non_blocking=True)
+        # Process activation / token IDs
+        tensor = msg.tensor.to(self.model_slice.device, non_blocking=True)
+        if self.is_first_node and tensor.dtype in (torch.long, torch.int64, torch.int32):
+            if self.model_slice.embed_tokens is not None:
+                hidden_states = self.model_slice.embed_tokens(tensor)
+            else:
+                hidden_states = tensor
+        else:
+            hidden_states = tensor
+
         output = self._forward(hidden_states, session_id=msg.session_id)
 
         if self.is_last_node:

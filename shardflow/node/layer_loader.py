@@ -95,6 +95,10 @@ def load_layer_slice(
     config = AutoConfig.from_pretrained(model_path)
     total_layers = config.num_hidden_layers
 
+    # Node 0 (layer_start == 0) always owns token embedding matrix
+    if layer_start == 0:
+        include_embed = True
+
     if layer_start < 0 or layer_end > total_layers or layer_start >= layer_end:
         raise ValueError(
             f"Invalid layer range [{layer_start}, {layer_end}) "
