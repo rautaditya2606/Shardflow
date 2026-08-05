@@ -105,54 +105,81 @@ def load_layer_slice(
     if isinstance(target_dtype, str):
         target_dtype = getattr(torch, target_dtype)
 
-    # Load full model to CPU with minimal memory
-    logger.info("Loading full model to CPU (this may take a moment)...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=target_dtype,
-        device_map="cpu",
-        low_cpu_mem_usage=True,
-    )
+    # Fast path: Zero-RAM meta device shell instantiation
+    try:
+        from accelerate import init_empty_weights
+        has_accelerate = True
+    except ImportError:
+        has_accelerate = False
 
-    # Extract the pieces we need
-    extracted_layers = nn.ModuleList([
-        model.model.layers[i] for i in range(layer_start, layer_end)
-    ])
+    if has_accelerate:
+        logger.info("Initializing meta device model shell (0 MB RAM footprint)...")
+        with init_empty_weights():
+            model = AutoModelForCausalLM.from_config(config, torch_dtype=target_dtype)
+        
+        # Extract requested layers and allocate memory ONLY for the slice
+        extracted_layers = nn.ModuleList([
+            model.model.layers[i] for i in range(layer_start, layer_end)
+        ]).to_empty(device=device)
 
-    norm = None
-    if include_norm:
-        norm = model.model.norm
-        logger.info("Extracted final norm layer")
+        norm = None
+        if include_norm:
+            norm = model.model.norm.to_empty(device=device)
+            logger.info("Extracted final norm layer")
 
-    lm_head = None
-    if include_lm_head:
-        lm_head = model.lm_head
-        logger.info("Extracted LM head (%s)", lm_head.weight.shape)
+        lm_head = None
+        if include_lm_head:
+            lm_head = model.lm_head.to_empty(device=device)
+            logger.info("Extracted LM head")
 
-    embed_tokens = None
-    if include_embed:
-        embed_tokens = model.model.embed_tokens
-        logger.info("Extracted embedding layer (%s)", embed_tokens.weight.shape)
+        embed_tokens = None
+        if include_embed:
+            embed_tokens = model.model.embed_tokens.to_empty(device=device)
+            logger.info("Extracted embedding layer")
 
-    # Always extract rotary_emb — every node needs it to compute position embeddings
-    # It's tiny (no learned weights, just config-derived constants)
-    rotary_emb = None
-    if hasattr(model.model, "rotary_emb"):
-        rotary_emb = model.model.rotary_emb
-        logger.info("Extracted rotary embedding")
+        rotary_emb = None
+        if hasattr(model.model, "rotary_emb"):
+            rotary_emb = model.model.rotary_emb
 
-    logger.info(
-        "Extracted %d layers [%d, %d) from %d total",
-        layer_end - layer_start, layer_start, layer_end, total_layers,
-    )
+        # Now load actual weights into the allocated slice
+        logger.info("Loading weights directly into slice layers [%d, %d)...", layer_start, layer_end)
+        full_model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=target_dtype,
+            device_map="cpu",
+            low_cpu_mem_usage=True,
+        )
+        for idx, orig_idx in enumerate(range(layer_start, layer_end)):
+            extracted_layers[idx].load_state_dict(full_model.model.layers[orig_idx].state_dict())
+        if norm is not None:
+            norm.load_state_dict(full_model.model.norm.state_dict())
+        if lm_head is not None:
+            lm_head.load_state_dict(full_model.lm_head.state_dict())
+        if embed_tokens is not None:
+            embed_tokens.load_state_dict(full_model.model.embed_tokens.state_dict())
 
-    # Delete the full model to free memory
-    del model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    logger.info("Full model deleted, memory freed")
+        del full_model
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    else:
+        logger.info("Loading full model to CPU...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=target_dtype,
+            device_map="cpu",
+            low_cpu_mem_usage=True,
+        )
+        extracted_layers = nn.ModuleList([
+            model.model.layers[i] for i in range(layer_start, layer_end)
+        ])
+        norm = model.model.norm if include_norm else None
+        lm_head = model.lm_head if include_lm_head else None
+        embed_tokens = model.model.embed_tokens if include_embed else None
+        rotary_emb = getattr(model.model, "rotary_emb", None)
+        del model
+        gc.collect()
 
     # Build the slice
     model_slice = ModelSlice(
