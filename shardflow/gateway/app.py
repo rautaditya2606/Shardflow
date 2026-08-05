@@ -210,17 +210,25 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     # Non-streaming JSON response
-    completion_text = await _orchestrator.generate(
-        prompt=prompt,
-        max_tokens=req.max_tokens,
-        temperature=req.temperature,
-        top_k=req.top_k,
-        top_p=req.top_p,
-        stream=False,
-    )
+    from shardflow.orchestrator.orchestrator import PartialGenerationError
+
+    finish_reason = "stop"
+    try:
+        completion_text = await _orchestrator.generate(
+            prompt=prompt,
+            max_tokens=req.max_tokens,
+            temperature=req.temperature,
+            top_k=req.top_k,
+            top_p=req.top_p,
+            stream=False,
+        )
+    except PartialGenerationError as e:
+        logger.warning("Returning partial generation text due to node error: %s", e)
+        completion_text = e.partial_text
+        finish_reason = "node_failure"
 
     prompt_tokens = len(_orchestrator.tokenizer.encode(prompt))
-    comp_tokens = len(_orchestrator.tokenizer.encode(completion_text))
+    comp_tokens = len(_orchestrator.tokenizer.encode(completion_text)) if completion_text else 0
 
     return ChatCompletionResponse(
         id=completion_id,
@@ -230,7 +238,7 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
             Choice(
                 index=0,
                 message=ChoiceMessage(role="assistant", content=completion_text),
-                finish_reason="stop",
+                finish_reason=finish_reason,
             )
         ],
         usage=UsageInfo(

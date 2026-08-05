@@ -25,19 +25,79 @@ app = FastAPI(
 )
 
 
+KNOWN_MODEL_LAYERS = {
+    "tinyllama/tinyllama-1.1b-chat-v1.0": 22,
+    "meta-llama/meta-llama-3-8b": 32,
+    "meta-llama/meta-llama-3-8b-instruct": 32,
+    "meta-llama/llama-2-7b": 32,
+    "mistralai/mistral-7b-v0.1": 32,
+    "qwen/qwen2-7b": 28,
+}
+
+
+def get_model_total_layers(model_id: str) -> int:
+    """
+    Fetch total hidden layers directly from HuggingFace AutoConfig.
+    Falls back to known offline dict or default only if network/HF lookup fails.
+    """
+    # 1. Primary path: Fetch from HuggingFace AutoConfig
+    try:
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(model_id)
+        if hasattr(cfg, "num_hidden_layers") and cfg.num_hidden_layers > 0:
+            logger.info("Loaded total layers (%d) for model %s via AutoConfig", cfg.num_hidden_layers, model_id)
+            return cfg.num_hidden_layers
+    except Exception as e:
+        logger.warning(
+            "AutoConfig.from_pretrained failed for '%s': %s. Falling back to offline layer mapping.",
+            model_id, e
+        )
+
+    # 2. Secondary fallback path: Offline lookup map
+    key = model_id.lower()
+    if key in KNOWN_MODEL_LAYERS:
+        fallback_layers = KNOWN_MODEL_LAYERS[key]
+        logger.warning("Using offline fallback mapping for model '%s': %d layers", model_id, fallback_layers)
+        return fallback_layers
+
+    # 3. Last resort fallback
+    logger.error(
+        "Could not determine layer count for model '%s' via AutoConfig or offline map. "
+        "Defaulting to 22 layers (TinyLlama).", model_id
+    )
+    return 22
+
+
 class NodeRegistration(BaseModel):
     node_id: str = Field(..., description="Unique node identifier")
     addr: str = Field(..., description="Public IP or Cloudflare tunnel host")
     port: int = Field(..., description="TCP port for activations")
-    layer_start: int = Field(..., description="Assigned start layer (inclusive)")
-    layer_end: int = Field(..., description="Assigned end layer (exclusive)")
+    layer_start: Optional[int] = Field(None, description="Assigned start layer (optional/auto-calculated)")
+    layer_end: Optional[int] = Field(None, description="Assigned end layer (optional/auto-calculated)")
     vram_available_mb: float = Field(0.0, description="Available VRAM in MB")
     vram_total_mb: float = Field(0.0, description="Total VRAM in MB")
+    model_id: str = Field("TinyLlama/TinyLlama-1.1B-Chat-v1.0", description="Model ID")
 
 
-class NodeStatus(NodeRegistration):
-    last_heartbeat: float = Field(..., description="Monotonic timestamp of last heartbeat")
+class NodeStatus(BaseModel):
+    node_id: str
+    addr: str
+    port: int
+    layer_start: int
+    layer_end: int
+    vram_available_mb: float = 0.0
+    vram_total_mb: float = 0.0
+    model_id: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    last_heartbeat: float
     is_active: bool = True
+    is_first_node: bool = False
+    is_last_node: bool = False
+    next_node_host: Optional[str] = None
+    next_node_port: Optional[int] = None
+
+
+class NodeRegistrationResponse(NodeStatus):
+    total_model_layers: int
 
 
 class HeartbeatPayload(BaseModel):
@@ -66,23 +126,82 @@ def _cleanup_inactive_nodes() -> None:
         del _nodes[nid]
 
 
-@app.post("/register", status_code=status.HTTP_201_CREATED, response_model=NodeStatus)
+def _rebalance_assignments(model_id: str) -> None:
+    """Recalculate dynamic layer bounds and next-node routing across active nodes."""
+    if not _nodes:
+        return
+
+    # Sort nodes deterministically by node_id
+    sorted_node_ids = sorted(_nodes.keys())
+    total_layers = get_model_total_layers(model_id)
+    n_nodes = len(sorted_node_ids)
+
+    base, rem = divmod(total_layers, n_nodes)
+    curr_layer = 0
+
+    for i, nid in enumerate(sorted_node_ids):
+        count = base + (1 if i < rem else 0)
+        layer_start = curr_layer
+        layer_end = curr_layer + count
+        curr_layer = layer_end
+
+        is_first = (i == 0)
+        is_last = (i == n_nodes - 1)
+
+        next_host = None
+        next_port = None
+        if not is_last:
+            next_node = _nodes[sorted_node_ids[i + 1]]
+            next_host = next_node.addr
+            next_port = next_node.port
+
+        node = _nodes[nid]
+        node.layer_start = layer_start
+        node.layer_end = layer_end
+        node.is_first_node = is_first
+        node.is_last_node = is_last
+        node.next_node_host = next_host
+        node.next_node_port = next_port
+
+
+@app.post("/register", status_code=status.HTTP_201_CREATED, response_model=NodeRegistrationResponse)
 def register_node(payload: NodeRegistration):
-    """Register or update a pipeline node."""
+    """Register or update a pipeline node and receive dynamic layer assignments."""
     _cleanup_inactive_nodes()
     now = time.time()
 
+    # Pre-register entry
     node_status = NodeStatus(
-        **payload.model_dump(),
+        node_id=payload.node_id,
+        addr=payload.addr,
+        port=payload.port,
+        layer_start=payload.layer_start or 0,
+        layer_end=payload.layer_end or 0,
+        vram_available_mb=payload.vram_available_mb,
+        vram_total_mb=payload.vram_total_mb,
+        model_id=payload.model_id,
         last_heartbeat=now,
         is_active=True,
     )
     _nodes[payload.node_id] = node_status
+
+    # Recalculate dynamic splits across active pool
+    _rebalance_assignments(payload.model_id)
+
+    updated_status = _nodes[payload.node_id]
+    total_layers = get_model_total_layers(payload.model_id)
+
     logger.info(
-        "Registered node %s (%s:%d) for layers [%d, %d)",
-        payload.node_id, payload.addr, payload.port, payload.layer_start, payload.layer_end
+        "Registered node %s (%s:%d) -> assigned layers [%d, %d) (first=%s, last=%s)",
+        updated_status.node_id, updated_status.addr, updated_status.port,
+        updated_status.layer_start, updated_status.layer_end,
+        updated_status.is_first_node, updated_status.is_last_node,
     )
-    return node_status
+
+    return NodeRegistrationResponse(
+        **updated_status.model_dump(),
+        total_model_layers=total_layers,
+    )
 
 
 @app.post("/heartbeat", status_code=status.HTTP_200_OK)
@@ -100,7 +219,6 @@ def heartbeat(payload: HeartbeatPayload):
 def get_topology():
     """Return ordered topology of active nodes sorted by layer_start."""
     _cleanup_inactive_nodes()
-    # Sort nodes by layer_start
     sorted_nodes = sorted(_nodes.values(), key=lambda n: n.layer_start)
     return TopologyResponse(
         nodes=sorted_nodes,

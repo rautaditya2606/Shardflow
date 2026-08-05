@@ -247,8 +247,8 @@ def main():
     """CLI entry point for starting a pipeline node."""
     parser = argparse.ArgumentParser(description="ShardFlow Pipeline Node")
     parser.add_argument("--model", required=True, help="Model path or HF model ID")
-    parser.add_argument("--layer-start", type=int, required=True, help="First layer index (inclusive)")
-    parser.add_argument("--layer-end", type=int, required=True, help="Last layer index (exclusive)")
+    parser.add_argument("--layer-start", type=int, default=None, help="First layer index (inclusive)")
+    parser.add_argument("--layer-end", type=int, default=None, help="Last layer index (exclusive)")
     parser.add_argument("--host", default="0.0.0.0", help="Listen host")
     parser.add_argument("--port", type=int, default=9000, help="Listen port")
     parser.add_argument("--next-host", default=None, help="Next node host (omit for last node)")
@@ -266,53 +266,76 @@ def main():
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
+    import uuid
+    node_id = args.node_id or f"node-{uuid.uuid4().hex[:6]}"
+    pub_host = args.public_host or args.host
+    pub_port = args.public_port or args.port
+    layer_start = args.layer_start
+    layer_end = args.layer_end
     is_last = args.next_host is None
+    next_host = args.next_host
+    next_port = args.next_port
+
+    # Auto-registration with Registry if registry_url is provided
+    if args.registry_url:
+        import requests
+        vram = 0.0
+        if torch.cuda.is_available():
+            vram = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
+        try:
+            reg_payload = {
+                "node_id": node_id,
+                "addr": pub_host,
+                "port": pub_port,
+                "vram_available_mb": vram,
+                "vram_total_mb": vram,
+                "model_id": args.model,
+            }
+            if layer_start is not None:
+                reg_payload["layer_start"] = layer_start
+            if layer_end is not None:
+                reg_payload["layer_end"] = layer_end
+
+            resp = requests.post(
+                f"{args.registry_url.rstrip('/')}/register",
+                json=reg_payload,
+                timeout=5.0,
+            )
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                layer_start = data.get("layer_start", layer_start)
+                layer_end = data.get("layer_end", layer_end)
+                is_last = data.get("is_last_node", is_last)
+                next_host = data.get("next_node_host", next_host)
+                next_port = data.get("next_node_port", next_port)
+                logger.info(
+                    "Registered node %s with registry -> assigned layers [%s, %s)",
+                    node_id, layer_start, layer_end
+                )
+        except Exception as e:
+            logger.warning("Failed auto-registration with registry: %s", e)
+
+    if layer_start is None or layer_end is None:
+        logger.error("Must specify --layer-start/--layer-end or provide a valid --registry-url.")
+        sys.exit(1)
 
     # Load model slice
     model_slice = load_layer_slice(
         model_path=args.model,
-        layer_start=args.layer_start,
-        layer_end=args.layer_end,
+        layer_start=layer_start,
+        layer_end=layer_end,
         include_norm=is_last,
         include_lm_head=is_last,
         device=args.device,
     )
 
-    # Optional Auto-Registration with Topology Registry
-    if args.registry_url:
-        import requests, uuid
-        node_id = args.node_id or f"node-{uuid.uuid4().hex[:6]}"
-        pub_host = args.public_host or args.host
-        pub_port = args.public_port or args.port
-        vram = 0.0
-        if torch.cuda.is_available():
-            vram = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
-        try:
-            resp = requests.post(
-                f"{args.registry_url.rstrip('/')}/register",
-                json={
-                    "node_id": node_id,
-                    "addr": pub_host,
-                    "port": pub_port,
-                    "layer_start": args.layer_start,
-                    "layer_end": args.layer_end,
-                    "vram_available_mb": vram,
-                    "vram_total_mb": vram,
-                },
-                timeout=5.0,
-            )
-            if resp.status_code in (200, 201):
-                logger.info("Registered node %s with registry at %s", node_id, args.registry_url)
-        except Exception as e:
-            logger.warning("Failed to register node with registry: %s", e)
-
     # Create and run node
     node = PipelineNode(
         model_slice=model_slice,
-        is_first_node=(args.layer_start == 0),
+        is_first_node=(layer_start == 0),
         is_last_node=is_last,
-        next_node_host=args.next_host,
-        next_node_port=args.next_port,
+        next_node_host=next_host,
+        next_node_port=next_port,
         listen_host=args.host,
         listen_port=args.port,
     )
@@ -322,3 +345,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

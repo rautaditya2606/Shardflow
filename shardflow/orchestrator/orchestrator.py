@@ -38,6 +38,16 @@ from shardflow.orchestrator.metrics import metrics
 import requests
 
 
+class PartialGenerationError(Exception):
+    """Raised when node failure/disconnect occurs mid-generation, returning partial tokens."""
+
+    def __init__(self, message: str, partial_text: str, tokens_generated: int, original_error: Exception):
+        super().__init__(message)
+        self.partial_text = partial_text
+        self.tokens_generated = tokens_generated
+        self.original_error = original_error
+
+
 class Orchestrator:
     """
     Central controller for distributed inference.
@@ -99,50 +109,39 @@ class Orchestrator:
                     if fetched:
                         self._cached_topology = fetched
                         self._last_topology_fetch = now
-                        logger.info("Fetched topology from registry: %d nodes", len(fetched))
+                        logger.info("Updated topology from registry: %s", fetched)
                         return self._cached_topology
             except Exception as e:
-                logger.warning("Failed to fetch topology from registry (%s), using cached topology", e)
+                logger.warning("Failed to fetch topology from registry: %s", e)
 
         return self._cached_topology
 
     async def initialize(self) -> None:
-        """Load tokenizer + embedding, connect to nodes."""
-        logger.info("Loading tokenizer from %s", self.model_path)
+        """Load tokenizer and token embedding matrix, connect to Node 0."""
+        logger.info("Initializing Orchestrator with model %s...", self.model_path)
         self.tokenizer = load_tokenizer(self.model_path)
 
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        logger.info("Loading embedding layer...")
-        embed_slice = load_layer_slice(
+        # Load only embedding layer
+        slice_obj = load_layer_slice(
             model_path=self.model_path,
             layer_start=0,
             layer_end=1,
             include_embed=True,
-            dtype=self.dtype,
             device=str(self.device),
+            dtype=self.dtype,
         )
-        self.embed_tokens = embed_slice.embed_tokens
-        self.config = embed_slice.config
-        del embed_slice.layers
-        logger.info(
-            "Embedding loaded: vocab=%d, dim=%d, device=%s",
-            self.config.vocab_size, self.config.hidden_size, self.device,
-        )
+        self.embed_tokens = slice_obj.embed_tokens
+        self.config = slice_obj.config
 
+        # Connect to Node 0
         nodes = self.fetch_topology(force=True)
         if not nodes:
-            raise RuntimeError("No active nodes available in topology!")
+            raise RuntimeError("No nodes available in topology")
 
-        first_host, first_port = nodes[0]
-        self._node0_client = NodeClient(first_host, first_port, recv_timeout=120.0)
+        node0_host, node0_port = nodes[0]
+        logger.info("Connecting orchestrator to Node 0 at %s:%d", node0_host, node0_port)
+        self._node0_client = NodeClient(node0_host, node0_port)
         await self._node0_client.connect()
-
-        logger.info(
-            "Connected to node chain (%d nodes). Ready for inference.",
-            len(nodes),
-        )
 
     @torch.inference_mode()
     def _embed(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -169,9 +168,6 @@ class Orchestrator:
         """
         Generate text from a prompt.
 
-        Phase 1: No KV cache — resends the full growing sequence each iteration.
-        This is O(n²) in sequence length. Phase 2 fixes this.
-
         Args:
             prompt: input text
             max_tokens: max tokens to generate
@@ -196,70 +192,31 @@ class Orchestrator:
         generated_tokens = []
         start_time = time.perf_counter()
 
-        # Step 1: Chunked Prefill phase — chunk prompt into 512-token windows
-        step_start = time.perf_counter()
-        prompt_len = input_ids.shape[1]
-        prefill_chunk_size = 512
-
-        response = None
-        for chunk_start in range(0, prompt_len, prefill_chunk_size):
-            chunk_end = min(prompt_len, chunk_start + prefill_chunk_size)
-            chunk_input_ids = input_ids[:, chunk_start:chunk_end]
-            hidden_states = self._embed(chunk_input_ids)
-
-            msg = TensorMessage(
-                msg_type=MessageType.ACTIVATION,
-                session_id=session_id,
-                tensor=hidden_states.cpu(),
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                sample_on_node=True,
-            )
-            response = await self._node0_client.send_recv(msg)
-
-        if response is None:
-            raise RuntimeError("No response from prefill phase")
-
-        if response.msg_type == MessageType.TOKEN_ID:
-            next_token = response.token_id
-        elif response.msg_type == MessageType.LOGITS:
-            logits = response.tensor[0, -1, :]
-            next_token = sample_next_token(logits, temperature=temperature, top_k=top_k, top_p=top_p)
-        else:
-            raise RuntimeError(f"Expected TOKEN_ID or LOGITS from prefill, got {response.msg_type}")
-
-        generated_tokens.append(next_token)
-
-        token_text = self.tokenizer.decode([next_token])
-        if stream:
-            print(token_text, end="", flush=True)
-
-        logger.debug(
-            "Prefill step (len=%d): token=%d ('%s') in %.3fs",
-            input_ids.shape[1], next_token, token_text.strip(), time.perf_counter() - step_start,
-        )
-
-        # Step 2: Incremental decode phase — send 1 token at a time
-        for step in range(1, max_tokens):
-            if next_token == self.tokenizer.eos_token_id:
-                logger.info("EOS reached at step %d", step)
-                break
-
+        try:
+            # Step 1: Chunked Prefill phase — chunk prompt into 512-token windows
             step_start = time.perf_counter()
-            token_ids = torch.tensor([[next_token]], dtype=torch.long)
-            hidden_states = self._embed(token_ids)  # [1, 1, hidden_dim]
+            prompt_len = input_ids.shape[1]
+            prefill_chunk_size = 512
 
-            msg = TensorMessage(
-                msg_type=MessageType.ACTIVATION,
-                session_id=session_id,
-                tensor=hidden_states.cpu(),
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                sample_on_node=True,
-            )
-            response = await self._node0_client.send_recv(msg)
+            response = None
+            for chunk_start in range(0, prompt_len, prefill_chunk_size):
+                chunk_end = min(prompt_len, chunk_start + prefill_chunk_size)
+                chunk_input_ids = input_ids[:, chunk_start:chunk_end]
+                hidden_states = self._embed(chunk_input_ids)
+
+                msg = TensorMessage(
+                    msg_type=MessageType.ACTIVATION,
+                    session_id=session_id,
+                    tensor=hidden_states.cpu(),
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    sample_on_node=True,
+                )
+                response = await self._node0_client.send_recv(msg)
+
+            if response is None:
+                raise RuntimeError("No response from prefill phase")
 
             if response.msg_type == MessageType.TOKEN_ID:
                 next_token = response.token_id
@@ -267,7 +224,7 @@ class Orchestrator:
                 logits = response.tensor[0, -1, :]
                 next_token = sample_next_token(logits, temperature=temperature, top_k=top_k, top_p=top_p)
             else:
-                raise RuntimeError(f"Expected TOKEN_ID or LOGITS, got {response.msg_type}")
+                raise RuntimeError(f"Expected TOKEN_ID or LOGITS from prefill, got {response.msg_type}")
 
             generated_tokens.append(next_token)
 
@@ -276,8 +233,61 @@ class Orchestrator:
                 print(token_text, end="", flush=True)
 
             logger.debug(
-                "Decode step %d: token=%d ('%s') in %.3fs",
-                step, next_token, token_text.strip(), time.perf_counter() - step_start,
+                "Prefill step (len=%d): token=%d ('%s') in %.3fs",
+                input_ids.shape[1], next_token, token_text.strip(), time.perf_counter() - step_start,
+            )
+
+            # Step 2: Incremental decode phase — send 1 token at a time
+            for step in range(1, max_tokens):
+                if next_token == self.tokenizer.eos_token_id:
+                    logger.info("EOS reached at step %d", step)
+                    break
+
+                step_start = time.perf_counter()
+                token_ids = torch.tensor([[next_token]], dtype=torch.long)
+                hidden_states = self._embed(token_ids)  # [1, 1, hidden_dim]
+
+                msg = TensorMessage(
+                    msg_type=MessageType.ACTIVATION,
+                    session_id=session_id,
+                    tensor=hidden_states.cpu(),
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    sample_on_node=True,
+                )
+                response = await self._node0_client.send_recv(msg)
+
+                if response.msg_type == MessageType.TOKEN_ID:
+                    next_token = response.token_id
+                elif response.msg_type == MessageType.LOGITS:
+                    logits = response.tensor[0, -1, :]
+                    next_token = sample_next_token(logits, temperature=temperature, top_k=top_k, top_p=top_p)
+                else:
+                    raise RuntimeError(f"Expected TOKEN_ID or LOGITS, got {response.msg_type}")
+
+                generated_tokens.append(next_token)
+
+                token_text = self.tokenizer.decode([next_token])
+                if stream:
+                    print(token_text, end="", flush=True)
+
+                logger.debug(
+                    "Decode step %d: token=%d ('%s') in %.3fs",
+                    step, next_token, token_text.strip(), time.perf_counter() - step_start,
+                )
+
+        except Exception as err:
+            partial = self.tokenizer.decode(generated_tokens, skip_special_tokens=True) if generated_tokens else ""
+            logger.warning(
+                "Generation interrupted after %d tokens due to node transport failure: %s",
+                len(generated_tokens), err
+            )
+            raise PartialGenerationError(
+                message=f"Node failure during generation step: {err}",
+                partial_text=partial,
+                tokens_generated=len(generated_tokens),
+                original_error=err,
             )
 
         if stream:
