@@ -54,6 +54,8 @@ DTYPE_MAP = {
     0: torch.float16,
     1: torch.bfloat16,
     2: torch.float32,
+    3: torch.int64,
+    4: torch.int32,
 }
 DTYPE_REVERSE = {v: k for k, v in DTYPE_MAP.items()}
 
