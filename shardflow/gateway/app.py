@@ -79,11 +79,22 @@ def _format_prompt(messages: list) -> str:
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
     """OpenAI-compatible chat completions endpoint."""
-    if _orchestrator is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Orchestrator not initialized or nodes not ready",
-        )
+    global _orchestrator
+    if _orchestrator is None or _orchestrator._node0_client is None:
+        import os
+        registry_url = os.getenv("SHARDFLOW_REGISTRY_URL", "http://127.0.0.1:8000")
+        model_path = req.model or os.getenv("SHARDFLOW_MODEL_PATH", "Qwen/Qwen2.5-7B-Instruct")
+        try:
+            logger.info("Auto-connecting Orchestrator to active Node 0 (Model: %s)...", model_path)
+            orch = Orchestrator(model_path=model_path, registry_url=registry_url, device="cpu")
+            await orch.initialize()
+            _orchestrator = orch
+        except Exception as e:
+            logger.warning("Could not auto-initialize Orchestrator: %s", e)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Orchestrator not initialized or nodes not ready: {e}",
+            )
 
     # Format messages to prompt string
     if hasattr(_orchestrator.tokenizer, "apply_chat_template"):
