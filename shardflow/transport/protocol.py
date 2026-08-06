@@ -208,7 +208,7 @@ async def send_message(
 
 async def recv_message(
     reader: asyncio.StreamReader,
-    timeout: float = 5.0,
+    timeout: float = 60.0,
 ) -> TensorMessage:
     """
     Receive a length-prefixed tensor message from an async TCP connection.

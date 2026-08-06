@@ -116,8 +116,8 @@ class NodeClient:
         self,
         host: str,
         port: int,
-        send_timeout: float = 5.0,
-        recv_timeout: float = 30.0,
+        send_timeout: float = 15.0,
+        recv_timeout: float = 60.0,
     ):
         self.host = host
         self.port = port
