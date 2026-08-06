@@ -12,7 +12,7 @@ import time
 import os
 import shutil
 import logging
-from typing import Tuple
+from typing import Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +23,12 @@ def install_cloudflared() -> str:
     if bin_path:
         return bin_path
 
+    target = "/tmp/cloudflared"
+    if os.path.exists(target) and os.access(target, os.X_OK):
+        return target
+
     logger.info("Downloading cloudflared binary...")
     url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-    target = "/tmp/cloudflared"
     subprocess.run(["curl", "-L", "-o", target, url], check=True)
     subprocess.run(["chmod", "+x", target], check=True)
     return target
@@ -86,7 +89,7 @@ def install_bore() -> str:
     return target
 
 
-def start_bore_tunnel(local_port: int, server: str = "bore.pub") -> Tuple[subprocess.Popen, str, int]:
+def start_bore_tunnel(local_port: int, server: str = "bore.pub", remote_port: Optional[int] = None) -> Tuple[subprocess.Popen, str, int]:
     """
     Start bore tunnel on local_port.
 
@@ -95,6 +98,11 @@ def start_bore_tunnel(local_port: int, server: str = "bore.pub") -> Tuple[subpro
     """
     bin_path = install_bore()
     cmd = [bin_path, "local", str(local_port), "--to", server]
+    if remote_port:
+        cmd.extend(["--port", str(remote_port)])
+    elif local_port > 0:
+        # Default to a unique remote port based on local_port offset
+        cmd.extend(["--port", str(30000 + (local_port % 20000))])
 
     logger.info("Starting bore tunnel for localhost:%d to %s...", local_port, server)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
