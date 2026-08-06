@@ -99,6 +99,19 @@ class Orchestrator:
         if not force and self._cached_topology and (now - self._last_topology_fetch < self.topology_ttl):
             return self._cached_topology
 
+        # Primary path: Direct in-memory lookup if running in same process (avoids HTTP loopback deadlock)
+        try:
+            from shardflow.registry.app import get_topology
+            topo_res = get_topology()
+            fetched = [(n.addr, n.port) for n in topo_res.nodes if n.is_active]
+            if fetched:
+                self._cached_topology = fetched
+                self._last_topology_fetch = now
+                logger.info("Updated topology directly from in-memory registry: %s", fetched)
+                return self._cached_topology
+        except Exception as e:
+            logger.debug("In-memory topology fetch fallback to HTTP: %s", e)
+
         if self.registry_url:
             try:
                 resp = requests.get(f"{self.registry_url.rstrip('/')}/topology", timeout=5.0)

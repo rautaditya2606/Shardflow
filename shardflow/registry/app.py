@@ -137,20 +137,23 @@ def _rebalance_assignments(model_id: str) -> None:
     if not _nodes:
         return
 
-    # Sort nodes deterministically by node_id
-    sorted_node_ids = sorted(_nodes.keys())
+    # Sort nodes deterministically by layer_start, then node_id
+    sorted_node_ids = sorted(_nodes.keys(), key=lambda nid: (_nodes[nid].layer_start, nid))
     total_layers = get_model_total_layers(model_id)
     n_nodes = len(sorted_node_ids)
 
-    base, rem = divmod(total_layers, n_nodes)
-    curr_layer = 0
+    # Only perform auto-split if nodes did not specify explicit non-zero layer bounds
+    all_auto = all(_nodes[nid].layer_end == 0 for nid in sorted_node_ids)
+    if all_auto:
+        base, rem = divmod(total_layers, n_nodes)
+        curr_layer = 0
+        for i, nid in enumerate(sorted_node_ids):
+            count = base + (1 if i < rem else 0)
+            _nodes[nid].layer_start = curr_layer
+            _nodes[nid].layer_end = curr_layer + count
+            curr_layer += count
 
     for i, nid in enumerate(sorted_node_ids):
-        count = base + (1 if i < rem else 0)
-        layer_start = curr_layer
-        layer_end = curr_layer + count
-        curr_layer = layer_end
-
         is_first = (i == 0)
         is_last = (i == n_nodes - 1)
 
@@ -162,8 +165,6 @@ def _rebalance_assignments(model_id: str) -> None:
             next_port = next_node.port
 
         node = _nodes[nid]
-        node.layer_start = layer_start
-        node.layer_end = layer_end
         node.is_first_node = is_first
         node.is_last_node = is_last
         node.next_node_host = next_host
