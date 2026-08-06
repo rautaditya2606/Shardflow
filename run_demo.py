@@ -61,17 +61,27 @@ def main():
     server_thread = Thread(target=lambda: asyncio.run(setup_shardflow_pipeline()), daemon=True)
     server_thread.start()
 
-    # Wait for startup
-    time.sleep(6)
+    # Wait for gateway startup
+    import requests
+    print("Waiting for gateway server to bind...")
+    for _ in range(30):
+        try:
+            r = requests.get(f"http://127.0.0.1:{GATEWAY_PORT}/health", timeout=1.0)
+            if r.status_code == 200:
+                print("✅ Gateway server is online and ready!")
+                break
+        except Exception:
+            time.sleep(0.5)
 
-    print(f"{'='*60}")
-    print("🤖 TESTING STREAMING VIA OPENAI PYTHON SDK")
+    print(f"\n{'='*60}")
+    print("🤖 TESTING CHAT COMPLETION (LOCAL LLM + LOCAL ORCHESTRATOR)")
     print(f"{'='*60}\n")
 
     client = OpenAI(base_url=f"http://127.0.0.1:{GATEWAY_PORT}/v1", api_key="not-needed")
 
     prompt = "Tell me a short story about a brave knight"
     print(f"Prompt: '{prompt}'\nCompletion: ", end="", flush=True)
+
 
     stream = client.chat.completions.create(
         model="tinyllama",

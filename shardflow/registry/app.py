@@ -16,13 +16,19 @@ from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, HTTPException, status
 
+from fastapi import FastAPI, HTTPException, status, APIRouter
+
 logger = logging.getLogger(__name__)
+
+router = APIRouter()
 
 app = FastAPI(
     title="ShardFlow Topology Registry",
     description="Node registration, topology discovery, and heartbeat monitoring",
     version="0.1.0",
 )
+app.include_router(router)
+
 
 
 KNOWN_MODEL_LAYERS = {
@@ -164,7 +170,7 @@ def _rebalance_assignments(model_id: str) -> None:
         node.next_node_port = next_port
 
 
-@app.post("/register", status_code=status.HTTP_201_CREATED, response_model=NodeRegistrationResponse)
+@router.post("/register", status_code=status.HTTP_201_CREATED, response_model=NodeRegistrationResponse)
 def register_node(payload: NodeRegistration):
     """Register or update a pipeline node and receive dynamic layer assignments."""
     _cleanup_inactive_nodes()
@@ -204,7 +210,7 @@ def register_node(payload: NodeRegistration):
     )
 
 
-@app.post("/heartbeat", status_code=status.HTTP_200_OK)
+@router.post("/heartbeat", status_code=status.HTTP_200_OK)
 def heartbeat(payload: HeartbeatPayload):
     """Receive heartbeat ping from a node."""
     if payload.node_id not in _nodes:
@@ -215,7 +221,7 @@ def heartbeat(payload: HeartbeatPayload):
     return {"status": "ok", "node_id": payload.node_id}
 
 
-@app.get("/topology", response_model=TopologyResponse)
+@router.get("/topology", response_model=TopologyResponse)
 def get_topology():
     """Return ordered topology of active nodes sorted by layer_start."""
     _cleanup_inactive_nodes()
@@ -227,13 +233,14 @@ def get_topology():
     )
 
 
-@app.delete("/nodes/{node_id}")
+@router.delete("/nodes/{node_id}")
 def unregister_node(node_id: str):
     """Manually unregister a node."""
     if node_id in _nodes:
         del _nodes[node_id]
         return {"status": "unregistered", "node_id": node_id}
     raise HTTPException(status_code=404, detail="Node not found")
+
 
 
 def main():

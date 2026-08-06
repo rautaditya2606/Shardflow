@@ -70,6 +70,9 @@ def start_cloudflare_tcp_tunnel(local_port: int) -> Tuple[subprocess.Popen, str,
         proc.terminate()
         raise RuntimeError("Failed to obtain Cloudflare tunnel URL within timeout")
 
+    return proc, public_url, 443
+
+
 def install_bore() -> str:
     """Ensure bore binary is installed and executable."""
     bin_path = shutil.which("bore")

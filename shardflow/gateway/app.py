@@ -48,8 +48,9 @@ app.add_middleware(
 )
 
 # Include Topology Registry endpoints (/register, /topology, /heartbeat) directly
-from shardflow.registry.app import app as registry_app
-app.include_router(registry_app.router)
+from shardflow.registry.app import router as registry_router
+app.include_router(registry_router)
+
 
 # Global orchestrator reference
 _orchestrator: Optional[Orchestrator] = None
