@@ -158,7 +158,7 @@ python scripts/test_local_real_server.py
 
 ## Benchmark Results
 
-Using TinyLlama 1.1B split across 2 pipeline nodes:
+### 1. Model: TinyLlama 1.1B (2 Pipeline Nodes)
 
 | Device | Framework / Strategy | Speed (tok/s) | Duration (20 tokens) |
 |---|---|---|---|
@@ -167,6 +167,13 @@ Using TinyLlama 1.1B split across 2 pipeline nodes:
 | **CPU** | **Optimized ShardFlow** (DynamicCache + Zero-Copy) | **1.12 tok/s** | **18.7s** |
 | **RTX 3050 GPU** | Initial TCP Protocol baseline (64KB Logits Relay) | 1.8 tok/s | 11.75s |
 | **RTX 3050 GPU** | **Optimized ShardFlow** (GPU Sampling + Zero-Copy + `TCP_NODELAY`) | **23.0 tok/s** | **0.91s (13x speedup)** |
+
+### 2. Model: Qwen/Qwen2.5-7B-Instruct (2 Google Colab T4 GPUs across Internet Tunnels)
+
+| Environment | Setup | Metric | Benchmark Result |
+|---|---|---|---|
+| **Google Colab (2 T4 GPUs)** | Layers 0-14 & 14-28 over `bore.pub` TCP Tunnel | **Raw GPU Node Generation** | **~14.7 tok/s** |
+| **Render + Colab Tunnels** | Full End-to-End HTTP `curl` Roundtrip | **End-to-End Latency** | **2.27 tok/s (38 tokens in 16.7s)** |
 
 ---
 
