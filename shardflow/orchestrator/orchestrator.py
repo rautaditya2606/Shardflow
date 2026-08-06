@@ -23,7 +23,7 @@ from typing import Optional
 
 import torch
 
-from shardflow.node.layer_loader import load_layer_slice, load_tokenizer
+from shardflow.orchestrator.tokenizer_utils import load_tokenizer
 from shardflow.orchestrator.sampler import sample_next_token
 from shardflow.transport.connection import NodeClient
 from shardflow.transport.protocol import (

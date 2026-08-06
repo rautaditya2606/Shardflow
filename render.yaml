@@ -24,3 +24,9 @@ services:
           property: host
       - key: SHARDFLOW_MODEL_PATH
         value: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+      # Point to the tokenizer cache baked into the Docker image at build time.
+      # This prevents AutoTokenizer.from_pretrained() from downloading at runtime
+      # and avoids the 500 MB /tmp spike that killed Render's 512 MB container.
+      - key: HF_HOME
+        value: "/app/.hf_cache"
+

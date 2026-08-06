@@ -279,24 +279,25 @@ async def cancel_session(session_id: str):
 
 @app.on_event("startup")
 async def startup_event():
-    """Auto-initialize orchestrator if environment variables are set."""
-    global _orchestrator
+    """
+    Intentionally lightweight — do NOT initialize the Orchestrator here.
+
+    Reason: Render free tier has a 512 MB RAM limit. Calling
+    AutoTokenizer.from_pretrained() during startup downloads and decompresses
+    the tokenizer vocab to /tmp (~500-600 MB peak), which kills the process.
+
+    The Orchestrator is initialized lazily on the first POST /v1/chat/completions
+    request, by which time Colab nodes will have registered themselves via /register.
+    This keeps idle RAM at ~30-50 MB.
+    """
     import os
-    registry_url = os.getenv("SHARDFLOW_REGISTRY_URL")
+    registry_url = os.getenv("SHARDFLOW_REGISTRY_URL", "(not set)")
     model_path = os.getenv("SHARDFLOW_MODEL_PATH", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-    if _orchestrator is None and registry_url:
-        logger.info("Auto-initializing Orchestrator from environment (Registry: %s, Model: %s)", registry_url, model_path)
-        try:
-            orch = Orchestrator(
-                model_path=model_path,
-                registry_url=registry_url,
-                device="cpu",
-            )
-            await orch.initialize()
-            set_orchestrator(orch)
-            logger.info("Orchestrator successfully initialized on startup.")
-        except Exception as e:
-            logger.warning("Could not auto-initialize Orchestrator on startup (waiting for active nodes): %s", e)
+    logger.info(
+        "ShardFlow Gateway started. Orchestrator will initialize lazily on first request. "
+        "Registry: %s | Model: %s",
+        registry_url, model_path,
+    )
 
 
 @app.get("/")
