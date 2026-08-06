@@ -74,14 +74,21 @@ def main():
 
     layer_start = assignment["layer_start"]
     layer_end = assignment["layer_end"]
-    is_first = assignment["is_first_node"]
-    is_last = assignment["is_last_node"]
+    total_layers = assignment.get("total_model_layers", 28)
+
+    if args.layer_start is not None:
+        layer_start = args.layer_start
+    if args.layer_end is not None:
+        layer_end = args.layer_end
+
+    is_first = (layer_start == 0)
+    is_last = (layer_end >= total_layers)
     next_host = assignment.get("next_node_host")
     next_port = assignment.get("next_node_port")
 
     logger.info(
-        "Successfully registered! Assigned layers [%d, %d) (is_first=%s, is_last=%s)",
-        layer_start, layer_end, is_first, is_last
+        "Successfully registered! Assigned layers [%d, %d) of %d total (is_first=%s, is_last=%s)",
+        layer_start, layer_end, total_layers, is_first, is_last
     )
     if next_host:
         logger.info("Next node routing target: %s:%d", next_host, next_port)
