@@ -3,8 +3,8 @@ Colab Node Runner script for ShardFlow.
 
 Usage in Google Colab:
 1. !pip install -q torch transformers tokenizers safetensors accelerate fastapi uvicorn requests pydantic sse-starlette
-2. !git clone https://github.com/adityaraut/Shardflow.git /content/Shardflow && cd /content/Shardflow && pip install -e .
-3. !python scripts/colab_runner.py --registry-url https://your-registry-url.onrender.com --model meta-llama/Meta-Llama-3-8B
+2. !git clone https://github.com/rautaditya2606/Shardflow.git /content/Shardflow && cd /content/Shardflow && pip install -e .
+3. !python scripts/colab_runner.py --registry-url https://shardflow.onrender.com --model Qwen/Qwen2.5-7B-Instruct --node-id colab-node-1 --port 9500
 """
 
 import argparse
@@ -23,11 +23,13 @@ logger = logging.getLogger("shardflow.colab_runner")
 
 def main():
     parser = argparse.ArgumentParser(description="ShardFlow Colab Node Runner")
-    parser.add_argument("--registry-url", required=True, help="Registry URL (e.g. https://shardflow-v0-1-0.onrender.com)")
-    parser.add_argument("--model", default="Qwen/Qwen2.5-14B-Instruct", help="Model path or HF model ID")
+    parser.add_argument("--registry-url", required=True, help="Registry URL (e.g. https://shardflow.onrender.com)")
+    parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct", help="Model path or HF model ID")
     parser.add_argument("--port", type=int, default=9500, help="Local TCP port")
     parser.add_argument("--tunnel", choices=["bore", "cloudflare"], default="bore", help="Tunnel backend (default: bore)")
     parser.add_argument("--node-id", default=None, help="Unique node identifier")
+    parser.add_argument("--layer-start", type=int, default=None, help="Explicit layer start (optional)")
+    parser.add_argument("--layer-end", type=int, default=None, help="Explicit layer end (optional)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -60,8 +62,13 @@ def main():
         "vram_total_mb": vram,
         "model_id": args.model,
     }
+    if args.layer_start is not None:
+        reg_payload["layer_start"] = args.layer_start
+    if args.layer_end is not None:
+        reg_payload["layer_end"] = args.layer_end
 
-    resp = requests.post(f"{args.registry_url.rstrip('/')}/register", json=reg_payload, timeout=15.0)
+    reg_url = f"{args.registry_url.rstrip('/')}/register"
+    resp = requests.post(reg_url, json=reg_payload, timeout=15.0)
     resp.raise_for_status()
     assignment = resp.json()
 
@@ -102,13 +109,24 @@ def main():
     )
 
     async def heartbeat_loop():
-        """Periodically ping Topology Registry to keep node alive."""
+        """
+        Periodically ping Topology Registry to keep node alive.
+        If Render restarted (404 response), automatically re-register!
+        """
         hb_url = f"{args.registry_url.rstrip('/')}/heartbeat"
         hb_payload = {"node_id": node_id}
         while True:
             await asyncio.sleep(10.0)
             try:
-                requests.post(hb_url, json=hb_payload, timeout=5.0)
+                hb_resp = requests.post(hb_url, json=hb_payload, timeout=5.0)
+                if hb_resp.status_code == 404:
+                    logger.warning("Render registry lost node %s (server restarted). Re-registering...", node_id)
+                    re_resp = requests.post(reg_url, json=reg_payload, timeout=10.0)
+                    if re_resp.status_code in (200, 201):
+                        data = re_resp.json()
+                        node.next_node_host = data.get("next_node_host", node.next_node_host)
+                        node.next_node_port = data.get("next_node_port", node.next_node_port)
+                        logger.info("Re-registration successful! Next node: %s:%s", node.next_node_host, node.next_node_port)
             except Exception as e:
                 logger.debug("Heartbeat ping error: %s", e)
 
@@ -116,7 +134,7 @@ def main():
         asyncio.create_task(heartbeat_loop())
         await node.serve_forever()
 
-    logger.info("Pipeline node running with background heartbeat...")
+    logger.info("Pipeline node running with background heartbeat & auto-reregistration...")
     asyncio.run(run_node())
 
 

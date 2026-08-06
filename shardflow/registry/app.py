@@ -221,7 +221,7 @@ def heartbeat(payload: HeartbeatPayload):
     return {"status": "ok", "node_id": payload.node_id}
 
 
-@router.get("/topology", response_model=TopologyResponse)
+@router.api_route("/topology", methods=["GET", "HEAD"], response_model=TopologyResponse)
 def get_topology():
     """Return ordered topology of active nodes sorted by layer_start."""
     _cleanup_inactive_nodes()

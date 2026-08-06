@@ -301,7 +301,7 @@ async def startup_event():
     )
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def read_root():
     return {
         "service": "ShardFlow OpenAI-Compatible API Gateway",
@@ -313,7 +313,7 @@ def read_root():
     }
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"status": "ok", "orchestrator_ready": _orchestrator is not None}
 
