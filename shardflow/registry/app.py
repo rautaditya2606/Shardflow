@@ -11,6 +11,7 @@ Endpoints:
 """
 
 import logging
+import os
 import time
 from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
@@ -31,14 +32,9 @@ app.include_router(router)
 
 
 
-KNOWN_MODEL_LAYERS = {
-    "tinyllama/tinyllama-1.1b-chat-v1.0": 22,
-    "meta-llama/meta-llama-3-8b": 32,
-    "meta-llama/meta-llama-3-8b-instruct": 32,
-    "meta-llama/llama-2-7b": 32,
-    "mistralai/mistral-7b-v0.1": 32,
-    "qwen/qwen2-7b": 28,
-}
+from shardflow.partition.engine import AutoPartitionEngine, NodeVRAMInfo
+
+EXPECTED_NODES = int(os.getenv("SHARDFLOW_EXPECTED_NODES", "2"))
 
 
 def get_model_total_layers(model_id: str) -> int:
@@ -133,42 +129,71 @@ def _cleanup_inactive_nodes() -> None:
 
 
 def _rebalance_assignments(model_id: str) -> None:
-    """Recalculate dynamic layer bounds and next-node routing across active nodes."""
+    """Run AutoPartitionEngine once all expected nodes are registered."""
     if not _nodes:
         return
 
-    # Sort nodes deterministically by layer_start, then node_id
-    sorted_node_ids = sorted(_nodes.keys(), key=lambda nid: (_nodes[nid].layer_start, nid))
-    total_layers = get_model_total_layers(model_id)
-    n_nodes = len(sorted_node_ids)
+    active = [n for n in _nodes.values() if n.is_active]
+    if len(active) < EXPECTED_NODES:
+        logger.info(
+            "Waiting for nodes: %d/%d registered", len(active), EXPECTED_NODES
+        )
+        return
 
-    # Only perform auto-split if nodes did not specify explicit non-zero layer bounds
-    all_auto = all(_nodes[nid].layer_end == 0 for nid in sorted_node_ids)
-    if all_auto:
-        base, rem = divmod(total_layers, n_nodes)
-        curr_layer = 0
-        for i, nid in enumerate(sorted_node_ids):
-            count = base + (1 if i < rem else 0)
-            _nodes[nid].layer_start = curr_layer
-            _nodes[nid].layer_end = curr_layer + count
-            curr_layer += count
+    total_layers = get_model_total_layers(model_id)
+    try:
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(model_id)
+        hidden_size = cfg.hidden_size
+        vocab_size = cfg.vocab_size
+    except Exception:
+        # ponytail: rough fallback so registry doesn't crash on network failure
+        hidden_size = 4096
+        vocab_size = 32000
+
+    engine = AutoPartitionEngine(
+        total_layers=total_layers,
+        hidden_size=hidden_size,
+        vocab_size=vocab_size,
+    )
+    vram_infos = [
+        NodeVRAMInfo(
+            node_id=n.node_id,
+            vram_available_mb=n.vram_available_mb,
+            vram_total_mb=n.vram_total_mb,
+        )
+        for n in active
+    ]
+
+    try:
+        assignments = engine.compute_partition(vram_infos)
+    except ValueError as e:
+        logger.error("AutoPartitionEngine failed: %s", e)
+        return
+
+    # Write assignments back, then update routing
+    sorted_node_ids = [a.node_id for a in assignments]
+    for a in assignments:
+        _nodes[a.node_id].layer_start = a.layer_start
+        _nodes[a.node_id].layer_end = a.layer_end
 
     for i, nid in enumerate(sorted_node_ids):
-        is_first = (i == 0)
-        is_last = (i == n_nodes - 1)
-
-        next_host = None
-        next_port = None
+        is_last = (i == len(sorted_node_ids) - 1)
+        _nodes[nid].is_first_node = (i == 0)
+        _nodes[nid].is_last_node = is_last
+        _nodes[nid].next_node_host = None
+        _nodes[nid].next_node_port = None
         if not is_last:
-            next_node = _nodes[sorted_node_ids[i + 1]]
-            next_host = next_node.addr
-            next_port = next_node.port
+            nxt = _nodes[sorted_node_ids[i + 1]]
+            _nodes[nid].next_node_host = nxt.addr
+            _nodes[nid].next_node_port = nxt.port
 
-        node = _nodes[nid]
-        node.is_first_node = is_first
-        node.is_last_node = is_last
-        node.next_node_host = next_host
-        node.next_node_port = next_port
+    logger.info(
+        "Partitioned %d layers across %d nodes: %s",
+        total_layers,
+        len(assignments),
+        [(a.node_id, a.layer_start, a.layer_end) for a in assignments],
+    )
 
 
 @router.post("/register", status_code=status.HTTP_201_CREATED, response_model=NodeRegistrationResponse)
@@ -241,6 +266,43 @@ def unregister_node(node_id: str):
         del _nodes[node_id]
         return {"status": "unregistered", "node_id": node_id}
     raise HTTPException(status_code=404, detail="Node not found")
+
+
+@router.get("/assignment/{node_id}")
+def get_assignment(node_id: str):
+    """
+    Poll for a node's layer assignment.
+
+    Returns 200 with slice info once AutoPartitionEngine has run.
+    Returns 202 while waiting for all expected nodes to register.
+    Nodes call this after registering with no layer bounds.
+    """
+    if node_id not in _nodes:
+        raise HTTPException(status_code=404, detail="Node not registered")
+
+    node = _nodes[node_id]
+    # layer_end == 0 means assignment hasn't run yet
+    if node.layer_end == 0:
+        active_count = sum(1 for n in _nodes.values() if n.is_active)
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "pending",
+                "message": f"Waiting for nodes: {active_count}/{EXPECTED_NODES}",
+            },
+        )
+
+    return {
+        "status": "assigned",
+        "node_id": node_id,
+        "layer_start": node.layer_start,
+        "layer_end": node.layer_end,
+        "is_first_node": node.is_first_node,
+        "is_last_node": node.is_last_node,
+        "next_node_host": node.next_node_host,
+        "next_node_port": node.next_node_port,
+    }
 
 
 

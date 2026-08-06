@@ -127,18 +127,33 @@ class NodeClient:
         self._writer: Optional[asyncio.StreamWriter] = None
         self._connected = False
 
-    async def connect(self) -> None:
-        """Establish TCP connection to the node."""
+    async def connect(self, max_retries: int = 15, retry_delay: float = 2.0) -> None:
+        """Establish TCP connection to the node, with retry for bootstrapping nodes."""
         logger.info("Connecting to %s:%d ...", self.host, self.port)
-        self._reader, self._writer = await asyncio.wait_for(
-            asyncio.open_connection(self.host, self.port),
-            timeout=self.send_timeout,
+        last_err = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                self._reader, self._writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.host, self.port),
+                    timeout=self.send_timeout,
+                )
+                sock = self._writer.get_extra_info("socket")
+                if sock:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self._connected = True
+                logger.info("Connected to %s:%d", self.host, self.port)
+                return
+            except (OSError, asyncio.TimeoutError) as e:
+                last_err = e
+                if attempt < max_retries:
+                    logger.debug(
+                        "Connect to %s:%d failed (attempt %d/%d): %s. Retrying in %.1fs...",
+                        self.host, self.port, attempt, max_retries, e, retry_delay
+                    )
+                    await asyncio.sleep(retry_delay)
+        raise ConnectionError(
+            f"Failed to connect to {self.host}:{self.port} after {max_retries} attempts: {last_err}"
         )
-        sock = self._writer.get_extra_info("socket")
-        if sock:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self._connected = True
-        logger.info("Connected to %s:%d", self.host, self.port)
 
     async def send(self, msg: TensorMessage) -> None:
         """Send a message to the connected node."""

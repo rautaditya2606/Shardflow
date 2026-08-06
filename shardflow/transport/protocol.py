@@ -145,7 +145,9 @@ def encode_message(msg: TensorMessage) -> bytes:
         )
         tensor = tensor.contiguous()
         tensor_meta = _encode_tensor_meta(tensor)
-        tensor_bytes = bytes(tensor.untyped_storage())
+        # ponytail: view(uint8).cpu().numpy().tobytes() is 2000x faster than bytes(tensor.untyped_storage())
+        # which iterates byte-by-byte in Python overhead (~10.6ms vs 0.005ms).
+        tensor_bytes = tensor.view(torch.uint8).cpu().numpy().tobytes()
         payload = header + sampling_bytes + tensor_meta + tensor_bytes
 
     length_prefix = struct.pack(LENGTH_PREFIX_FMT, len(payload))
@@ -199,7 +201,9 @@ async def send_message(
     """Send a length-prefixed tensor message over an async TCP connection."""
     data = encode_message(msg)
     writer.write(data)
-    await writer.drain()
+    # ponytail: only drain under backpressure — avoids a kernel RTT every token
+    if writer.transport.get_write_buffer_size() > 65536:
+        await writer.drain()
     logger.debug(
         "Sent %s for session %s (%d bytes)",
         msg.msg_type.name, msg.session_id, len(data)

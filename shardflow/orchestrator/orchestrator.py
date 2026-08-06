@@ -19,7 +19,7 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import Optional
+from typing import AsyncGenerator, Optional
 
 import torch
 
@@ -308,6 +308,89 @@ class Orchestrator:
         # Decode the full completion
         completion = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
         return completion
+
+    async def generate_stream(
+        self,
+        prompt: str,
+        max_tokens: int = 100,
+        temperature: float = 0.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+    ) -> AsyncGenerator[str, None]:
+        """
+        Async generator that yields decoded token strings one at a time.
+
+        Handles prefill + decode loop. Sends CLEAR in finally so callers
+        don't need to manage session cleanup on disconnect or error.
+        """
+        session_id = str(uuid.uuid4())
+        input_ids = self.tokenizer(prompt, return_tensors="pt")["input_ids"]
+        prompt_len = input_ids.shape[1]
+
+        try:
+            # Prefill — chunked to avoid OOM on long prompts
+            response = None
+            for chunk_start in range(0, prompt_len, 512):
+                chunk = input_ids[:, chunk_start:min(prompt_len, chunk_start + 512)]
+                msg = TensorMessage(
+                    msg_type=MessageType.ACTIVATION,
+                    session_id=session_id,
+                    tensor=chunk.cpu(),
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    sample_on_node=True,
+                )
+                response = await self._node0_client.send_recv(msg)
+
+            if response is None:
+                return
+
+            if response.msg_type == MessageType.TOKEN_ID:
+                next_token = response.token_id
+            elif response.msg_type == MessageType.LOGITS:
+                next_token = sample_next_token(
+                    response.tensor[0, -1, :], temperature=temperature, top_k=top_k, top_p=top_p
+                )
+            else:
+                raise RuntimeError(f"Unexpected prefill response: {response.msg_type}")
+
+            yield self.tokenizer.decode([next_token])
+
+            # Decode loop
+            for _ in range(1, max_tokens):
+                if next_token == self.tokenizer.eos_token_id:
+                    break
+
+                msg = TensorMessage(
+                    msg_type=MessageType.ACTIVATION,
+                    session_id=session_id,
+                    tensor=torch.tensor([[next_token]], dtype=torch.long),
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    sample_on_node=True,
+                )
+                response = await self._node0_client.send_recv(msg)
+
+                if response.msg_type == MessageType.TOKEN_ID:
+                    next_token = response.token_id
+                elif response.msg_type == MessageType.LOGITS:
+                    next_token = sample_next_token(
+                        response.tensor[0, -1, :], temperature=temperature, top_k=top_k, top_p=top_p
+                    )
+                else:
+                    raise RuntimeError(f"Unexpected decode response: {response.msg_type}")
+
+                yield self.tokenizer.decode([next_token])
+
+        finally:
+            # Always evict KV cache — fires on normal exit, error, or client disconnect
+            clear_msg = TensorMessage(msg_type=MessageType.CLEAR, session_id=session_id, tensor=None)
+            try:
+                await self._node0_client.send(clear_msg)
+            except Exception:
+                pass
 
     async def shutdown(self) -> None:
         """Disconnect from all nodes."""

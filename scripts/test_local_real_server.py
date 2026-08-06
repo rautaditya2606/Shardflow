@@ -30,9 +30,46 @@ def run_gateway_server(port: int = 8000):
     uvicorn.run(gateway_app, host="127.0.0.1", port=port, log_level="warning")
 
 
-def run_node_process(model_path: str, layer_start: int, layer_end: int, is_last: bool, listen_port: int, registry_url: str, node_id: str):
-    """Run a pipeline node process."""
-    logger.info("Node %s loading layers [%d, %d) on GPU...", node_id, layer_start, layer_end)
+def run_node_process(model_path: str, listen_port: int, registry_url: str, node_id: str):
+    """Run a pipeline node process — layers assigned by registry auto-partition."""
+    logger.info("Node %s registering (auto-partition mode)...", node_id)
+
+    # Register with no layer bounds — registry assigns via AutoPartitionEngine
+    reg_payload = {
+        "node_id": node_id,
+        "addr": "127.0.0.1",
+        "port": listen_port,
+        "vram_available_mb": 4000.0,
+        "vram_total_mb": 8000.0,
+        "model_id": model_path,
+    }
+    resp = requests.post(f"{registry_url}/register", json=reg_payload, timeout=10.0)
+    resp.raise_for_status()
+
+    # Poll for assignment (registry runs partition once SHARDFLOW_EXPECTED_NODES register)
+    import time
+    deadline = time.monotonic() + 90.0
+    assignment = None
+    while time.monotonic() < deadline:
+        time.sleep(2.0)
+        poll = requests.get(f"{registry_url}/assignment/{node_id}", timeout=5.0)
+        if poll.status_code == 200:
+            d = poll.json()
+            if d.get("status") == "assigned":
+                assignment = d
+                break
+
+    if assignment is None:
+        raise RuntimeError(f"Node {node_id} timed out waiting for layer assignment")
+
+    layer_start = assignment["layer_start"]
+    layer_end = assignment["layer_end"]
+    is_last = assignment["is_last_node"]
+    next_host = assignment.get("next_node_host")
+    next_port = assignment.get("next_node_port")
+
+    logger.info("Node %s auto-assigned layers [%d, %d), is_last=%s", node_id, layer_start, layer_end, is_last)
+
     model_slice = load_layer_slice(
         model_path=model_path,
         layer_start=layer_start,
@@ -41,25 +78,6 @@ def run_node_process(model_path: str, layer_start: int, layer_end: int, is_last:
         include_lm_head=is_last,
         device="cuda",
     )
-
-    reg_payload = {
-        "node_id": node_id,
-        "addr": "127.0.0.1",
-        "port": listen_port,
-        "vram_available_mb": 4000.0,
-        "vram_total_mb": 8000.0,
-        "model_id": model_path,
-        "layer_start": layer_start,
-        "layer_end": layer_end,
-    }
-    
-    resp = requests.post(f"{registry_url}/register", json=reg_payload, timeout=10.0)
-    resp.raise_for_status()
-    assignment = resp.json()
-
-    next_host = assignment.get("next_node_host")
-    next_port = assignment.get("next_node_port")
-    logger.info("Node %s registered! (is_last=%s, next=%s:%s)", node_id, is_last, next_host, next_port)
 
     node = PipelineNode(
         model_slice=model_slice,
@@ -107,25 +125,25 @@ def main():
         except Exception:
             time.sleep(0.2)
 
-    logger.info("==================================================")
-    logger.info("2. Spawning Node 1 (Layers 11..22, LAST)...")
+    logger.info("==========================================")
+    logger.info("2. Spawning Node 1 (auto-partition, LAST candidate)...")
     node1_proc = multiprocessing.Process(
         target=run_node_process,
-        args=(model_path, 11, 22, True, 9001, registry_url, "node-1"),
+        args=(model_path, 9001, registry_url, "node-1"),
         daemon=True,
     )
     node1_proc.start()
-    time.sleep(3.0)
+    time.sleep(2.0)
 
-    logger.info("==================================================")
-    logger.info("3. Spawning Node 0 (Layers 0..11, FIRST)...")
+    logger.info("==========================================")
+    logger.info("3. Spawning Node 0 (auto-partition, FIRST candidate)...")
     node0_proc = multiprocessing.Process(
         target=run_node_process,
-        args=(model_path, 0, 11, False, 9000, registry_url, "node-0"),
+        args=(model_path, 9000, registry_url, "node-0"),
         daemon=True,
     )
     node0_proc.start()
-    time.sleep(3.0)
+    time.sleep(2.0)
 
     logger.info("==================================================")
     logger.info("4. Checking Registry Topology...")

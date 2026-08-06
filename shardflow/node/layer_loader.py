@@ -10,15 +10,78 @@ Uses safetensors for direct weight loading without instantiating the full model.
 """
 
 import gc
+import json
 import logging
+import os
 from dataclasses import dataclass
-from typing import Optional
+from pathlib import Path
+from typing import Dict, Optional, Set
 
 import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_local_dir(model_path: str) -> Optional[Path]:
+    """Return a local directory path for model_path, or None if unavailable."""
+    if os.path.isdir(model_path):
+        return Path(model_path)
+    try:
+        from huggingface_hub import snapshot_download
+        local = snapshot_download(model_path, local_files_only=True)
+        return Path(local)
+    except Exception:
+        return None
+
+
+def _load_weights_from_safetensors(
+    model_path: str,
+    target_keys: Set[str],
+    target_dtype: torch.dtype,
+) -> Optional[Dict[str, torch.Tensor]]:
+    """
+    Load only the weights in target_keys from safetensors files.
+
+    target_keys comes from the already-allocated module's named_parameters(),
+    so it's fully model-agnostic — no hardcoded architecture names.
+
+    Returns a state_dict (key → tensor) or None if safetensors unavailable.
+    """
+    try:
+        from safetensors.torch import load_file
+    except ImportError:
+        return None
+
+    local_dir = _resolve_local_dir(model_path)
+    if local_dir is None:
+        return None
+
+    index_path = local_dir / "model.safetensors.index.json"
+    single_path = local_dir / "model.safetensors"
+
+    if index_path.exists():
+        with open(index_path) as f:
+            weight_map: Dict[str, str] = json.load(f)["weight_map"]
+        needed_shards = {weight_map[k] for k in target_keys if k in weight_map}
+        if not needed_shards:
+            logger.warning("No safetensors shards matched target keys — falling back to full load")
+            return None
+        state_dict: Dict[str, torch.Tensor] = {}
+        for shard in sorted(needed_shards):
+            logger.info("Loading shard %s ...", shard)
+            data = load_file(local_dir / shard, device="cpu")
+            state_dict.update({k: v.to(target_dtype) for k, v in data.items() if k in target_keys})
+        return state_dict
+
+    if single_path.exists():
+        logger.info("Loading single safetensors file (filtering to slice keys)...")
+        data = load_file(single_path, device="cpu")
+        return {k: v.to(target_dtype) for k, v in data.items() if k in target_keys}
+
+    return None
+
 
 
 @dataclass
@@ -119,7 +182,7 @@ def load_layer_slice(
     if has_accelerate:
         logger.info("Initializing meta device model shell (0 MB RAM footprint)...")
         with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(config, torch_dtype=target_dtype)
+            model = AutoModelForCausalLM.from_config(config, dtype=target_dtype)
         
         # Extract requested layers and allocate memory ONLY for the slice
         extracted_layers = nn.ModuleList([
@@ -145,24 +208,72 @@ def load_layer_slice(
         if hasattr(model.model, "rotary_emb"):
             rotary_emb = model.model.rotary_emb
 
-        # Now load actual weights into the allocated slice
-        logger.info("Loading weights directly into slice layers [%d, %d)...", layer_start, layer_end)
-        full_model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=target_dtype,
-            device_map="cpu",
-            low_cpu_mem_usage=True,
-        )
+        # Collect the exact safetensors keys we need from the allocated modules.
+        # This is model-agnostic: we ask the module itself what its parameters are.
+        target_keys: Set[str] = set()
         for idx, orig_idx in enumerate(range(layer_start, layer_end)):
-            extracted_layers[idx].load_state_dict(full_model.model.layers[orig_idx].state_dict())
+            prefix = f"model.layers.{orig_idx}"
+            for param_name in dict(extracted_layers[idx].named_parameters()).keys():
+                target_keys.add(f"{prefix}.{param_name}")
         if norm is not None:
-            norm.load_state_dict(full_model.model.norm.state_dict())
+            for param_name in dict(norm.named_parameters()).keys():
+                target_keys.add(f"model.norm.{param_name}")
         if lm_head is not None:
-            lm_head.load_state_dict(full_model.lm_head.state_dict())
+            for param_name in dict(lm_head.named_parameters()).keys():
+                target_keys.add(f"lm_head.{param_name}")
         if embed_tokens is not None:
-            embed_tokens.load_state_dict(full_model.model.embed_tokens.state_dict())
+            for param_name in dict(embed_tokens.named_parameters()).keys():
+                target_keys.add(f"model.embed_tokens.{param_name}")
 
-        del full_model
+        logger.info(
+            "Need %d weight tensors for layers [%d, %d)",
+            len(target_keys), layer_start, layer_end,
+        )
+
+        # Try targeted safetensors load first (only loads slice shards)
+        state_dict = _load_weights_from_safetensors(model_path, target_keys, target_dtype)
+
+        if state_dict is not None:
+            # Apply directly into the already-allocated tensors
+            for idx, orig_idx in enumerate(range(layer_start, layer_end)):
+                prefix = f"model.layers.{orig_idx}"
+                layer_sd = {
+                    k[len(prefix) + 1:]: v
+                    for k, v in state_dict.items()
+                    if k.startswith(prefix + ".")
+                }
+                extracted_layers[idx].load_state_dict(layer_sd)
+            if norm is not None:
+                norm_sd = {k[len("model.norm."):]: v for k, v in state_dict.items() if k.startswith("model.norm.")}
+                norm.load_state_dict(norm_sd)
+            if lm_head is not None:
+                head_sd = {k[len("lm_head."):]: v for k, v in state_dict.items() if k.startswith("lm_head.")}
+                lm_head.load_state_dict(head_sd)
+            if embed_tokens is not None:
+                embed_sd = {k[len("model.embed_tokens."):]: v for k, v in state_dict.items() if k.startswith("model.embed_tokens.")}
+                embed_tokens.load_state_dict(embed_sd)
+            del state_dict
+        else:
+            # Fallback: load full model to CPU and copy slice weights
+            logger.warning(
+                "Targeted safetensors load unavailable — loading full model to CPU (higher RAM usage)"
+            )
+            full_model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=target_dtype,
+                device_map="cpu",
+                low_cpu_mem_usage=True,
+            )
+            for idx, orig_idx in enumerate(range(layer_start, layer_end)):
+                extracted_layers[idx].load_state_dict(full_model.model.layers[orig_idx].state_dict())
+            if norm is not None:
+                norm.load_state_dict(full_model.model.norm.state_dict())
+            if lm_head is not None:
+                lm_head.load_state_dict(full_model.lm_head.state_dict())
+            if embed_tokens is not None:
+                embed_tokens.load_state_dict(full_model.model.embed_tokens.state_dict())
+            del full_model
+
         del model
         gc.collect()
         if torch.cuda.is_available():

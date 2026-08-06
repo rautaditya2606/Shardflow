@@ -117,7 +117,6 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
     # Handle streaming SSE response
     if req.stream:
         async def event_generator() -> AsyncGenerator[str, None]:
-            # Initial chunk with role
             role_chunk = ChatCompletionChunk(
                 id=completion_id,
                 created=created_ts,
@@ -126,77 +125,16 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
             )
             yield f"data: {json.dumps(role_chunk.model_dump())}\n\n"
 
-            # Stream tokens
-            # We can capture tokens as orchestrator generates
-            # For streaming, we generate tokens incrementally
             try:
-                # Custom async token yield generator calling orchestrator logic
-                session_id = str(uuid.uuid4())
-                input_ids = _orchestrator.tokenizer(prompt, return_tensors="pt")["input_ids"]
-                prompt_len = input_ids.shape[1]
-
-                hidden_states = _orchestrator._embed(input_ids)
-                from shardflow.transport.protocol import TensorMessage, MessageType
-                from shardflow.orchestrator.sampler import sample_next_token
-
-                msg = TensorMessage(
-                    msg_type=MessageType.ACTIVATION,
-                    session_id=session_id,
-                    tensor=hidden_states.cpu(),
+                async for token_text in _orchestrator.generate_stream(
+                    prompt=prompt,
+                    max_tokens=req.max_tokens,
                     temperature=req.temperature,
                     top_k=req.top_k,
                     top_p=req.top_p,
-                    sample_on_node=True,
-                )
-                response = await _orchestrator._node0_client.send_recv(msg)
-                if response.msg_type == MessageType.TOKEN_ID:
-                    next_token = response.token_id
-                elif response.msg_type == MessageType.LOGITS:
-                    logits = response.tensor[0, -1, :]
-                    next_token = sample_next_token(logits, temperature=req.temperature, top_k=req.top_k, top_p=req.top_p)
-                else:
-                    raise RuntimeError(f"Expected TOKEN_ID or LOGITS, got {response.msg_type}")
-
-                token_text = _orchestrator.tokenizer.decode([next_token])
-                chunk = ChatCompletionChunk(
-                    id=completion_id,
-                    created=created_ts,
-                    model=req.model,
-                    choices=[ChunkChoice(index=0, delta=DeltaMessage(content=token_text), finish_reason=None)],
-                )
-                yield f"data: {json.dumps(chunk.model_dump())}\n\n"
-
-                for _ in range(1, req.max_tokens):
-                    if next_token == _orchestrator.tokenizer.eos_token_id:
-                        break
-
-                    # Check client disconnect
+                ):
                     if await raw_request.is_disconnected():
-                        logger.info("Client disconnected during stream for session %s", session_id)
                         break
-
-                    import torch
-                    token_ids = torch.tensor([[next_token]], dtype=torch.long)
-                    hidden_states = _orchestrator._embed(token_ids)
-                    msg = TensorMessage(
-                        msg_type=MessageType.ACTIVATION,
-                        session_id=session_id,
-                        tensor=hidden_states.cpu(),
-                        temperature=req.temperature,
-                        top_k=req.top_k,
-                        top_p=req.top_p,
-                        sample_on_node=True,
-                    )
-                    response = await _orchestrator._node0_client.send_recv(msg)
-                    if response.msg_type == MessageType.TOKEN_ID:
-                        next_token = response.token_id
-                    elif response.msg_type == MessageType.LOGITS:
-                        logits = response.tensor[0, -1, :]
-                        next_token = sample_next_token(logits, temperature=req.temperature, top_k=req.top_k, top_p=req.top_p)
-                    else:
-                        raise RuntimeError(f"Expected TOKEN_ID or LOGITS, got {response.msg_type}")
-
-                    token_text = _orchestrator.tokenizer.decode([next_token])
                     chunk = ChatCompletionChunk(
                         id=completion_id,
                         created=created_ts,
@@ -204,26 +142,17 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
                         choices=[ChunkChoice(index=0, delta=DeltaMessage(content=token_text), finish_reason=None)],
                     )
                     yield f"data: {json.dumps(chunk.model_dump())}\n\n"
-
-                # Final chunk
-                final_chunk = ChatCompletionChunk(
-                    id=completion_id,
-                    created=created_ts,
-                    model=req.model,
-                    choices=[ChunkChoice(index=0, delta=DeltaMessage(), finish_reason="stop")],
-                )
-                yield f"data: {json.dumps(final_chunk.model_dump())}\n\n"
-                yield "data: [DONE]\n\n"
-
-            except Exception as e:
+            except Exception:
                 logger.exception("Error during SSE streaming")
-            finally:
-                # Cleanup session on finish or disconnect
-                clear_msg = TensorMessage(msg_type=MessageType.CLEAR, session_id=session_id, tensor=None)
-                try:
-                    await _orchestrator._node0_client.send(clear_msg)
-                except Exception:
-                    pass
+
+            final_chunk = ChatCompletionChunk(
+                id=completion_id,
+                created=created_ts,
+                model=req.model,
+                choices=[ChunkChoice(index=0, delta=DeltaMessage(), finish_reason="stop")],
+            )
+            yield f"data: {json.dumps(final_chunk.model_dump())}\n\n"
+            yield "data: [DONE]\n\n"
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 

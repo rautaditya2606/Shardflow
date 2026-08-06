@@ -255,8 +255,8 @@ def main():
     """CLI entry point for starting a pipeline node."""
     parser = argparse.ArgumentParser(description="ShardFlow Pipeline Node")
     parser.add_argument("--model", required=True, help="Model path or HF model ID")
-    parser.add_argument("--layer-start", type=int, default=None, help="First layer index (inclusive)")
-    parser.add_argument("--layer-end", type=int, default=None, help="Last layer index (exclusive)")
+    parser.add_argument("--layer-start", type=int, default=None, help="First layer index (inclusive); auto-assigned if omitted")
+    parser.add_argument("--layer-end", type=int, default=None, help="Last layer index (exclusive); auto-assigned if omitted")
     parser.add_argument("--host", default="0.0.0.0", help="Listen host")
     parser.add_argument("--port", type=int, default=9000, help="Listen port")
     parser.add_argument("--next-host", default=None, help="Next node host (omit for last node)")
@@ -299,6 +299,7 @@ def main():
                 "vram_total_mb": vram,
                 "model_id": args.model,
             }
+            # Only send explicit bounds if given — otherwise let registry auto-assign
             if layer_start is not None:
                 reg_payload["layer_start"] = layer_start
             if layer_end is not None:
@@ -311,8 +312,11 @@ def main():
             )
             if resp.status_code in (200, 201):
                 data = resp.json()
-                layer_start = data.get("layer_start", layer_start)
-                layer_end = data.get("layer_end", layer_end)
+                # Use registry-assigned values if we didn't specify manually
+                if layer_start is None:
+                    layer_start = data.get("layer_start")
+                if layer_end is None or layer_end == 0:
+                    layer_end = data.get("layer_end")
                 is_last = data.get("is_last_node", is_last)
                 next_host = data.get("next_node_host", next_host)
                 next_port = data.get("next_node_port", next_port)
@@ -320,6 +324,41 @@ def main():
                     "Registered node %s with registry -> assigned layers [%s, %s)",
                     node_id, layer_start, layer_end
                 )
+
+            # If auto-assign mode and layer_end is still 0/None, poll until assigned
+            if not layer_end:
+                logger.info(
+                    "Layer bounds not yet assigned — polling /assignment/%s (timeout 90s)...",
+                    node_id,
+                )
+                import time
+                deadline = time.monotonic() + 90.0
+                while time.monotonic() < deadline:
+                    time.sleep(3.0)
+                    try:
+                        poll = requests.get(
+                            f"{args.registry_url.rstrip('/')}/assignment/{node_id}",
+                            timeout=5.0,
+                        )
+                        if poll.status_code == 200:
+                            d = poll.json()
+                            if d.get("status") == "assigned":
+                                layer_start = d["layer_start"]
+                                layer_end = d["layer_end"]
+                                is_last = d["is_last_node"]
+                                next_host = d.get("next_node_host")
+                                next_port = d.get("next_node_port")
+                                logger.info(
+                                    "Auto-assigned layers [%d, %d) (is_last=%s)",
+                                    layer_start, layer_end, is_last,
+                                )
+                                break
+                    except Exception as e:
+                        logger.debug("Poll error: %s", e)
+                else:
+                    logger.error("Timed out waiting for layer assignment from registry.")
+                    sys.exit(1)
+
         except Exception as e:
             logger.warning("Failed auto-registration with registry: %s", e)
 
