@@ -248,7 +248,17 @@ def load_layer_slice(
         rotary_emb = None
         if hasattr(model.model, "rotary_emb") and model.model.rotary_emb is not None:
             try:
-                rotary_emb = model.model.rotary_emb.to_empty(device=device)
+                rotary_cls = type(model.model.rotary_emb)
+                rotary_emb = rotary_cls(config).to(device)
+            except Exception:
+                try:
+                    rotary_emb = model.model.rotary_emb.to_empty(device=device)
+                except Exception:
+                    rotary_emb = None
+        elif hasattr(model, "rotary_emb") and model.rotary_emb is not None:
+            try:
+                rotary_cls = type(model.rotary_emb)
+                rotary_emb = rotary_cls(config).to(device)
             except Exception:
                 rotary_emb = None
 
