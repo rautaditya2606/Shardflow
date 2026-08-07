@@ -168,6 +168,27 @@ class Orchestrator:
         """Pass token IDs integer tensor directly (embedding executes on Node 0 GPU)."""
         return token_ids
 
+    async def _ensure_node0_connected(self) -> None:
+        """Ensure orchestrator is connected to current Node 0 target from topology."""
+        nodes = await self.fetch_topology_async(force=True)
+        if not nodes:
+            raise RuntimeError("No active nodes available in topology")
+        node0_host, node0_port = nodes[0]
+        if (
+            self._node0_client is None
+            or not self._node0_client.is_connected
+            or self._node0_client.host != node0_host
+            or self._node0_client.port != node0_port
+        ):
+            if self._node0_client:
+                try:
+                    await self._node0_client.close()
+                except Exception:
+                    pass
+            logger.info("Connecting orchestrator to Node 0 at %s:%d...", node0_host, node0_port)
+            self._node0_client = NodeClient(node0_host, node0_port)
+            await self._node0_client.connect()
+
     async def generate(
         self,
         prompt: str,
@@ -191,6 +212,7 @@ class Orchestrator:
         Returns:
             Generated text (completion only, not including prompt)
         """
+        await self._ensure_node0_connected()
         session_id = str(uuid.uuid4())
         logger.info(
             "Starting generation: session=%s, max_tokens=%d, temp=%.2f",
@@ -344,6 +366,7 @@ class Orchestrator:
         don't need to manage session cleanup on disconnect or error.
         """
         session_id = str(uuid.uuid4())
+        await self._ensure_node0_connected()
         input_ids = self.tokenizer(prompt, return_tensors="pt")["input_ids"]
         prompt_len = input_ids.shape[1]
 

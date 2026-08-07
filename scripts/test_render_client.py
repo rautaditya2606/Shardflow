@@ -17,7 +17,7 @@ def main():
 
     start_t = time.time()
     response = client.chat.completions.create(
-        model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        model="Qwen/Qwen2.5-7B-Instruct",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=60,
         temperature=0.7,
@@ -26,8 +26,12 @@ def main():
 
     print("Response: ", end="", flush=True)
     for chunk in response:
-        if chunk.choices[0].delta.content:
-            print(chunk.choices[0].delta.content, end="", flush=True)
+        if hasattr(chunk, "choices") and chunk.choices:
+            content = chunk.choices[0].delta.content
+            if content:
+                print(content, end="", flush=True)
+        else:
+            print(f"[raw: {chunk}]", end="", flush=True)
 
     duration = time.time() - start_t
     print(f"\n\nDone in {duration:.2f}s!")

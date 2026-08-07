@@ -130,18 +130,19 @@ class NodeClient:
     async def connect(self, max_retries: int = 15, retry_delay: float = 2.0) -> None:
         """Establish TCP connection to the node, with retry for bootstrapping nodes."""
         logger.info("Connecting to %s:%d ...", self.host, self.port)
+        use_ssl = True if self.port == 443 else None
         last_err = None
         for attempt in range(1, max_retries + 1):
             try:
                 self._reader, self._writer = await asyncio.wait_for(
-                    asyncio.open_connection(self.host, self.port),
+                    asyncio.open_connection(self.host, self.port, ssl=use_ssl),
                     timeout=self.send_timeout,
                 )
                 sock = self._writer.get_extra_info("socket")
                 if sock:
                     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self._connected = True
-                logger.info("Connected to %s:%d", self.host, self.port)
+                logger.info("Connected to %s:%d (ssl=%s)", self.host, self.port, bool(use_ssl))
                 return
             except (OSError, asyncio.TimeoutError) as e:
                 last_err = e
@@ -157,15 +158,23 @@ class NodeClient:
 
     async def send(self, msg: TensorMessage) -> None:
         """Send a message to the connected node."""
-        if not self._connected:
+        if not self.is_connected:
             raise ConnectionError("Not connected. Call connect() first.")
-        await send_message(self._writer, msg)
+        try:
+            await send_message(self._writer, msg)
+        except Exception:
+            self._connected = False
+            raise
 
     async def recv(self) -> TensorMessage:
         """Receive a message from the connected node."""
-        if not self._connected:
+        if not self.is_connected:
             raise ConnectionError("Not connected. Call connect() first.")
-        return await recv_message(self._reader, timeout=self.recv_timeout)
+        try:
+            return await recv_message(self._reader, timeout=self.recv_timeout)
+        except Exception:
+            self._connected = False
+            raise
 
     async def send_recv(self, msg: TensorMessage) -> TensorMessage:
         """Send a message and wait for a response."""
@@ -175,11 +184,19 @@ class NodeClient:
     async def close(self) -> None:
         """Close the connection."""
         if self._writer:
-            self._writer.close()
-            await self._writer.wait_closed()
+            try:
+                self._writer.close()
+                await self._writer.wait_closed()
+            except Exception:
+                pass
         self._connected = False
         logger.info("Disconnected from %s:%d", self.host, self.port)
 
     @property
     def is_connected(self) -> bool:
-        return self._connected
+        if not self._connected:
+            return False
+        if self._writer is None or self._writer.is_closing():
+            self._connected = False
+            return False
+        return True
