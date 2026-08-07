@@ -147,13 +147,13 @@ def _rebalance_assignments(model_id: str) -> None:
         logger.info(
             "Waiting for nodes: %d/%d registered", len(active), EXPECTED_NODES
         )
-        # ponytail: single node owns all layers until full cluster joins
+        # ponytail: assign proportional layer slice (total_layers // EXPECTED_NODES) to first node to prevent single-GPU CUDA OOM
         if len(active) == 1:
             n0 = active[0]
             n0.layer_start = 0
-            n0.layer_end = total_layers
+            n0.layer_end = total_layers // max(1, EXPECTED_NODES)
             n0.is_first_node = True
-            n0.is_last_node = True
+            n0.is_last_node = (EXPECTED_NODES == 1)
         return
     # ponytail: fast offline lookup to eliminate HF network latency during /register
     key = model_id.lower()

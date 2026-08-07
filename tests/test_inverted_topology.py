@@ -31,9 +31,9 @@ def test_auto_split_tinyllama_2_nodes():
     assert r0.status_code == 201
     d0 = r0.json()
     assert d0["layer_start"] == 0
-    assert d0["layer_end"] == 22
+    assert d0["layer_end"] == 11
     assert d0["is_first_node"] is True
-    assert d0["is_last_node"] is True
+    assert d0["is_last_node"] is False
 
     node1 = {
         "node_id": "node-1",
