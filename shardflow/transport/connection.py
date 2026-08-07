@@ -183,7 +183,7 @@ class NodeClient:
         try:
             return await recv_message(self._reader, timeout=t)
         except Exception:
-            self._connected = False
+            await self.close()
             raise
 
     async def close(self) -> None:

@@ -155,13 +155,26 @@ class KVCacheStore:
         """Get cache statistics."""
         total_memory = 0
         for session_id, cache_obj in self._cache.items():
-            if hasattr(cache_obj, "__len__"):
-                for idx in range(len(cache_obj)):
-                    k, v = cache_obj[idx]
-                    if k is not None:
+            if hasattr(cache_obj, "layers") and isinstance(cache_obj.layers, (list, tuple)):
+                for layer in cache_obj.layers:
+                    for tensor in (getattr(layer, "keys", None), getattr(layer, "values", None)):
+                        if tensor is not None and hasattr(tensor, "nelement"):
+                            total_memory += tensor.nelement() * tensor.element_size()
+            elif hasattr(cache_obj, "key_cache") and hasattr(cache_obj, "value_cache"):
+                for k in getattr(cache_obj, "key_cache", []):
+                    if k is not None and hasattr(k, "nelement"):
                         total_memory += k.nelement() * k.element_size()
-                    if v is not None:
+                for v in getattr(cache_obj, "value_cache", []):
+                    if v is not None and hasattr(v, "nelement"):
                         total_memory += v.nelement() * v.element_size()
+            elif isinstance(cache_obj, (list, tuple)):
+                for item in cache_obj:
+                    if isinstance(item, (list, tuple)) and len(item) == 2:
+                        k, v = item
+                        if k is not None and hasattr(k, "nelement"):
+                            total_memory += k.nelement() * k.element_size()
+                        if v is not None and hasattr(v, "nelement"):
+                            total_memory += v.nelement() * v.element_size()
 
         return {
             "active_sessions": self.active_sessions,
