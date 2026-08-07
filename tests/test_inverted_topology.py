@@ -13,8 +13,59 @@ client = TestClient(registry_app)
 @pytest.fixture(autouse=True)
 def clear_registry_nodes():
     _nodes.clear()
+    import shardflow.registry.app as registry_mod
+    registry_mod._topology_version = 0
     yield
     _nodes.clear()
+    registry_mod._topology_version = 0
+
+
+def test_assignment_pending_until_cluster_ready():
+    """Nodes must not receive final assignment until EXPECTED_NODES register."""
+    node0 = {
+        "node_id": "node-0",
+        "addr": "127.0.0.1",
+        "port": 9000,
+        "model_id": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    client.post("/register", json=node0)
+
+    pending = client.get("/assignment/node-0")
+    assert pending.status_code == 202
+    assert pending.json()["status"] == "pending"
+    assert pending.json()["cluster_ready"] is False
+
+    node1 = {
+        "node_id": "node-1",
+        "addr": "127.0.0.1",
+        "port": 9001,
+        "model_id": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    client.post("/register", json=node1)
+
+    assigned = client.get("/assignment/node-0")
+    assert assigned.status_code == 200
+    data = assigned.json()
+    assert data["status"] == "assigned"
+    assert data["cluster_ready"] is True
+    assert data["layer_start"] == 0
+    assert data["layer_end"] == 11
+    assert data["next_node_host"] == "127.0.0.1"
+    assert data["topology_version"] >= 1
+
+
+def test_heartbeat_includes_topology_version():
+    node0 = {
+        "node_id": "node-0",
+        "addr": "127.0.0.1",
+        "port": 9000,
+        "model_id": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    client.post("/register", json=node0)
+    hb = client.post("/heartbeat", json={"node_id": "node-0"})
+    assert hb.status_code == 200
+    assert "topology_version" in hb.json()
+    assert hb.json()["cluster_ready"] is False
 
 
 def test_auto_split_tinyllama_2_nodes():
@@ -88,8 +139,8 @@ def test_auto_split_llama3_8b_2_nodes():
 
     topo = client.get("/topology").json()
     assert topo["nodes"][0]["layer_start"] == 0
-    assert topo["nodes"][0]["layer_end"] == 16
-    assert topo["nodes"][1]["layer_start"] == 16
+    assert topo["nodes"][0]["layer_end"] == 17
+    assert topo["nodes"][1]["layer_start"] == 17
     assert topo["nodes"][1]["layer_end"] == 32
 
 

@@ -19,6 +19,7 @@ import uvicorn
 from shardflow.gateway.app import app as gateway_app
 from shardflow.node.layer_loader import load_layer_slice
 from shardflow.node.node import PipelineNode
+from shardflow.registry.client import poll_for_assignment
 from shardflow.transport.connection import NodeClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -46,21 +47,7 @@ def run_node_process(model_path: str, listen_port: int, registry_url: str, node_
     resp = requests.post(f"{registry_url}/register", json=reg_payload, timeout=10.0)
     resp.raise_for_status()
 
-    # Poll for assignment (registry runs partition once SHARDFLOW_EXPECTED_NODES register)
-    import time
-    deadline = time.monotonic() + 90.0
-    assignment = None
-    while time.monotonic() < deadline:
-        time.sleep(2.0)
-        poll = requests.get(f"{registry_url}/assignment/{node_id}", timeout=5.0)
-        if poll.status_code == 200:
-            d = poll.json()
-            if d.get("status") == "assigned":
-                assignment = d
-                break
-
-    if assignment is None:
-        raise RuntimeError(f"Node {node_id} timed out waiting for layer assignment")
+    assignment = poll_for_assignment(registry_url, node_id, timeout=90.0)
 
     layer_start = assignment["layer_start"]
     layer_end = assignment["layer_end"]

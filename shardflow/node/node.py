@@ -332,6 +332,7 @@ def main():
     # Auto-registration with Registry if registry_url is provided
     if args.registry_url:
         import requests
+        from shardflow.registry.client import poll_for_assignment
         vram = 0.0
         if torch.cuda.is_available():
             vram = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
@@ -370,39 +371,22 @@ def main():
                     node_id, layer_start, layer_end
                 )
 
-            # If auto-assign mode and layer_end is still 0/None, poll until assigned
-            if not layer_end:
+            # Poll until the full cluster partition is ready before loading weights
+            if layer_start is None or layer_end is None or layer_end == 0:
                 logger.info(
-                    "Layer bounds not yet assigned — polling /assignment/%s (timeout 90s)...",
+                    "Waiting for final cluster assignment — polling /assignment/%s...",
                     node_id,
                 )
-                import time
-                deadline = time.monotonic() + 90.0
-                while time.monotonic() < deadline:
-                    time.sleep(3.0)
-                    try:
-                        poll = requests.get(
-                            f"{args.registry_url.rstrip('/')}/assignment/{node_id}",
-                            timeout=5.0,
-                        )
-                        if poll.status_code == 200:
-                            d = poll.json()
-                            if d.get("status") == "assigned":
-                                layer_start = d["layer_start"]
-                                layer_end = d["layer_end"]
-                                is_last = d["is_last_node"]
-                                next_host = d.get("next_node_host")
-                                next_port = d.get("next_node_port")
-                                logger.info(
-                                    "Auto-assigned layers [%d, %d) (is_last=%s)",
-                                    layer_start, layer_end, is_last,
-                                )
-                                break
-                    except Exception as e:
-                        logger.debug("Poll error: %s", e)
-                else:
-                    logger.error("Timed out waiting for layer assignment from registry.")
-                    sys.exit(1)
+                assignment = poll_for_assignment(args.registry_url, node_id, timeout=120.0)
+                layer_start = assignment["layer_start"]
+                layer_end = assignment["layer_end"]
+                is_last = assignment["is_last_node"]
+                next_host = assignment.get("next_node_host")
+                next_port = assignment.get("next_node_port")
+                logger.info(
+                    "Auto-assigned layers [%d, %d) (is_last=%s)",
+                    layer_start, layer_end, is_last,
+                )
 
         except Exception as e:
             logger.warning("Failed auto-registration with registry: %s", e)

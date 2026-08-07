@@ -1,10 +1,10 @@
 """
-Colab Node Runner script for ShardFlow.
+Kaggle Node Runner script for ShardFlow.
 
-Usage in Google Colab:
+Usage in Kaggle Notebook:
 1. !pip install -q torch transformers tokenizers safetensors accelerate fastapi uvicorn requests pydantic sse-starlette
-2. !git clone https://github.com/rautaditya2606/Shardflow.git /content/Shardflow && cd /content/Shardflow && pip install -e .
-3. !python scripts/colab_runner.py --registry-url https://shardflow.onrender.com --model Qwen/Qwen2.5-7B-Instruct --node-id colab-node-1 --port 9500
+2. !git clone https://github.com/rautaditya2606/Shardflow.git /kaggle/working/Shardflow && cd /kaggle/working/Shardflow && pip install -e .
+3. !python scripts/kaggle_runner.py --registry-url https://shardflow.onrender.com --model Qwen/Qwen2.5-7B-Instruct --node-id kaggle-node-1 --port 9500
 """
 
 import argparse
@@ -19,11 +19,11 @@ from shardflow.transport.tunnel import start_cloudflare_tcp_tunnel, start_bore_t
 from shardflow.node.layer_loader import load_layer_slice
 from shardflow.node.node import PipelineNode
 
-logger = logging.getLogger("shardflow.colab_runner")
+logger = logging.getLogger("shardflow.kaggle_runner")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ShardFlow Colab Node Runner")
+    parser = argparse.ArgumentParser(description="ShardFlow Kaggle Node Runner")
     parser.add_argument("--registry-url", required=True, help="Registry URL (e.g. https://shardflow.onrender.com)")
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct", help="Model path or HF model ID")
     parser.add_argument("--port", type=int, default=9500, help="Local TCP port")
@@ -31,7 +31,7 @@ def main():
         "--tunnel",
         choices=["bore", "cloudflare"],
         default="cloudflare",
-        help="Tunnel backend (default: cloudflare — more stable than bore.pub)",
+        help="Tunnel backend (default: cloudflare)",
     )
     parser.add_argument("--node-id", default=None, help="Unique node identifier")
     parser.add_argument("--layer-start", type=int, default=None, help="Explicit layer start (optional)")
@@ -43,7 +43,7 @@ def main():
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
-    node_id = args.node_id or f"colab-node-{int(time.time())}"
+    node_id = args.node_id or f"kaggle-node-{int(time.time())}"
     local_port = args.port
 
     if args.tunnel == "bore":
@@ -117,8 +117,6 @@ def main():
         is_first,
         is_last,
     )
-    if next_host:
-        logger.info("Next node routing target: %s:%d", next_host, next_port)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info("Loading layer slice [%d, %d) onto device %s...", layer_start, layer_end, device)
@@ -145,10 +143,6 @@ def main():
     seen_topology_version = topology_version
 
     async def heartbeat_loop():
-        """
-        Keep node alive and apply routing updates when topology_version changes.
-        Re-register automatically if Render restarts and loses in-memory state.
-        """
         nonlocal seen_topology_version
         hb_url = f"{args.registry_url.rstrip('/')}/heartbeat"
         hb_payload = {"node_id": node_id}
@@ -184,7 +178,7 @@ def main():
         asyncio.create_task(heartbeat_loop())
         await node.serve_forever()
 
-    logger.info("Pipeline node running with background heartbeat & auto-reregistration...")
+    logger.info("Kaggle Pipeline node running...")
     asyncio.run(run_node())
 
 

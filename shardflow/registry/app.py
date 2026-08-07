@@ -35,8 +35,10 @@ app.include_router(router)
 from shardflow.partition.engine import AutoPartitionEngine, NodeVRAMInfo
 
 EXPECTED_NODES = int(os.getenv("SHARDFLOW_EXPECTED_NODES", "2"))
+HEARTBEAT_TIMEOUT = float(os.getenv("SHARDFLOW_HEARTBEAT_TIMEOUT", "90.0"))
+HEARTBEAT_GRACE = float(os.getenv("SHARDFLOW_HEARTBEAT_GRACE", "60.0"))
 
-# ponytail: Offline model layer map to eliminate network latency during /register
+# Offline model metadata — avoids HuggingFace Hub calls during /register
 KNOWN_MODEL_LAYERS: Dict[str, int] = {
     "tinyllama/tinyllama-1.1b-chat-v1.0": 22,
     "qwen/qwen2.5-7b-instruct": 28,
@@ -50,6 +52,22 @@ KNOWN_MODEL_LAYERS: Dict[str, int] = {
     "meta-llama/meta-llama-3-8b-instruct": 32,
     "meta-llama/llama-2-7b-hf": 32,
     "mistralai/mistral-7b-v0.1": 32,
+    "mistralai/mistral-7b-instruct-v0.2": 32,
+    "google/gemma-2-9b-it": 42,
+    "google/gemma-2-2b-it": 26,
+}
+
+KNOWN_MODEL_DIMS: Dict[str, tuple[int, int]] = {
+    "qwen/qwen2.5-14b-instruct": (5120, 152064),
+    "deepseek-ai/deepseek-r1-distill-qwen-14b": (5120, 152064),
+    "qwen/qwen2.5-7b-instruct": (3584, 152064),
+    "deepseek-ai/deepseek-r1-distill-qwen-7b": (3584, 152064),
+    "qwen/qwen2.5-3b-instruct": (2048, 151936),
+    "meta-llama/meta-llama-3-8b": (4096, 128256),
+    "meta-llama/meta-llama-3-8b-instruct": (4096, 128256),
+    "meta-llama/llama-2-7b-hf": (4096, 32000),
+    "mistralai/mistral-7b-v0.1": (4096, 32000),
+    "tinyllama/tinyllama-1.1b-chat-v1.0": (2048, 32000),
 }
 
 
@@ -107,6 +125,8 @@ class NodeStatus(BaseModel):
 
 class NodeRegistrationResponse(NodeStatus):
     total_model_layers: int
+    cluster_ready: bool = False
+    topology_version: int = 0
 
 
 class HeartbeatPayload(BaseModel):
@@ -117,22 +137,65 @@ class TopologyResponse(BaseModel):
     nodes: List[NodeStatus]
     total_nodes: int
     updated_at: float
+    topology_version: int = 0
+    cluster_ready: bool = False
 
 
 # In-memory registry store
 _nodes: Dict[str, NodeStatus] = {}
-HEARTBEAT_TIMEOUT = 30.0  # Evict nodes silent for > 30 seconds
+_topology_version: int = 0
+
+
+def _active_nodes_for_model(model_id: str) -> List[NodeStatus]:
+    key = model_id.lower()
+    return [n for n in _nodes.values() if n.is_active and n.model_id.lower() == key]
+
+
+def _is_cluster_ready(model_id: str) -> bool:
+    return len(_active_nodes_for_model(model_id)) >= EXPECTED_NODES
+
+
+def _bump_topology_version() -> None:
+    global _topology_version
+    _topology_version += 1
 
 
 def _cleanup_inactive_nodes() -> None:
     now = time.time()
+    for node in _nodes.values():
+        silence = now - node.last_heartbeat
+        if silence > HEARTBEAT_GRACE and node.is_active:
+            logger.warning(
+                "Node %s missed heartbeats for %.1fs — marking inactive (grace=%.0fs, evict=%.0fs)",
+                node.node_id, silence, HEARTBEAT_GRACE, HEARTBEAT_TIMEOUT,
+            )
+            node.is_active = False
+
     dead_nodes = [
         nid for nid, node in _nodes.items()
         if now - node.last_heartbeat > HEARTBEAT_TIMEOUT
     ]
+    if dead_nodes:
+        _bump_topology_version()
     for nid in dead_nodes:
         logger.warning("Evicting dead node %s (no heartbeat for %.1fs)", nid, now - _nodes[nid].last_heartbeat)
         del _nodes[nid]
+
+
+def _get_model_dims(model_id: str) -> tuple[int, int]:
+    key = model_id.lower()
+    if key in KNOWN_MODEL_DIMS:
+        return KNOWN_MODEL_DIMS[key]
+    if "14b" in key:
+        return 5120, 152064
+    if "7b" in key:
+        return 3584, (152064 if "qwen" in key else 32000)
+    try:
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(model_id)
+        return cfg.hidden_size, cfg.vocab_size
+    except Exception:
+        return 4096, 32000
 
 
 def _rebalance_assignments(model_id: str) -> None:
@@ -141,41 +204,32 @@ def _rebalance_assignments(model_id: str) -> None:
         return
 
     total_layers = get_model_total_layers(model_id)
+    active = _active_nodes_for_model(model_id)
 
-    active = [n for n in _nodes.values() if n.is_active]
     if len(active) < EXPECTED_NODES:
         logger.info(
-            "Waiting for nodes: %d/%d registered", len(active), EXPECTED_NODES
+            "Waiting for nodes: %d/%d registered for model %s",
+            len(active), EXPECTED_NODES, model_id,
         )
-        # ponytail: assign proportional layer slice (total_layers // EXPECTED_NODES) to first node to prevent single-GPU CUDA OOM
+        # Provisional slice for the first node prevents OOM if a runner loads early,
+        # but /assignment stays pending until the cluster is complete.
         if len(active) == 1:
             n0 = active[0]
             n0.layer_start = 0
             n0.layer_end = total_layers // max(1, EXPECTED_NODES)
             n0.is_first_node = True
             n0.is_last_node = (EXPECTED_NODES == 1)
+            n0.next_node_host = None
+            n0.next_node_port = None
         return
-    # ponytail: fast offline lookup to eliminate HF network latency during /register
-    key = model_id.lower()
-    if "14b" in key:
-        hidden_size, vocab_size = 5120, 152064
-    elif "7b" in key:
-        hidden_size, vocab_size = 3584, (152064 if "qwen" in key else 32000)
-    else:
-        try:
-            from transformers import AutoConfig
-            cfg = AutoConfig.from_pretrained(model_id)
-            hidden_size = cfg.hidden_size
-            vocab_size = cfg.vocab_size
-        except Exception:
-            hidden_size, vocab_size = 4096, 32000
+
+    hidden_size, vocab_size = _get_model_dims(model_id)
 
     engine = AutoPartitionEngine(
         total_layers=total_layers,
         hidden_size=hidden_size,
         vocab_size=vocab_size,
     )
-    # ponytail: Default to 15000 MB if node reports 0 VRAM (e.g., tests or nodes without VRAM reporting)
     vram_infos = [
         NodeVRAMInfo(
             node_id=n.node_id,
@@ -191,7 +245,6 @@ def _rebalance_assignments(model_id: str) -> None:
         logger.error("AutoPartitionEngine failed: %s", e)
         return
 
-    # Write assignments back, then update routing
     sorted_node_ids = [a.node_id for a in assignments]
     for a in assignments:
         _nodes[a.node_id].layer_start = a.layer_start
@@ -208,10 +261,12 @@ def _rebalance_assignments(model_id: str) -> None:
             _nodes[nid].next_node_host = nxt.addr
             _nodes[nid].next_node_port = nxt.port
 
+    _bump_topology_version()
     logger.info(
-        "Partitioned %d layers across %d nodes: %s",
+        "Partitioned %d layers across %d nodes (topology v%d): %s",
         total_layers,
         len(assignments),
+        _topology_version,
         [(a.node_id, a.layer_start, a.layer_end) for a in assignments],
     )
 
@@ -253,6 +308,8 @@ def register_node(payload: NodeRegistration):
     return NodeRegistrationResponse(
         **updated_status.model_dump(),
         total_model_layers=total_layers,
+        cluster_ready=_is_cluster_ready(payload.model_id),
+        topology_version=_topology_version,
     )
 
 
@@ -265,6 +322,8 @@ class HeartbeatResponse(BaseModel):
     is_last_node: bool = False
     layer_start: int = 0
     layer_end: int = 0
+    cluster_ready: bool = False
+    topology_version: int = 0
 
 
 @router.post("/heartbeat", status_code=status.HTTP_200_OK, response_model=HeartbeatResponse)
@@ -280,12 +339,14 @@ def heartbeat(payload: HeartbeatPayload):
     return HeartbeatResponse(
         status="ok",
         node_id=node.node_id,
-        next_node_host=node.next_node_host,
-        next_node_port=node.next_node_port,
+        next_node_host=node.next_node_host if _is_cluster_ready(node.model_id) else None,
+        next_node_port=node.next_node_port if _is_cluster_ready(node.model_id) else None,
         is_first_node=node.is_first_node,
         is_last_node=node.is_last_node,
         layer_start=node.layer_start,
         layer_end=node.layer_end,
+        cluster_ready=_is_cluster_ready(node.model_id),
+        topology_version=_topology_version,
     )
 
 
@@ -294,10 +355,13 @@ def get_topology():
     """Return ordered topology of active nodes sorted by layer_start."""
     _cleanup_inactive_nodes()
     sorted_nodes = sorted(_nodes.values(), key=lambda n: n.layer_start)
+    model_id = sorted_nodes[0].model_id if sorted_nodes else ""
     return TopologyResponse(
         nodes=sorted_nodes,
         total_nodes=len(sorted_nodes),
         updated_at=time.time(),
+        topology_version=_topology_version,
+        cluster_ready=_is_cluster_ready(model_id) if model_id else False,
     )
 
 
@@ -315,28 +379,32 @@ def get_assignment(node_id: str):
     """
     Poll for a node's layer assignment.
 
-    Returns 200 with slice info once AutoPartitionEngine has run.
+    Returns 200 with slice info once AutoPartitionEngine has run and the cluster is ready.
     Returns 202 while waiting for all expected nodes to register.
-    Nodes call this after registering with no layer bounds.
     """
     if node_id not in _nodes:
         raise HTTPException(status_code=404, detail="Node not registered")
 
     node = _nodes[node_id]
-    # layer_end == 0 means assignment hasn't run yet
-    if node.layer_end == 0:
-        active_count = sum(1 for n in _nodes.values() if n.is_active)
+    cluster_ready = _is_cluster_ready(node.model_id)
+    active_count = len(_active_nodes_for_model(node.model_id))
+
+    if not cluster_ready or node.layer_end == 0:
         from fastapi.responses import JSONResponse
         return JSONResponse(
             status_code=202,
             content={
                 "status": "pending",
+                "cluster_ready": False,
+                "topology_version": _topology_version,
                 "message": f"Waiting for nodes: {active_count}/{EXPECTED_NODES}",
             },
         )
 
     return {
         "status": "assigned",
+        "cluster_ready": True,
+        "topology_version": _topology_version,
         "node_id": node_id,
         "layer_start": node.layer_start,
         "layer_end": node.layer_end,

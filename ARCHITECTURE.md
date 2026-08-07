@@ -182,17 +182,17 @@ Remaining latency: inter-node TCP + GPU compute only.
 ## Pending Work
 
 ### Current scope (short term)
-- [ ] `numpy(force=True)` serialization for float16 inter-node activations (700x faster, validated correct)
-- [ ] `encode_message` bytearray pre-allocation (remove triple-copy in serialization)
-- [ ] `layer_loader.py`: `accelerate` device_map partial loading (no full model to CPU RAM)
-- [ ] Kaggle runner script
-- [ ] Rented GPU runner script (no tunnel mode)
+- [x] Fast activation serialization (`numpy(force=True)`) for fp16/fp32 activations
+- [x] `encode_message` single-buffer pre-allocation (eliminated triple-copy allocations)
+- [x] `layer_loader.py`: `accelerate` device_map partial loading with meta device
+- [x] Kaggle runner script (`scripts/kaggle_runner.py`)
+- [x] Rented GPU runner script (`scripts/runpod_runner.py` for direct IP mode)
 
 ### v2 scope (future milestone)
-- [ ] `START_SESSION` message type in protocol
+- [x] `START_SESSION` message type & framing in protocol (`protocol.py`)
 - [ ] Node 0: decode driver + tokenizer
-- [ ] Last node: stream-back path
-- [ ] Gateway: session handoff, stream forwarding only
+- [ ] Last node: direct TCP stream-back path to gateway
+- [ ] Gateway: session handoff & SSE forwarding proxy
 - [ ] Protocol versioning
 
 ---

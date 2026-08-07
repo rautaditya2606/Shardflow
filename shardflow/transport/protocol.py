@@ -48,6 +48,7 @@ class MessageType(IntEnum):
     CLEAR = 0x02
     LOGITS = 0x03
     TOKEN_ID = 0x04
+    START_SESSION = 0x05
 
 
 DTYPE_MAP = {
@@ -65,12 +66,17 @@ class TensorMessage:
     """A framed message containing a tensor and metadata."""
     msg_type: MessageType
     session_id: str
-    tensor: Optional[torch.Tensor] = None  # None for CLEAR or TOKEN_ID messages
+    tensor: Optional[torch.Tensor] = None  # None for CLEAR, TOKEN_ID, or START_SESSION messages
     token_id: Optional[int] = None        # Set for TOKEN_ID messages
-    temperature: float = 0.0              # Sampling temperature for ACTIVATION
+    temperature: float = 0.0              # Sampling temperature
     top_k: int = 0                        # Sampling top_k
     top_p: float = 1.0                    # Sampling top_p
     sample_on_node: bool = True           # Request node to perform GPU sampling
+    prompt_tokens: Optional[list[int]] = None  # Token IDs for START_SESSION
+    max_tokens: int = 128                 # Max tokens for START_SESSION
+    stream_back_host: Optional[str] = None     # Host address to stream generated tokens to
+    stream_back_port: Optional[int] = None     # Port address to stream generated tokens to
+
 
 
 def _encode_tensor_meta(tensor: torch.Tensor) -> bytes:
@@ -115,43 +121,105 @@ SAMPLING_SIZE = struct.calcsize(SAMPLING_FMT)
 
 def encode_message(msg: TensorMessage) -> bytes:
     """
-    Encode a TensorMessage into wire format.
+    Encode a TensorMessage into wire format using single-buffer allocation.
 
     Returns: length-prefixed bytes ready to send.
     """
-    header = struct.pack(
-        HEADER_FMT,
-        msg.msg_type,
-        msg.session_id.encode("ascii")
-    )
+    session_id_bytes = msg.session_id.encode("ascii")
 
     if msg.msg_type == MessageType.CLEAR:
-        payload = header
+        payload_len = HEADER_SIZE
+        buf = bytearray(LENGTH_PREFIX_SIZE + payload_len)
+        struct.pack_into(LENGTH_PREFIX_FMT, buf, 0, payload_len)
+        struct.pack_into(HEADER_FMT, buf, LENGTH_PREFIX_SIZE, msg.msg_type, session_id_bytes)
+        return bytes(buf)
+
     elif msg.msg_type == MessageType.TOKEN_ID:
-        token_bytes = struct.pack("<q", msg.token_id or 0)
-        payload = header + token_bytes
+        payload_len = HEADER_SIZE + 8
+        buf = bytearray(LENGTH_PREFIX_SIZE + payload_len)
+        struct.pack_into(LENGTH_PREFIX_FMT, buf, 0, payload_len)
+        struct.pack_into(HEADER_FMT, buf, LENGTH_PREFIX_SIZE, msg.msg_type, session_id_bytes)
+        struct.pack_into("<q", buf, LENGTH_PREFIX_SIZE + HEADER_SIZE, msg.token_id or 0)
+        return bytes(buf)
+
+    elif msg.msg_type == MessageType.START_SESSION:
+        host_bytes = (msg.stream_back_host or "").encode("utf-8")
+        tokens = msg.prompt_tokens or []
+
+        # SAMPLING_FMT (temp, top_k, top_p, sample_flag) + max_tokens (I) + host_len (H) + host_bytes + port (H) + num_tokens (I) + tokens (q*N)
+        extra_len = SAMPLING_SIZE + 4 + 2 + len(host_bytes) + 2 + 4 + (8 * len(tokens))
+        payload_len = HEADER_SIZE + extra_len
+        buf = bytearray(LENGTH_PREFIX_SIZE + payload_len)
+
+        struct.pack_into(LENGTH_PREFIX_FMT, buf, 0, payload_len)
+        offset = LENGTH_PREFIX_SIZE
+
+        struct.pack_into(HEADER_FMT, buf, offset, msg.msg_type, session_id_bytes)
+        offset += HEADER_SIZE
+
+        struct.pack_into(
+            SAMPLING_FMT,
+            buf,
+            offset,
+            float(msg.temperature),
+            int(msg.top_k),
+            float(msg.top_p),
+            1 if msg.sample_on_node else 0,
+        )
+        offset += SAMPLING_SIZE
+
+        struct.pack_into("<IH", buf, offset, int(msg.max_tokens), len(host_bytes))
+        offset += 6
+
+        if host_bytes:
+            buf[offset:offset + len(host_bytes)] = host_bytes
+            offset += len(host_bytes)
+
+        struct.pack_into("<HI", buf, offset, int(msg.stream_back_port or 0), len(tokens))
+        offset += 6
+
+        for token in tokens:
+            struct.pack_into("<q", buf, offset, int(token))
+            offset += 8
+
+        return bytes(buf)
+
     else:
         # ACTIVATION / LOGITS
         tensor = msg.tensor
         if tensor is None:
             raise ValueError(f"Tensor required for message type {msg.msg_type}")
 
-        sampling_bytes = struct.pack(
+        tensor = tensor.contiguous()
+        tensor_meta = _encode_tensor_meta(tensor)
+        # ponytail: view(uint8).cpu().numpy().tobytes() is 700x faster than bytes(tensor.untyped_storage())
+        tensor_bytes = tensor.view(torch.uint8).cpu().numpy().tobytes()
+
+        payload_len = HEADER_SIZE + SAMPLING_SIZE + len(tensor_meta) + len(tensor_bytes)
+        buf = bytearray(LENGTH_PREFIX_SIZE + payload_len)
+
+        struct.pack_into(LENGTH_PREFIX_FMT, buf, 0, payload_len)
+        offset = LENGTH_PREFIX_SIZE
+
+        struct.pack_into(HEADER_FMT, buf, offset, msg.msg_type, session_id_bytes)
+        offset += HEADER_SIZE
+
+        struct.pack_into(
             SAMPLING_FMT,
+            buf,
+            offset,
             float(msg.temperature),
             int(msg.top_k),
             float(msg.top_p),
             1 if msg.sample_on_node else 0,
         )
-        tensor = tensor.contiguous()
-        tensor_meta = _encode_tensor_meta(tensor)
-        # ponytail: view(uint8).cpu().numpy().tobytes() is 2000x faster than bytes(tensor.untyped_storage())
-        # which iterates byte-by-byte in Python overhead (~10.6ms vs 0.005ms).
-        tensor_bytes = tensor.view(torch.uint8).cpu().numpy().tobytes()
-        payload = header + sampling_bytes + tensor_meta + tensor_bytes
+        offset += SAMPLING_SIZE
 
-    length_prefix = struct.pack(LENGTH_PREFIX_FMT, len(payload))
-    return length_prefix + payload
+        buf[offset:offset + len(tensor_meta)] = tensor_meta
+        offset += len(tensor_meta)
+
+        buf[offset:offset + len(tensor_bytes)] = tensor_bytes
+        return bytes(buf)
 
 
 def decode_message(data: bytes) -> TensorMessage:
@@ -169,6 +237,40 @@ def decode_message(data: bytes) -> TensorMessage:
     if msg_type == MessageType.TOKEN_ID:
         token_id = struct.unpack_from("<q", data, offset)[0]
         return TensorMessage(msg_type=msg_type, session_id=session_id, token_id=token_id)
+
+    if msg_type == MessageType.START_SESSION:
+        temp, top_k, top_p, sample_flag = struct.unpack_from(SAMPLING_FMT, data, offset)
+        offset += SAMPLING_SIZE
+
+        max_tokens, host_len = struct.unpack_from("<IH", data, offset)
+        offset += 6
+
+        stream_host = ""
+        if host_len > 0:
+            stream_host = data[offset:offset + host_len].decode("utf-8")
+            offset += host_len
+
+        stream_port, num_tokens = struct.unpack_from("<HI", data, offset)
+        offset += 6
+
+        prompt_tokens = []
+        for _ in range(num_tokens):
+            t_id = struct.unpack_from("<q", data, offset)[0]
+            prompt_tokens.append(t_id)
+            offset += 8
+
+        return TensorMessage(
+            msg_type=msg_type,
+            session_id=session_id,
+            temperature=temp,
+            top_k=top_k,
+            top_p=top_p,
+            sample_on_node=bool(sample_flag),
+            prompt_tokens=prompt_tokens,
+            max_tokens=max_tokens,
+            stream_back_host=stream_host if stream_host else None,
+            stream_back_port=stream_port if stream_port > 0 else None,
+        )
 
     # Parse sampling options
     temp, top_k, top_p, sample_flag = struct.unpack_from(SAMPLING_FMT, data, offset)

@@ -83,9 +83,8 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
     global _orchestrator
     if _orchestrator is None or _orchestrator._node0_client is None:
         import os
-        port = os.getenv("PORT", "8000")
-        default_url = f"http://127.0.0.1:{port}"
-        registry_url = os.getenv("SHARDFLOW_REGISTRY_URL", default_url)
+        # None = use embedded in-memory registry (avoids HTTP loopback deadlock on Render)
+        registry_url = os.getenv("SHARDFLOW_REGISTRY_URL")
         model_path = req.model or os.getenv("SHARDFLOW_MODEL_PATH", "Qwen/Qwen2.5-7B-Instruct")
         try:
             logger.info("Auto-connecting Orchestrator to active Node 0 (Model: %s, Registry: %s)...", model_path, registry_url)

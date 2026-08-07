@@ -35,7 +35,6 @@ logger = logging.getLogger(__name__)
 
 
 from shardflow.orchestrator.metrics import metrics
-import requests
 
 
 class PartialGenerationError(Exception):
@@ -99,31 +98,52 @@ class Orchestrator:
         if not force and self._cached_topology and (now - self._last_topology_fetch < self.topology_ttl):
             return self._cached_topology
 
-        # Primary path: Direct in-memory lookup if running in same process (avoids HTTP loopback deadlock)
+        # Primary path: direct in-memory lookup when registry is embedded in the gateway process.
         try:
             from shardflow.registry.app import get_topology
             topo_res = get_topology()
-            fetched = [(n.addr, n.port) for n in topo_res.nodes if n.is_active]
-            if fetched:
-                self._cached_topology = fetched
-                self._last_topology_fetch = now
-                logger.info("Updated topology directly from in-memory registry: %s", fetched)
-                return self._cached_topology
+            if not topo_res.cluster_ready:
+                logger.debug("In-memory cluster not ready yet (%d nodes)", topo_res.total_nodes)
+            else:
+                fetched = [(n.addr, n.port) for n in topo_res.nodes if n.is_active]
+                if fetched:
+                    self._cached_topology = fetched
+                    self._last_topology_fetch = now
+                    logger.info("Updated topology directly from in-memory registry: %s", fetched)
+                    return self._cached_topology
         except Exception as e:
-            logger.debug("In-memory topology fetch fallback to HTTP: %s", e)
+            logger.debug("In-memory topology fetch unavailable: %s", e)
+
+        return self._cached_topology
+
+    async def fetch_topology_async(self, force: bool = False) -> list[tuple[str, int]]:
+        """Async topology fetch — avoids blocking the event loop on external registry HTTP."""
+        now = time.time()
+        if not force and self._cached_topology and (now - self._last_topology_fetch < self.topology_ttl):
+            return self._cached_topology
+
+        try:
+            from shardflow.registry.app import get_topology
+            topo_res = get_topology()
+            if topo_res.cluster_ready:
+                fetched = [(n.addr, n.port) for n in topo_res.nodes if n.is_active]
+                if fetched:
+                    self._cached_topology = fetched
+                    self._last_topology_fetch = now
+                    logger.info("Updated topology directly from in-memory registry: %s", fetched)
+                    return self._cached_topology
+        except Exception as e:
+            logger.debug("In-memory topology fetch unavailable: %s", e)
 
         if self.registry_url:
             try:
-                resp = requests.get(f"{self.registry_url.rstrip('/')}/topology", timeout=5.0)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    nodes = data.get("nodes", [])
-                    fetched = [(n["addr"], n["port"]) for n in nodes]
-                    if fetched:
-                        self._cached_topology = fetched
-                        self._last_topology_fetch = now
-                        logger.info("Updated topology from registry: %s", fetched)
-                        return self._cached_topology
+                from shardflow.registry.client import async_get_topology
+                fetched = await async_get_topology(self.registry_url)
+                if fetched:
+                    self._cached_topology = fetched
+                    self._last_topology_fetch = now
+                    logger.info("Updated topology from registry: %s", fetched)
+                    return self._cached_topology
             except Exception as e:
                 logger.warning("Failed to fetch topology from registry: %s", e)
 
@@ -135,7 +155,7 @@ class Orchestrator:
         self.tokenizer = load_tokenizer(self.model_path)
 
         # Connect to Node 0
-        nodes = self.fetch_topology(force=True)
+        nodes = await self.fetch_topology_async(force=True)
         if not nodes:
             raise RuntimeError("No nodes available in topology")
 

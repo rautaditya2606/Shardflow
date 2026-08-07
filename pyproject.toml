@@ -44,3 +44,7 @@ shardflow-gateway = "shardflow.gateway.app:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["shardflow*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
