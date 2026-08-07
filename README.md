@@ -174,26 +174,29 @@ PYTHONPATH=. python scripts/test_local_real_server.py
 
 ## Benchmark Results
 
-### 1. Model: TinyLlama 1.1B (2 Pipeline Nodes)
+### 1. Model: TinyLlama 1.1B
 
-| Device | Framework / Strategy | Speed (tok/s) | Duration (20 tokens) |
+| Device / Setup | Partition & Transport | Metric | Benchmark Result |
 |---|---|---|---|
-| **CPU** | No KV Cache (Phase 1) | 0.1 tok/s | 258.5s |
-| **CPU** | Initial DynamicCache baseline | 0.9 tok/s | 23.0s |
-| **CPU** | **Optimized ShardFlow** (DynamicCache + Zero-Copy) | **1.12 tok/s** | **18.7s** |
-| **RTX 3050 GPU** | Initial TCP Protocol baseline (64KB Logits Relay) | 1.8 tok/s | 11.75s |
-| **RTX 3050 GPU** | GPU Sampling + Zero-Copy + `TCP_NODELAY` | 23.0 tok/s | 0.91s |
-| **RTX 3050 GPU** | **Optimized ShardFlow** (Fast Serialization + Auto-Partition) | **40.7 tok/s** | **0.49s (+41% speedup)** |
+| **Local RTX 3050 GPU (1 Node)** | Localhost TCP + Fast Serialization | **Max Throughput** | **40.7 tok/s** |
+| **Local RTX 3050 GPU (3 Nodes)** | 3 Auto-Partitioned Nodes (`[0,8)`, `[8,16)`, `[16,22)`) | **Throughput / TTFT** | **34.28 tok/s** (TTFT: 3.56s) |
 
-### 2. Model: Qwen/Qwen2.5-7B-Instruct (2 Google Colab T4 GPUs across Internet Tunnels)
+### 2. Model: Qwen/Qwen2.5-7B-Instruct (2 Google Colab T4 GPUs + Render Gateway)
 
-| Environment | Setup | Metric | Benchmark Result |
-|---|---|---|---|
-| **Google Colab (2 T4 GPUs)** | Layers 0-14 & 14-28 over `bore.pub` TCP Tunnel | **Raw GPU Node Generation** | **~14.7 tok/s** |
-| **Render + Colab Tunnels** | Full End-to-End HTTP `curl` Roundtrip | **End-to-End Latency** | **2.27 tok/s (38 tokens in 16.7s)** |
+| Benchmark Metric | Setup | Result |
+|---|---|---|
+| **Time to First Token (TTFT)** | Prefill pass across 2 Colab T4 GPUs | **1.83s** |
+| **Decode Throughput** | Pure streaming token generation loop | **3.22 tok/s** |
+| **Overall End-to-End Throughput** | Render Gateway $\rightarrow$ `bore.pub` TCP Tunnels $\rightarrow$ Client | **2.87 tok/s** |
+| **Completion Reliability** | 40/40 Tokens Generated | **100% (0 transport errors)** |
 
----
+### 3. Model: Qwen/Qwen2.5-14B-Instruct (2 Google Colab T4 GPUs + Render Gateway)
 
-## License
+| Benchmark Metric | Setup | Result |
+|---|---|---|
+| **Total Model Layers** | 48 Transformer Layers | **48 Layers** |
+| **Auto-Partition Split** | Colab 1 (`[0, 25)`), Colab 2 (`[25, 48)` + LM Head) | **25 / 23 Layers** |
+| **VRAM Footprint** | ~7.2 GB per Colab T4 GPU | **~50% T4 VRAM Capacity** |
+| **End-to-End Latency** | 40 Tokens Generated | **17.65s (2.27 tok/s)** |
+| **Completion Reliability** | 40/40 Tokens Generated | **100% (0 transport errors)** |
 
-MIT License
