@@ -68,9 +68,19 @@ def main():
         reg_payload["layer_end"] = args.layer_end
 
     reg_url = f"{args.registry_url.rstrip('/')}/register"
-    resp = requests.post(reg_url, json=reg_payload, timeout=15.0)
-    resp.raise_for_status()
-    assignment = resp.json()
+    assignment = None
+    for attempt in range(3):
+        try:
+            logger.info("Registering node %s with registry %s (attempt %d/3)...", node_id, args.registry_url, attempt + 1)
+            resp = requests.post(reg_url, json=reg_payload, timeout=30.0)
+            resp.raise_for_status()
+            assignment = resp.json()
+            break
+        except Exception as e:
+            logger.warning("Registration attempt %d failed: %s", attempt + 1, e)
+            if attempt == 2:
+                raise
+            time.sleep(2)
 
     layer_start = assignment["layer_start"]
     layer_end = assignment["layer_end"]

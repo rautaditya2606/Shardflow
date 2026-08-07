@@ -36,9 +36,16 @@ from shardflow.partition.engine import AutoPartitionEngine, NodeVRAMInfo
 
 EXPECTED_NODES = int(os.getenv("SHARDFLOW_EXPECTED_NODES", "2"))
 
-# ponytail: Simple offline layer lookup fallback for common models
+# ponytail: Offline model layer map to eliminate network latency during /register
 KNOWN_MODEL_LAYERS: Dict[str, int] = {
     "tinyllama/tinyllama-1.1b-chat-v1.0": 22,
+    "qwen/qwen2.5-7b-instruct": 28,
+    "qwen/qwen2.5-14b-instruct": 48,
+    "qwen/qwen2.5-3b-instruct": 36,
+    "qwen/qwen2.5-1.5b-instruct": 28,
+    "qwen/qwen2.5-0.5b-instruct": 24,
+    "deepseek-ai/deepseek-r1-distill-qwen-14b": 48,
+    "deepseek-ai/deepseek-r1-distill-qwen-7b": 28,
     "meta-llama/meta-llama-3-8b": 32,
     "meta-llama/meta-llama-3-8b-instruct": 32,
     "meta-llama/llama-2-7b-hf": 32,
@@ -48,10 +55,13 @@ KNOWN_MODEL_LAYERS: Dict[str, int] = {
 
 def get_model_total_layers(model_id: str) -> int:
     """
-    Fetch total hidden layers directly from HuggingFace AutoConfig.
-    Falls back to known offline dict or default only if network/HF lookup fails.
+    Get total hidden layers for model.
+    Checks fast offline lookup first to eliminate network latency during registration.
     """
-    # 1. Primary path: Fetch from HuggingFace AutoConfig
+    key = model_id.lower()
+    if key in KNOWN_MODEL_LAYERS:
+        return KNOWN_MODEL_LAYERS[key]
+
     try:
         from transformers import AutoConfig
         cfg = AutoConfig.from_pretrained(model_id)
@@ -60,23 +70,11 @@ def get_model_total_layers(model_id: str) -> int:
             return cfg.num_hidden_layers
     except Exception as e:
         logger.warning(
-            "AutoConfig.from_pretrained failed for '%s': %s. Falling back to offline layer mapping.",
+            "AutoConfig.from_pretrained failed for '%s': %s. Falling back to default.",
             model_id, e
         )
 
-    # 2. Secondary fallback path: Offline lookup map
-    key = model_id.lower()
-    if key in KNOWN_MODEL_LAYERS:
-        fallback_layers = KNOWN_MODEL_LAYERS[key]
-        logger.warning("Using offline fallback mapping for model '%s': %d layers", model_id, fallback_layers)
-        return fallback_layers
-
-    # 3. Last resort fallback
-    logger.error(
-        "Could not determine layer count for model '%s' via AutoConfig or offline map. "
-        "Defaulting to 22 layers (TinyLlama).", model_id
-    )
-    return 22
+    return 48 if "14b" in key else (28 if "7b" in key else 22)
 
 
 class NodeRegistration(BaseModel):
@@ -157,15 +155,20 @@ def _rebalance_assignments(model_id: str) -> None:
             n0.is_first_node = True
             n0.is_last_node = True
         return
-    try:
-        from transformers import AutoConfig
-        cfg = AutoConfig.from_pretrained(model_id)
-        hidden_size = cfg.hidden_size
-        vocab_size = cfg.vocab_size
-    except Exception:
-        # ponytail: rough fallback so registry doesn't crash on network failure
-        hidden_size = 4096
-        vocab_size = 32000
+    # ponytail: fast offline lookup to eliminate HF network latency during /register
+    key = model_id.lower()
+    if "14b" in key:
+        hidden_size, vocab_size = 5120, 152064
+    elif "7b" in key:
+        hidden_size, vocab_size = 3584, (152064 if "qwen" in key else 32000)
+    else:
+        try:
+            from transformers import AutoConfig
+            cfg = AutoConfig.from_pretrained(model_id)
+            hidden_size = cfg.hidden_size
+            vocab_size = cfg.vocab_size
+        except Exception:
+            hidden_size, vocab_size = 4096, 32000
 
     engine = AutoPartitionEngine(
         total_layers=total_layers,
