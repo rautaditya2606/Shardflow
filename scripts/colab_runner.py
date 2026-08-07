@@ -34,6 +34,7 @@ def main():
         help="Tunnel backend (default: cloudflare — more stable than bore.pub)",
     )
     parser.add_argument("--node-id", default=None, help="Unique node identifier")
+    parser.add_argument("--expected-nodes", type=int, default=None, help="Expected total cluster nodes count (optional)")
     parser.add_argument("--layer-start", type=int, default=None, help="Explicit layer start (optional)")
     parser.add_argument("--layer-end", type=int, default=None, help="Explicit layer end (optional)")
     args = parser.parse_args()
@@ -67,6 +68,8 @@ def main():
         "vram_total_mb": vram,
         "model_id": args.model,
     }
+    if args.expected_nodes is not None:
+        reg_payload["expected_nodes"] = args.expected_nodes
     if args.layer_start is not None:
         reg_payload["layer_start"] = args.layer_start
     if args.layer_end is not None:

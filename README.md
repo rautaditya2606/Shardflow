@@ -184,7 +184,7 @@ print()
 
 ## Key Architecture & Performance Features
 
-1. **Registration Barrier & Deferred Weight Loading**: Workers register metadata first and poll `/assignment/{node_id}`. PyTorch weights are loaded into GPU memory **only after** all expected cluster nodes register, preventing partial single-node OOMs.
+1. **Dynamic Registration Barrier & Fallback Timeout**: Workers send `--expected-nodes N` during registration. As soon as $N$ nodes connect, the registry calculates layer boundaries **instantly** (0s delay). If a node fails to connect, a 60s fallback timeout partitions across active available nodes instead of hanging.
 2. **VRAM-Weighted Auto-Partitioning**: `AutoPartitionEngine` dynamically calculates layer boundaries based on available VRAM and deducts LM head overhead for the terminal node.
 3. **Zero-RAM Meta-Device Slicing**: Model skeletons instantiate on PyTorch `meta` device in 0.00s with **0 MB CPU RAM overhead**, loading safetensors directly into assigned layer slices.
 4. **Single-Buffer Fast Tensor Serialization**: Replaced slow PyTorch element-wise storage loops with C-level numpy view reinterpret (`tensor.view(torch.uint8).cpu().numpy().tobytes()`), reducing tensor serialization overhead to **0.005ms (700x faster)**.

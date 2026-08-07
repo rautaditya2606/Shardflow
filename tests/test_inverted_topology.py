@@ -12,12 +12,10 @@ client = TestClient(registry_app)
 
 @pytest.fixture(autouse=True)
 def clear_registry_nodes():
-    _nodes.clear()
-    import shardflow.registry.app as registry_mod
-    registry_mod._topology_version = 0
+    from shardflow.registry.app import _reset_registry_state
+    _reset_registry_state()
     yield
-    _nodes.clear()
-    registry_mod._topology_version = 0
+    _reset_registry_state()
 
 
 def test_assignment_pending_until_cluster_ready():

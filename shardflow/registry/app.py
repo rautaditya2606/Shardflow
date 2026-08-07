@@ -35,6 +35,7 @@ app.include_router(router)
 from shardflow.partition.engine import AutoPartitionEngine, NodeVRAMInfo
 
 EXPECTED_NODES = int(os.getenv("SHARDFLOW_EXPECTED_NODES", "2"))
+REGISTRATION_TIMEOUT = float(os.getenv("SHARDFLOW_REGISTRATION_TIMEOUT", "60.0"))
 HEARTBEAT_TIMEOUT = float(os.getenv("SHARDFLOW_HEARTBEAT_TIMEOUT", "90.0"))
 HEARTBEAT_GRACE = float(os.getenv("SHARDFLOW_HEARTBEAT_GRACE", "60.0"))
 
@@ -104,6 +105,7 @@ class NodeRegistration(BaseModel):
     vram_available_mb: float = Field(0.0, description="Available VRAM in MB")
     vram_total_mb: float = Field(0.0, description="Total VRAM in MB")
     model_id: str = Field("TinyLlama/TinyLlama-1.1B-Chat-v1.0", description="Model ID")
+    expected_nodes: Optional[int] = Field(None, description="Expected cluster total nodes count")
 
 
 class NodeStatus(BaseModel):
@@ -144,6 +146,24 @@ class TopologyResponse(BaseModel):
 # In-memory registry store
 _nodes: Dict[str, NodeStatus] = {}
 _topology_version: int = 0
+_expected_nodes_target: Optional[int] = None
+_first_registration_time: Optional[float] = None
+_cluster_partition_calculated: bool = False
+
+
+def _reset_registry_state() -> None:
+    global _nodes, _topology_version, _expected_nodes_target, _first_registration_time, _cluster_partition_calculated
+    _nodes.clear()
+    _topology_version = 0
+    _expected_nodes_target = None
+    _first_registration_time = None
+    _cluster_partition_calculated = False
+
+
+def _get_target_node_count() -> int:
+    if _expected_nodes_target is not None and _expected_nodes_target > 0:
+        return _expected_nodes_target
+    return EXPECTED_NODES
 
 
 def _active_nodes_for_model(model_id: str) -> List[NodeStatus]:
@@ -152,7 +172,15 @@ def _active_nodes_for_model(model_id: str) -> List[NodeStatus]:
 
 
 def _is_cluster_ready(model_id: str) -> bool:
-    return len(_active_nodes_for_model(model_id)) >= EXPECTED_NODES
+    if _cluster_partition_calculated:
+        return True
+    target_count = _get_target_node_count()
+    active_count = len(_active_nodes_for_model(model_id))
+    if active_count >= target_count and target_count > 0:
+        return True
+    if _first_registration_time is not None and (time.time() - _first_registration_time) > REGISTRATION_TIMEOUT:
+        return True
+    return False
 
 
 def _bump_topology_version() -> None:
@@ -199,26 +227,37 @@ def _get_model_dims(model_id: str) -> tuple[int, int]:
 
 
 def _rebalance_assignments(model_id: str) -> None:
-    """Run AutoPartitionEngine once all expected nodes are registered."""
+    """Run AutoPartitionEngine once expected nodes are registered or timeout window elapses."""
+    global _cluster_partition_calculated, _first_registration_time
     if not _nodes:
         return
 
     total_layers = get_model_total_layers(model_id)
     active = _active_nodes_for_model(model_id)
+    target_count = _get_target_node_count()
 
-    if len(active) < EXPECTED_NODES:
+    now = time.time()
+    if _first_registration_time is None and active:
+        _first_registration_time = now
+
+    timeout_elapsed = False
+    if _first_registration_time is not None and (now - _first_registration_time) >= REGISTRATION_TIMEOUT:
+        timeout_elapsed = True
+
+    if len(active) < target_count and not timeout_elapsed and not _cluster_partition_calculated:
+        time_left = max(0.0, REGISTRATION_TIMEOUT - (now - (_first_registration_time or now)))
         logger.info(
-            "Waiting for nodes: %d/%d registered for model %s",
-            len(active), EXPECTED_NODES, model_id,
+            "Waiting for nodes: %d/%d registered for model %s (timeout window: %.1fs left)",
+            len(active), target_count, model_id, time_left,
         )
         # Provisional slice for the first node prevents OOM if a runner loads early,
         # but /assignment stays pending until the cluster is complete.
         if len(active) == 1:
             n0 = active[0]
             n0.layer_start = 0
-            n0.layer_end = total_layers // max(1, EXPECTED_NODES)
+            n0.layer_end = total_layers // max(1, target_count)
             n0.is_first_node = True
-            n0.is_last_node = (EXPECTED_NODES == 1)
+            n0.is_last_node = (target_count == 1)
             n0.next_node_host = None
             n0.next_node_port = None
         return
@@ -261,12 +300,15 @@ def _rebalance_assignments(model_id: str) -> None:
             _nodes[nid].next_node_host = nxt.addr
             _nodes[nid].next_node_port = nxt.port
 
+    _cluster_partition_calculated = True
     _bump_topology_version()
     logger.info(
-        "Partitioned %d layers across %d nodes (topology v%d): %s",
+        "Partitioned %d layers across %d nodes (topology v%d, target=%d, timeout_fallback=%s): %s",
         total_layers,
         len(assignments),
         _topology_version,
+        target_count,
+        timeout_elapsed,
         [(a.node_id, a.layer_start, a.layer_end) for a in assignments],
     )
 
@@ -274,8 +316,17 @@ def _rebalance_assignments(model_id: str) -> None:
 @router.post("/register", status_code=status.HTTP_201_CREATED, response_model=NodeRegistrationResponse)
 def register_node(payload: NodeRegistration):
     """Register or update a pipeline node and receive dynamic layer assignments."""
+    global _expected_nodes_target, _first_registration_time
     _cleanup_inactive_nodes()
     now = time.time()
+
+    if payload.expected_nodes is not None and payload.expected_nodes > 0:
+        if _expected_nodes_target != payload.expected_nodes:
+            logger.info("Dynamic expected nodes target updated to %d by node %s", payload.expected_nodes, payload.node_id)
+            _expected_nodes_target = payload.expected_nodes
+
+    if _first_registration_time is None:
+        _first_registration_time = now
 
     # Pre-register entry
     node_status = NodeStatus(
@@ -389,6 +440,7 @@ def get_assignment(node_id: str):
     cluster_ready = _is_cluster_ready(node.model_id)
     active_count = len(_active_nodes_for_model(node.model_id))
 
+    target_count = _get_target_node_count()
     if not cluster_ready or node.layer_end == 0:
         from fastapi.responses import JSONResponse
         return JSONResponse(
@@ -397,7 +449,7 @@ def get_assignment(node_id: str):
                 "status": "pending",
                 "cluster_ready": False,
                 "topology_version": _topology_version,
-                "message": f"Waiting for nodes: {active_count}/{EXPECTED_NODES}",
+                "message": f"Waiting for nodes: {active_count}/{target_count}",
             },
         )
 
