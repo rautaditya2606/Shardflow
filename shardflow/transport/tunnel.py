@@ -103,9 +103,6 @@ def start_bore_tunnel(local_port: int, server: str = "bore.pub", remote_port: Op
     cmd = [bin_path, "local", str(local_port), "--to", server]
     if remote_port:
         cmd.extend(["--port", str(remote_port)])
-    elif local_port > 0:
-        # Default to a unique remote port based on local_port offset
-        cmd.extend(["--port", str(30000 + (local_port % 20000))])
 
     logger.info("Starting bore tunnel for localhost:%d to %s...", local_port, server)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -119,7 +116,12 @@ def start_bore_tunnel(local_port: int, server: str = "bore.pub", remote_port: Op
             time.sleep(0.2)
             continue
 
-        match = re.search(r"bore\.pub:(\d+)", line) or re.search(r"bound_port=(\d+)", line) or re.search(r"port (\d+)", line)
+        match = (
+            re.search(r"bore\.pub:(\d+)", line)
+            or re.search(r"bound_port=(\d+)", line)
+            or re.search(r"listening at [^:]+:(\d+)", line)
+            or re.search(r"port (\d+)", line)
+        )
         if match:
             pub_port = int(match.group(1))
             logger.info("bore.pub Tunnel established at %s:%d", server, pub_port)
