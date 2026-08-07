@@ -1,9 +1,9 @@
 # ShardFlow
 
-A general-purpose distributed LLM inference framework that automatically partitions any HuggingFace transformer across N GPU machines (e.g. Google Colab T4 GPUs, local GPUs, or cloud instances), manages per-node KV caches, schedules concurrent requests through a micro-batch pipeline, and exposes a single OpenAI-compatible endpoint.
+A general-purpose distributed LLM inference framework that automatically partitions any HuggingFace transformer across N GPU machines (e.g. Google Colab T4 GPUs, Kaggle GPUs, Rented Cloud GPUs, or Local GPUs), manages per-node KV caches, schedules requests through a pipeline, and exposes a single OpenAI-compatible endpoint.
 
 > **Live API Gateway:** [https://shardflow.onrender.com](https://shardflow.onrender.com)  
-> **Status:** Fully functional & verified for distributed multi-GPU inference across Google Colab accounts and local GPUs.
+> **Status:** Fully functional & verified for distributed multi-GPU inference across Colab, Kaggle, Rented Cloud GPUs, and local GPUs.
 
 ---
 
@@ -29,12 +29,12 @@ graph TD
 
     subgraph DataPlane["Distributed Data Plane (GPU Nodes across TCP / Tunnels)"]
         subgraph Node0["Pipeline Node 0 (GPU Machine 1)"]
-            N0["Node 0 Processor<br/>Layers 0 ➔ 14"]:::node0
+            N0["Node 0 Processor<br/>Layers 0 ➔ N/2"]:::node0
             N0_KV["Per-Session DynamicCache"]:::node0
         end
 
         subgraph Node1["Pipeline Node 1 (GPU Machine 2)"]
-            N1["Node 1 Processor<br/>Layers 14 ➔ 28 + LM Head"]:::node1
+            N1["Node 1 Processor<br/>Layers N/2 ➔ N + LM Head"]:::node1
             N1_KV["Per-Session DynamicCache"]:::node1
             N1_SAMP["GPU Sampler<br/>Top-K / Top-P / Temp"]:::node1
         end
@@ -47,7 +47,7 @@ graph TD
     REG -.-|"VRAM-Weighted Auto-Split"| N0
     REG -.-|"VRAM-Weighted Auto-Split"| N1
 
-    ORCH -->|"3. TCP TensorMessage (Activation)"| N0
+    ORCH -->|"3. TCP TensorMessage (Activation / START_SESSION)"| N0
     N0 -->|"4. Fast Zero-Copy TCP Forward"| N1
     N1 --> N1_SAMP
     N1_SAMP -->|"5. 8-Byte TOKEN_ID / Logits"| ORCH
@@ -57,22 +57,24 @@ graph TD
 
 ### Layer Breakdown
 
-- **Layer 1 — Client:** Standard OpenAI SDK or `curl` hitting `POST /v1/chat/completions`. Supports real-time SSE streaming (`stream=True`).
-- **Layer 2 — API Gateway (FastAPI):** Exposes `/v1/chat/completions`, `/health`, `/metrics`, `/docs` (Swagger UI).
-- **Layer 3 — Request Scheduler:** Async queue (`asyncio.Queue`) for pending requests, session tracking, concurrency control.
-- **Layer 4 — Inference Orchestrator:** Tokenization, zero-weight memory loading, GPU sampling handler, and async TCP client (`generate_stream()`).
-- **Layer 5 — Topology Registry & Auto-Partition:** Dynamic node registration with **VRAM-Weighted `AutoPartitionEngine`** that automatically partitions model layers across heterogeneous GPUs without manual bounds.
+- **Layer 1 — Client:** Standard OpenAI Python/JS SDK or `curl` hitting `POST /v1/chat/completions`. Supports real-time SSE streaming (`stream=True`).
+- **Layer 2 — API Gateway (FastAPI):** Exposes `/v1/chat/completions`, `/health`, `/topology`, `/metrics`, `/docs` (Swagger UI).
+- **Layer 3 — Request Scheduler:** Async queue (`asyncio.Queue`) for pending requests, session tracking, and concurrency control.
+- **Layer 4 — Inference Orchestrator:** Tokenization, zero-weight memory loading, auto-reconnecting node client (`NodeClient`), and async TCP client (`generate_stream()`).
+- **Layer 5 — Topology Registry & Registration Barrier:** Dynamic node registration with **VRAM-Weighted `AutoPartitionEngine`** that automatically partitions model layers across heterogeneous GPUs. Enforces a registration barrier (`/assignment/{node_id}`) so workers defer weight loading until all expected nodes connect.
 - **Layer 6 — Pipeline Nodes:** Standalone Python processes loading layer slices via **Zero-RAM Meta-Device Slicing** (`accelerate.init_empty_weights`) with per-session `DynamicCache` and 60s background TTL eviction.
 
 ---
 
-## 🚀 Running on Google Colab (2 T4 GPUs)
+## Deployment Platforms & Runners
 
-Run an **8 Billion parameter model** (e.g. `Qwen/Qwen2.5-7B-Instruct`) split across two free Google Colab accounts.
+ShardFlow supports multiple GPU hosting platforms via dedicated runner scripts in `scripts/`:
 
-### Step 1: Start Colab Tab 2 (Account 2 - Incognito Tab)
-Run this in **Colab Tab 2** (registers as Node 1; bounds auto-assigned by registry):
+### 1. Google Colab (2 Free T4 GPUs)
 
+Run 7B or 14B parameter models (`Qwen/Qwen2.5-7B-Instruct` or `Qwen/Qwen2.5-14B-Instruct`) split across two free Colab accounts:
+
+#### **Colab Notebook 1 (Node 0):**
 ```python
 %cd /content
 !rm -rf /content/Shardflow
@@ -80,19 +82,15 @@ Run this in **Colab Tab 2** (registers as Node 1; bounds auto-assigned by regist
 %cd /content/Shardflow
 !pip install -q -e .
 
-!python scripts/colab_runner.py \
-  --registry-url https://shardflow.onrender.com \
-  --model Qwen/Qwen2.5-7B-Instruct \
-  --node-id colab-node-1 \
-  --port 9501
+!python /content/Shardflow/scripts/colab_runner.py \
+    --registry-url https://shardflow.onrender.com \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --node-id colab-node-1 \
+    --port 9500 \
+    --tunnel bore
 ```
-*Wait until it logs: `Node ready — layers [14, 28), LAST node (has LM head)`*
 
----
-
-### Step 2: Start Colab Tab 1 (Account 1 - Normal Tab)
-Run this in **Colab Tab 1** (registers as Node 0; bounds auto-assigned by registry):
-
+#### **Colab Notebook 2 (Node 1):**
 ```python
 %cd /content
 !rm -rf /content/Shardflow
@@ -100,81 +98,105 @@ Run this in **Colab Tab 1** (registers as Node 0; bounds auto-assigned by regist
 %cd /content/Shardflow
 !pip install -q -e .
 
-!python scripts/colab_runner.py \
-  --registry-url https://shardflow.onrender.com \
-  --model Qwen/Qwen2.5-7B-Instruct \
-  --node-id colab-node-0 \
-  --port 9500
+!python /content/Shardflow/scripts/colab_runner.py \
+    --registry-url https://shardflow.onrender.com \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --node-id colab-node-2 \
+    --port 9500 \
+    --tunnel bore
 ```
-*Wait until it logs: `Node ready — layers [0, 14), INTERMEDIATE node`*
 
 ---
 
-### Step 3: Call the OpenAI Endpoint
+### 2. Kaggle Notebooks
 
-#### Option A: Using `curl`
+Run on free Kaggle T4/P100 GPUs using `scripts/kaggle_runner.py`:
+
+```python
+!git clone https://github.com/rautaditya2606/Shardflow.git /kaggle/working/Shardflow && cd /kaggle/working/Shardflow && pip install -e .
+
+!python scripts/kaggle_runner.py \
+    --registry-url https://shardflow.onrender.com \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --node-id kaggle-node-1 \
+    --port 9500 \
+    --tunnel bore
+```
+
+---
+
+### 3. Rented Cloud GPUs (RunPod / Lambda Labs / Vast.ai / Custom VMs)
+
+For GPU cloud instances with public IP addresses (no reverse tunnels needed, direct TCP communication):
+
 ```bash
-curl https://shardflow.onrender.com/v1/chat/completions \
+python scripts/runpod_runner.py \
+    --registry-url https://shardflow.onrender.com \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --public-ip 1.2.3.4 \
+    --port 9500 \
+    --node-id runpod-node-1
+```
+
+---
+
+## API Client Usage
+
+Once your nodes log **`Cluster ready`**, call the API endpoint using standard OpenAI SDKs or `curl`:
+
+### Option A: Using `curl`
+
+```bash
+curl -X POST https://shardflow.onrender.com/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen2.5-7B-Instruct",
-    "messages": [{"role": "user", "content": "Explain artificial intelligence in one simple sentence."}],
-    "max_tokens": 40
+    "messages": [{"role": "user", "content": "Explain quantum computing in 2 short bullet points."}],
+    "max_tokens": 40,
+    "temperature": 0.7
   }'
 ```
 
-#### Option B: Using OpenAI Python SDK
+### Option B: Using OpenAI Python SDK
+
 ```python
 from openai import OpenAI
 
 client = OpenAI(
     base_url="https://shardflow.onrender.com/v1",
-    api_key="not-needed",
+    api_key="shardflow-key",
 )
 
 response = client.chat.completions.create(
     model="Qwen/Qwen2.5-7B-Instruct",
     messages=[{"role": "user", "content": "Explain cloud computing simply."}],
     max_tokens=40,
+    stream=True,
 )
 
-print(response.choices[0].message.content)
+for chunk in response:
+    if chunk.choices and chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+print()
 ```
 
 ---
 
-## Key Performance Optimizations
+## Key Architecture & Performance Features
 
-1. **VRAM-Weighted Auto-Partitioning**: Nodes register VRAM capacity, and `AutoPartitionEngine` dynamically allocates layer slices across heterogeneous GPUs without manual bounds.
-2. **Zero-RAM Meta-Device Loading**: Model skeletons are instantiated on PyTorch `meta` device in 0.00s with **0 MB CPU RAM overhead**, loading weights directly into assigned slices to prevent CPU RAM OOMs on 14B/32B/70B models.
-3. **Fast Tensor Serialization**: Replaced slow PyTorch element-wise storage serialization with fast C-level numpy view reinterpret (`tensor.view(torch.uint8).cpu().numpy().tobytes()`), reducing tensor serialization overhead to **0.005ms (2000x faster)**.
-4. **GPU-Side Token Sampling**: Last node samples next token directly on GPU logits and returns an **8-byte `TOKEN_ID`** message, reducing back-propagation payload from 64 KB to 8 bytes.
-5. **High-Watermark Draining & Zero-Copy**: Memoryviews (`torch.frombuffer`), high-watermark socket draining, and `socket.TCP_NODELAY` socket options for sub-millisecond network framing.
-6. **Heartbeat Auto-Reregistration**: Nodes automatically re-register with the registry if the server process restarts.
-
----
-
-## Local Development & Testing
-
-### Installation
-
-```bash
-git clone https://github.com/rautaditya2606/Shardflow.git
-cd Shardflow
-pip install -e ".[dev]"
-```
-
-### Run Local E2E Pipeline Test
-
-```bash
-PYTHONPATH=. python scripts/test_local_real_server.py
-```
+1. **Registration Barrier & Deferred Weight Loading**: Workers register metadata first and poll `/assignment/{node_id}`. PyTorch weights are loaded into GPU memory **only after** all expected cluster nodes register, preventing partial single-node OOMs.
+2. **VRAM-Weighted Auto-Partitioning**: `AutoPartitionEngine` dynamically calculates layer boundaries based on available VRAM and deducts LM head overhead for the terminal node.
+3. **Zero-RAM Meta-Device Slicing**: Model skeletons instantiate on PyTorch `meta` device in 0.00s with **0 MB CPU RAM overhead**, loading safetensors directly into assigned layer slices.
+4. **Single-Buffer Fast Tensor Serialization**: Replaced slow PyTorch element-wise storage loops with C-level numpy view reinterpret (`tensor.view(torch.uint8).cpu().numpy().tobytes()`), reducing tensor serialization overhead to **0.005ms (700x faster)**.
+5. **GPU-Side Token Sampling**: Terminal node samples tokens directly on GPU logits and returns an **8-byte `TOKEN_ID`** message, reducing reverse transport overhead.
+6. **Auto-Reconnect & SSL Auto-Detection**: `NodeClient` detects closed transports (`writer.is_closing()`) and auto-reconnects, while auto-detecting TLS/SSL for port 443 endpoints.
+7. **Control / Data Plane Primitive (`START_SESSION`)**: Supports protocol primitive for peer-to-peer session delegation (`MessageType.START_SESSION`).
 
 ---
 
 ## Benchmark Results
 
-### 1. Model: TinyLlama 1.1B
+### 1. Model: TinyLlama 1.1B (Local Benchmarks)
 
 | Device / Setup | Partition & Transport | Metric | Benchmark Result |
 |---|---|---|---|
@@ -200,3 +222,32 @@ PYTHONPATH=. python scripts/test_local_real_server.py
 | **End-to-End Latency** | 40 Tokens Generated | **17.65s (2.27 tok/s)** |
 | **Completion Reliability** | 40/40 Tokens Generated | **100% (0 transport errors)** |
 
+---
+
+## Local Development & Testing
+
+### Installation
+
+```bash
+git clone https://github.com/rautaditya2606/Shardflow.git
+cd Shardflow
+pip install -e ".[dev]"
+```
+
+### Run 3-Node Local Cluster Test
+
+```bash
+PYTHONPATH=. python scripts/test_3_nodes_local.py
+```
+
+### Run Full PyTest Suite
+
+```bash
+python -m pytest -p no:opik
+```
+
+---
+
+## License
+
+MIT License
