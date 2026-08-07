@@ -256,15 +256,37 @@ def register_node(payload: NodeRegistration):
     )
 
 
-@router.post("/heartbeat", status_code=status.HTTP_200_OK)
+class HeartbeatResponse(BaseModel):
+    status: str = "ok"
+    node_id: str
+    next_node_host: Optional[str] = None
+    next_node_port: Optional[int] = None
+    is_first_node: bool = False
+    is_last_node: bool = False
+    layer_start: int = 0
+    layer_end: int = 0
+
+
+@router.post("/heartbeat", status_code=status.HTTP_200_OK, response_model=HeartbeatResponse)
 def heartbeat(payload: HeartbeatPayload):
-    """Receive heartbeat ping from a node."""
+    """Receive heartbeat ping from a node and return latest routing assignment."""
     if payload.node_id not in _nodes:
         raise HTTPException(status_code=404, detail="Node not registered")
     
-    _nodes[payload.node_id].last_heartbeat = time.time()
-    _nodes[payload.node_id].is_active = True
-    return {"status": "ok", "node_id": payload.node_id}
+    node = _nodes[payload.node_id]
+    node.last_heartbeat = time.time()
+    node.is_active = True
+
+    return HeartbeatResponse(
+        status="ok",
+        node_id=node.node_id,
+        next_node_host=node.next_node_host,
+        next_node_port=node.next_node_port,
+        is_first_node=node.is_first_node,
+        is_last_node=node.is_last_node,
+        layer_start=node.layer_start,
+        layer_end=node.layer_end,
+    )
 
 
 @router.api_route("/topology", methods=["GET", "HEAD"], response_model=TopologyResponse)

@@ -127,7 +127,7 @@ def main():
 
     async def heartbeat_loop():
         """
-        Periodically ping Topology Registry to keep node alive.
+        Periodically ping Topology Registry to keep node alive and receive dynamic routing updates.
         If Render restarted (404 response), automatically re-register!
         """
         hb_url = f"{args.registry_url.rstrip('/')}/heartbeat"
@@ -136,14 +136,20 @@ def main():
             await asyncio.sleep(10.0)
             try:
                 hb_resp = requests.post(hb_url, json=hb_payload, timeout=5.0)
-                if hb_resp.status_code == 404:
+                if hb_resp.status_code == 200:
+                    data = hb_resp.json()
+                    nxt_host = data.get("next_node_host")
+                    nxt_port = data.get("next_node_port")
+                    await node.update_next_node(nxt_host, nxt_port)
+                elif hb_resp.status_code == 404:
                     logger.warning("Render registry lost node %s (server restarted). Re-registering...", node_id)
                     re_resp = requests.post(reg_url, json=reg_payload, timeout=10.0)
                     if re_resp.status_code in (200, 201):
                         data = re_resp.json()
-                        node.next_node_host = data.get("next_node_host", node.next_node_host)
-                        node.next_node_port = data.get("next_node_port", node.next_node_port)
-                        logger.info("Re-registration successful! Next node: %s:%s", node.next_node_host, node.next_node_port)
+                        nxt_host = data.get("next_node_host")
+                        nxt_port = data.get("next_node_port")
+                        await node.update_next_node(nxt_host, nxt_port)
+                        logger.info("Re-registration successful! Next node: %s:%s", nxt_host, nxt_port)
             except Exception as e:
                 logger.debug("Heartbeat ping error: %s", e)
 

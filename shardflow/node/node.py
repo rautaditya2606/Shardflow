@@ -100,6 +100,36 @@ class PipelineNode:
             self.listen_port,
         )
 
+    async def update_next_node(self, host: Optional[str], port: Optional[int]) -> None:
+        """
+        Dynamically update next-node routing target.
+        Handles None (disconnect/eviction), unchanged targets (no-op), and new targets (reconnect).
+        """
+        if host == self.next_node_host and port == self.next_node_port and self._next_client is not None and self._next_client.is_connected:
+            return
+
+        # Close old client if active
+        if self._next_client is not None:
+            logger.info("Closing old connection to next node (%s:%s)...", self.next_node_host, self.next_node_port)
+            try:
+                await self._next_client.close()
+            except Exception as e:
+                logger.debug("Error closing old next-node client: %s", e)
+            self._next_client = None
+
+        self.next_node_host = host
+        self.next_node_port = port
+
+        if not self.is_last_node and host and port:
+            logger.info("Connecting to updated next node target at %s:%d...", host, port)
+            self._next_client = NodeClient(host, port)
+            try:
+                await self._next_client.connect()
+                logger.info("Successfully connected to next node at %s:%d", host, port)
+            except Exception as e:
+                logger.warning("Could not connect to updated next node %s:%d: %s", host, port, e)
+                self._next_client = None
+
     async def _handle_message(self, msg: TensorMessage) -> Optional[TensorMessage]:
         """
         Process an incoming message.
@@ -156,6 +186,15 @@ class PipelineNode:
                     tensor=output.cpu(),
                 )
         else:
+            if self._next_client is None or not self._next_client.is_connected:
+                if self.next_node_host and self.next_node_port:
+                    logger.warning("Next client disconnected — attempting emergency reconnect to %s:%d...", self.next_node_host, self.next_node_port)
+                    await self.update_next_node(self.next_node_host, self.next_node_port)
+
+            if self._next_client is None or not self._next_client.is_connected:
+                logger.error("Cannot forward activation — next node target (%s:%s) is not connected", self.next_node_host, self.next_node_port)
+                raise RuntimeError(f"Next node target ({self.next_node_host}:{self.next_node_port}) is not connected")
+
             forward_msg = TensorMessage(
                 msg_type=MessageType.ACTIVATION,
                 session_id=msg.session_id,
@@ -209,14 +248,20 @@ class PipelineNode:
 
         # Run through each layer
         for layer in self.model_slice.layers:
-            layer_output = layer(
-                hidden_states,
-                attention_mask=causal_mask,
-                position_ids=position_ids,
-                position_embeddings=position_embeddings,
-                past_key_values=cache,
-                use_cache=True,
-            )
+            kwargs = {
+                "attention_mask": causal_mask,
+                "position_ids": position_ids,
+                "past_key_values": cache,
+                "use_cache": True,
+            }
+            if position_embeddings is not None:
+                kwargs["position_embeddings"] = position_embeddings
+            try:
+                layer_output = layer(hidden_states, **kwargs)
+            except TypeError:
+                kwargs.pop("position_embeddings", None)
+                layer_output = layer(hidden_states, **kwargs)
+
             if isinstance(layer_output, tuple):
                 hidden_states = layer_output[0]
             else:
