@@ -37,6 +37,7 @@ def main():
     parser.add_argument("--expected-nodes", type=int, default=None, help="Expected total cluster nodes count (optional)")
     parser.add_argument("--layer-start", type=int, default=None, help="Explicit layer start (optional)")
     parser.add_argument("--layer-end", type=int, default=None, help="Explicit layer end (optional)")
+    parser.add_argument("--load-in-4bit", action="store_true", help="Quantize weights to 4-bit NF4 via bitsandbytes to save VRAM")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -133,6 +134,7 @@ def main():
         include_norm=is_last,
         include_lm_head=is_last,
         device=device,
+        load_in_4bit=args.load_in_4bit,
     )
 
     node = PipelineNode(

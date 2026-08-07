@@ -176,10 +176,15 @@ class NodeClient:
             self._connected = False
             raise
 
-    async def send_recv(self, msg: TensorMessage) -> TensorMessage:
-        """Send a message and wait for a response."""
+    async def send_recv(self, msg: TensorMessage, timeout: Optional[float] = None) -> TensorMessage:
+        """Send a message and wait for a response with optional timeout override."""
         await self.send(msg)
-        return await self.recv()
+        t = timeout if timeout is not None else self.recv_timeout
+        try:
+            return await recv_message(self._reader, timeout=t)
+        except Exception:
+            self._connected = False
+            raise
 
     async def close(self) -> None:
         """Close the connection."""

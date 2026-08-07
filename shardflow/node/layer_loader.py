@@ -44,8 +44,8 @@ def _load_weights_from_safetensors(
     """
     Load only the weights in target_keys from safetensors files.
 
-    target_keys comes from the already-allocated module's named_parameters(),
-    so it's fully model-agnostic — no hardcoded architecture names.
+    Downloads ONLY the specific safetensors shard files containing target_keys,
+    eliminating full-model downloads and 14 GB RAM spikes.
 
     Returns a state_dict (key → tensor) or None if safetensors unavailable.
     """
@@ -54,31 +54,67 @@ def _load_weights_from_safetensors(
     except ImportError:
         return None
 
-    local_dir = _resolve_local_dir(model_path)
-    if local_dir is None:
+    # Check local directory first
+    if os.path.isdir(model_path):
+        local_dir = Path(model_path)
+        index_path = local_dir / "model.safetensors.index.json"
+        single_path = local_dir / "model.safetensors"
+
+        if index_path.exists():
+            with open(index_path) as f:
+                weight_map: Dict[str, str] = json.load(f)["weight_map"]
+            needed_shards = {weight_map[k] for k in target_keys if k in weight_map}
+            if not needed_shards:
+                logger.warning("No safetensors shards matched target keys in local index")
+                return None
+            state_dict: Dict[str, torch.Tensor] = {}
+            for shard in sorted(needed_shards):
+                logger.info("Loading local shard %s ...", shard)
+                data = load_file(local_dir / shard, device="cpu")
+                state_dict.update({k: v.to(target_dtype) for k, v in data.items() if k in target_keys})
+            return state_dict
+
+        if single_path.exists():
+            logger.info("Loading single local safetensors file...")
+            data = load_file(single_path, device="cpu")
+            return {k: v.to(target_dtype) for k, v in data.items() if k in target_keys}
+
+    # Remote HuggingFace Hub loading — download ONLY required index & shards
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
         return None
 
-    index_path = local_dir / "model.safetensors.index.json"
-    single_path = local_dir / "model.safetensors"
-
-    if index_path.exists():
-        with open(index_path) as f:
-            weight_map: Dict[str, str] = json.load(f)["weight_map"]
+    # 1. Try downloading index file
+    try:
+        logger.info("Fetching model.safetensors.index.json for targeted shard mapping (%s)...", model_path)
+        index_file = hf_hub_download(repo_id=model_path, filename="model.safetensors.index.json")
+        with open(index_file) as f:
+            weight_map = json.load(f)["weight_map"]
         needed_shards = {weight_map[k] for k in target_keys if k in weight_map}
         if not needed_shards:
-            logger.warning("No safetensors shards matched target keys — falling back to full load")
+            logger.warning("No safetensors shards matched target keys in remote index")
             return None
-        state_dict: Dict[str, torch.Tensor] = {}
-        for shard in sorted(needed_shards):
-            logger.info("Loading shard %s ...", shard)
-            data = load_file(local_dir / shard, device="cpu")
+
+        state_dict = {}
+        for shard_filename in sorted(needed_shards):
+            logger.info("Downloading targeted shard %s from HuggingFace Hub...", shard_filename)
+            shard_path = hf_hub_download(repo_id=model_path, filename=shard_filename)
+            logger.info("Loading shard %s ...", shard_filename)
+            data = load_file(shard_path, device="cpu")
             state_dict.update({k: v.to(target_dtype) for k, v in data.items() if k in target_keys})
         return state_dict
+    except Exception as e:
+        logger.debug("Failed to load via remote index file: %s", e)
 
-    if single_path.exists():
-        logger.info("Loading single safetensors file (filtering to slice keys)...")
+    # 2. Try single safetensors file
+    try:
+        logger.info("Attempting single model.safetensors download from HuggingFace Hub (%s)...", model_path)
+        single_path = hf_hub_download(repo_id=model_path, filename="model.safetensors")
         data = load_file(single_path, device="cpu")
         return {k: v.to(target_dtype) for k, v in data.items() if k in target_keys}
+    except Exception as e:
+        logger.warning("Failed single safetensors download: %s", e)
 
     return None
 
@@ -125,6 +161,8 @@ def load_layer_slice(
     include_embed: bool = False,
     dtype: Optional[torch.dtype] = None,
     device: str = "cpu",
+    load_in_4bit: bool = False,
+    load_in_8bit: bool = False,
 ) -> ModelSlice:
     """
     Load a contiguous slice of transformer layers from a model.
@@ -310,6 +348,13 @@ def load_layer_slice(
 
     # Move to target device
     target_device = torch.device(device)
+
+    if load_in_4bit:
+        logger.info("Quantizing layer slice to 4-bit NF4 via bitsandbytes...")
+        quantize_module_4bit(model_slice.layers, target_device)
+        if model_slice.lm_head is not None:
+            quantize_module_4bit(model_slice.lm_head, target_device)
+
     if target_device.type != "cpu":
         logger.info("Moving slice to %s...", target_device)
         model_slice.to(target_device)
@@ -319,6 +364,39 @@ def load_layer_slice(
             logger.info("GPU memory after loading: %.2f GB", allocated)
 
     return model_slice
+
+
+def quantize_module_4bit(module: nn.Module, device: torch.device) -> nn.Module:
+    """Replace linear layers in module with bitsandbytes 4-bit NF4 linear layers."""
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        logger.warning("bitsandbytes not installed — skipping 4-bit quantization")
+        return module
+
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear):
+            has_bias = child.bias is not None
+            compute_dtype = child.weight.dtype if child.weight.dtype in (torch.float16, torch.bfloat16) else torch.float16
+            qlinear = bnb.nn.Linear4bit(
+                child.in_features,
+                child.out_features,
+                bias=has_bias,
+                compute_dtype=compute_dtype,
+                quant_type="nf4",
+                device=device,
+            )
+            qlinear.weight = bnb.nn.Params4bit(
+                child.weight.data,
+                requires_grad=False,
+                quant_type="nf4",
+            ).to(device)
+            if has_bias and child.bias is not None:
+                qlinear.bias = child.bias.to(device)
+            setattr(module, name, qlinear)
+        else:
+            quantize_module_4bit(child, device)
+    return module
 
 
 def load_tokenizer(model_path: str) -> AutoTokenizer:

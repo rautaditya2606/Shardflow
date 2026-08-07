@@ -204,8 +204,17 @@ class PipelineNode:
                 top_p=msg.top_p,
                 sample_on_node=msg.sample_on_node,
             )
-            response = await self._next_client.send_recv(forward_msg)
-            return response
+            try:
+                response = await self._next_client.send_recv(forward_msg, timeout=10.0)
+                return response
+            except (asyncio.TimeoutError, ConnectionError, OSError) as err:
+                logger.error(
+                    "Forward to next node (%s:%s) failed or timed out for session %s: %s",
+                    self.next_node_host, self.next_node_port, msg.session_id, err,
+                )
+                raise RuntimeError(
+                    f"Forward to next node ({self.next_node_host}:{self.next_node_port}) failed: {err}"
+                ) from err
 
     @torch.inference_mode()
     def _forward(self, hidden_states: torch.Tensor, session_id: str) -> torch.Tensor:
