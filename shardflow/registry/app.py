@@ -36,6 +36,15 @@ from shardflow.partition.engine import AutoPartitionEngine, NodeVRAMInfo
 
 EXPECTED_NODES = int(os.getenv("SHARDFLOW_EXPECTED_NODES", "2"))
 
+# ponytail: Simple offline layer lookup fallback for common models
+KNOWN_MODEL_LAYERS: Dict[str, int] = {
+    "tinyllama/tinyllama-1.1b-chat-v1.0": 22,
+    "meta-llama/meta-llama-3-8b": 32,
+    "meta-llama/meta-llama-3-8b-instruct": 32,
+    "meta-llama/llama-2-7b-hf": 32,
+    "mistralai/mistral-7b-v0.1": 32,
+}
+
 
 def get_model_total_layers(model_id: str) -> int:
     """
@@ -133,14 +142,21 @@ def _rebalance_assignments(model_id: str) -> None:
     if not _nodes:
         return
 
+    total_layers = get_model_total_layers(model_id)
+
     active = [n for n in _nodes.values() if n.is_active]
     if len(active) < EXPECTED_NODES:
         logger.info(
             "Waiting for nodes: %d/%d registered", len(active), EXPECTED_NODES
         )
+        # ponytail: single node owns all layers until full cluster joins
+        if len(active) == 1:
+            n0 = active[0]
+            n0.layer_start = 0
+            n0.layer_end = total_layers
+            n0.is_first_node = True
+            n0.is_last_node = True
         return
-
-    total_layers = get_model_total_layers(model_id)
     try:
         from transformers import AutoConfig
         cfg = AutoConfig.from_pretrained(model_id)
@@ -156,11 +172,12 @@ def _rebalance_assignments(model_id: str) -> None:
         hidden_size=hidden_size,
         vocab_size=vocab_size,
     )
+    # ponytail: Default to 15000 MB if node reports 0 VRAM (e.g., tests or nodes without VRAM reporting)
     vram_infos = [
         NodeVRAMInfo(
             node_id=n.node_id,
-            vram_available_mb=n.vram_available_mb,
-            vram_total_mb=n.vram_total_mb,
+            vram_available_mb=n.vram_available_mb if n.vram_available_mb > 0 else 15000.0,
+            vram_total_mb=n.vram_total_mb if n.vram_total_mb > 0 else 15000.0,
         )
         for n in active
     ]
