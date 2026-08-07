@@ -70,40 +70,21 @@ graph TD
 
 ShardFlow supports multiple GPU hosting platforms via dedicated runner scripts in `scripts/`:
 
-### 1. Google Colab (2 Free T4 GPUs)
+> **Note on Tunneling:** Always use `--tunnel bore` when running on Colab/Kaggle. `bore.pub` provides unencumbered raw TCP sockets required for low-overhead binary tensor transfer, whereas free HTTP reverse proxies (like Cloudflare trycloudflare) alter/reject raw TCP protocol headers.
 
-Run 7B or 14B parameter models (`Qwen/Qwen2.5-7B-Instruct` or `Qwen/Qwen2.5-14B-Instruct`) split across two free Colab accounts:
+#### **Running across 3 Google Colab Notebooks (e.g. 14B Model):**
 
-#### **Colab Notebook 1 (Node 0):**
+Add `--expected-nodes 3` so the registry waits for all 3 nodes before distributing transformer layers:
+
 ```python
-%cd /content
-!rm -rf /content/Shardflow
-!git clone https://github.com/rautaditya2606/Shardflow.git /content/Shardflow
-%cd /content/Shardflow
-!pip install -q -e .
+# In Notebook 1 (colab-node-1):
+!python /content/Shardflow/scripts/colab_runner.py --registry-url https://shardflow.onrender.com --model Qwen/Qwen2.5-14B-Instruct --node-id colab-node-1 --expected-nodes 3 --tunnel bore
 
-!python /content/Shardflow/scripts/colab_runner.py \
-    --registry-url https://shardflow.onrender.com \
-    --model Qwen/Qwen2.5-7B-Instruct \
-    --node-id colab-node-1 \
-    --port 9500 \
-    --tunnel bore
-```
+# In Notebook 2 (colab-node-2):
+!python /content/Shardflow/scripts/colab_runner.py --registry-url https://shardflow.onrender.com --model Qwen/Qwen2.5-14B-Instruct --node-id colab-node-2 --expected-nodes 3 --tunnel bore
 
-#### **Colab Notebook 2 (Node 1):**
-```python
-%cd /content
-!rm -rf /content/Shardflow
-!git clone https://github.com/rautaditya2606/Shardflow.git /content/Shardflow
-%cd /content/Shardflow
-!pip install -q -e .
-
-!python /content/Shardflow/scripts/colab_runner.py \
-    --registry-url https://shardflow.onrender.com \
-    --model Qwen/Qwen2.5-7B-Instruct \
-    --node-id colab-node-2 \
-    --port 9500 \
-    --tunnel bore
+# In Notebook 3 (colab-node-3):
+!python /content/Shardflow/scripts/colab_runner.py --registry-url https://shardflow.onrender.com --model Qwen/Qwen2.5-14B-Instruct --node-id colab-node-3 --expected-nodes 3 --tunnel bore
 ```
 
 ---
@@ -212,15 +193,15 @@ print()
 | **Overall End-to-End Throughput** | Render Gateway $\rightarrow$ `bore.pub` TCP Tunnels $\rightarrow$ Client | **2.87 tok/s** |
 | **Completion Reliability** | 40/40 Tokens Generated | **100% (0 transport errors)** |
 
-### 3. Model: Qwen/Qwen2.5-14B-Instruct (2 Google Colab T4 GPUs + Render Gateway)
+### 4. Model: Qwen/Qwen2.5-14B-Instruct (3 Google Colab T4 GPUs + Render Gateway + `bore.pub`)
 
 | Benchmark Metric | Setup | Result |
 |---|---|---|
-| **Total Model Layers** | 48 Transformer Layers | **48 Layers** |
-| **Auto-Partition Split** | Colab 1 (`[0, 25)`), Colab 2 (`[25, 48)` + LM Head) | **25 / 23 Layers** |
-| **VRAM Footprint** | ~7.2 GB per Colab T4 GPU | **~50% T4 VRAM Capacity** |
-| **End-to-End Latency** | 40 Tokens Generated | **17.65s (2.27 tok/s)** |
-| **Completion Reliability** | 40/40 Tokens Generated | **100% (0 transport errors)** |
+| **Total Model Layers** | 48 Transformer Layers across 3 Nodes | **48 Layers** |
+| **Auto-Partition Split** | Colab 1 (`[0, 16)`), Colab 2 (`[16, 32)`), Colab 3 (`[32, 48)` + LM Head) | **16 / 16 / 16 Layers** |
+| **VRAM Footprint** | ~5.2 GB per Colab T4 GPU | **~35% T4 VRAM Capacity** |
+| **End-to-End Latency** | 60 Tokens Generated | **43.18s (1.39 tok/s)** |
+| **Completion Reliability** | 60/60 Tokens Generated | **100% (0 transport errors)** |
 
 ---
 

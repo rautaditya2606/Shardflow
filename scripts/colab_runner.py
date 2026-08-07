@@ -30,8 +30,8 @@ def main():
     parser.add_argument(
         "--tunnel",
         choices=["bore", "cloudflare"],
-        default="cloudflare",
-        help="Tunnel backend (default: cloudflare — more stable than bore.pub)",
+        default="bore",
+        help="Tunnel backend (default: bore — bore.pub raw TCP proxy for high performance binary tensor transfer)",
     )
     parser.add_argument("--node-id", default=None, help="Unique node identifier")
     parser.add_argument("--expected-nodes", type=int, default=None, help="Expected total cluster nodes count (optional)")
