@@ -66,6 +66,8 @@ class PipelineNode:
         # Connection to next node (if not the last)
         self._next_client: Optional[NodeClient] = None
         self._server: Optional[NodeServer] = None
+        # Stream clients cache for terminal node stream-back: (host, port) -> NodeClient
+        self._stream_clients: dict[tuple[str, int], NodeClient] = {}
 
     async def start(self) -> None:
         """Start the node: connect to next node, start listening, start eviction loop."""
@@ -130,14 +132,31 @@ class PipelineNode:
                 logger.warning("Could not connect to updated next node %s:%d: %s", host, port, e)
                 self._next_client = None
 
+    async def _get_stream_client(self, host: str, port: int) -> Optional[NodeClient]:
+        """Get or create a cached stream-back client to the Gateway."""
+        key = (host, port)
+        client = self._stream_clients.get(key)
+        if client is not None and client.is_connected:
+            return client
+
+        try:
+            client = NodeClient(host, port, send_timeout=5.0, recv_timeout=10.0)
+            await client.connect(max_retries=3, retry_delay=0.5)
+            self._stream_clients[key] = client
+            return client
+        except Exception as e:
+            logger.debug("Could not establish stream-back connection to %s:%d: %s", host, port, e)
+            return None
+
     async def _handle_message(self, msg: TensorMessage) -> Optional[TensorMessage]:
         """
         Process an incoming message.
 
         For CLEAR: evict KV cache for session_id.
+        For START_SESSION (v2 Data Plane): Node 0 drives the full decode loop across the cluster.
         For ACTIVATION:
         - Run hidden states through local layers using cached KV
-        - If last node: return sampled token ID (or logits if requested)
+        - If last node: sample token ID, stream back to Gateway if stream_back address is set, return token_id
         - If not last: forward to next node, wait for response, pass back
         """
         if msg.msg_type == MessageType.CLEAR:
@@ -148,6 +167,9 @@ class PipelineNode:
                 except (ConnectionError, OSError):
                     logger.debug("Could not forward CLEAR — next node already disconnected")
             return None
+
+        if msg.msg_type == MessageType.START_SESSION:
+            return await self._handle_start_session(msg)
 
         if msg.msg_type != MessageType.ACTIVATION:
             logger.warning("Unknown message type: %s", msg.msg_type)
@@ -178,6 +200,22 @@ class PipelineNode:
                     top_k=msg.top_k,
                     top_p=msg.top_p,
                 )
+
+                # Direct stream-back to Gateway over dedicated TCP channel
+                if msg.stream_back_host and msg.stream_back_port:
+                    try:
+                        stream_client = await self._get_stream_client(msg.stream_back_host, msg.stream_back_port)
+                        if stream_client and stream_client.is_connected:
+                            stream_msg = TensorMessage(
+                                msg_type=MessageType.STREAM_TOKEN,
+                                session_id=msg.session_id,
+                                token_id=token_id,
+                                is_eos=False,
+                            )
+                            await stream_client.send(stream_msg)
+                    except Exception as e:
+                        logger.debug("Stream-back to %s:%d failed: %s", msg.stream_back_host, msg.stream_back_port, e)
+
                 return TensorMessage(
                     msg_type=MessageType.TOKEN_ID,
                     session_id=msg.session_id,
@@ -211,9 +249,11 @@ class PipelineNode:
                 top_k=msg.top_k,
                 top_p=msg.top_p,
                 sample_on_node=msg.sample_on_node,
+                stream_back_host=msg.stream_back_host,
+                stream_back_port=msg.stream_back_port,
             )
             try:
-                response = await self._next_client.send_recv(forward_msg, timeout=10.0)
+                response = await self._next_client.send_recv(forward_msg, timeout=15.0)
                 return response
             except (asyncio.TimeoutError, ConnectionError, OSError) as err:
                 logger.error(
@@ -223,6 +263,166 @@ class PipelineNode:
                 raise RuntimeError(
                     f"Forward to next node ({self.next_node_host}:{self.next_node_port}) failed: {err}"
                 ) from err
+
+    async def _handle_start_session(self, msg: TensorMessage) -> TensorMessage:
+        """
+        v2 Data-Plane Controller on Node 0.
+
+        Drives the complete autoregressive generation loop peer-to-peer across
+        worker GPU nodes without involving the Gateway on every token.
+        """
+        session_id = msg.session_id
+        prompt_tokens = msg.prompt_tokens or []
+        max_tokens = msg.max_tokens or 100
+        temperature = msg.temperature
+        top_k = msg.top_k
+        top_p = msg.top_p
+        eos_id = msg.eos_token_id
+        stream_host = msg.stream_back_host
+        stream_port = msg.stream_back_port
+
+        logger.info(
+            "Starting v2 data-plane generation: session=%s, prompt_len=%d, max_tokens=%d",
+            session_id, len(prompt_tokens), max_tokens,
+        )
+
+        try:
+            # 1. Chunked Prefill Phase (windows of 512 tokens)
+            prefill_chunk_size = 512
+            prompt_len = len(prompt_tokens)
+            next_token = None
+
+            for chunk_start in range(0, prompt_len, prefill_chunk_size):
+                chunk_end = min(prompt_len, chunk_start + prefill_chunk_size)
+                chunk = prompt_tokens[chunk_start:chunk_end]
+                is_final_chunk = (chunk_end == prompt_len)
+
+                token_tensor = torch.tensor([chunk], dtype=torch.long, device=self.model_slice.device)
+                if self.model_slice.embed_tokens is not None:
+                    hidden_states = self.model_slice.embed_tokens(token_tensor)
+                else:
+                    hidden_states = token_tensor
+
+                output = self._forward(
+                    hidden_states,
+                    session_id=session_id,
+                    compute_head=is_final_chunk if self.is_last_node else False,
+                )
+
+                if self.is_last_node:
+                    if is_final_chunk:
+                        logits = output[0, -1, :]
+                        next_token = sample_next_token(logits, temperature=temperature, top_k=top_k, top_p=top_p)
+                        if stream_host and stream_port:
+                            stream_client = await self._get_stream_client(stream_host, stream_port)
+                            if stream_client and stream_client.is_connected:
+                                await stream_client.send(TensorMessage(
+                                    msg_type=MessageType.STREAM_TOKEN,
+                                    session_id=session_id,
+                                    token_id=next_token,
+                                    is_eos=False,
+                                ))
+                else:
+                    if self._next_client is None or not self._next_client.is_connected:
+                        await self.update_next_node(self.next_node_host, self.next_node_port)
+                    forward_msg = TensorMessage(
+                        msg_type=MessageType.ACTIVATION,
+                        session_id=session_id,
+                        tensor=output.cpu(),
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                        sample_on_node=is_final_chunk,
+                        stream_back_host=stream_host,
+                        stream_back_port=stream_port,
+                    )
+                    resp = await self._next_client.send_recv(forward_msg, timeout=30.0)
+                    if is_final_chunk and resp.msg_type == MessageType.TOKEN_ID:
+                        next_token = resp.token_id
+
+            if next_token is None:
+                raise RuntimeError("No token returned from prefill phase")
+
+            # 2. Peer-to-Peer Decode Loop
+            for step in range(1, max_tokens):
+                if eos_id is not None and next_token == eos_id:
+                    logger.info("Session %s reached EOS at step %d", session_id, step)
+                    break
+
+                token_tensor = torch.tensor([[next_token]], dtype=torch.long, device=self.model_slice.device)
+                if self.model_slice.embed_tokens is not None:
+                    hidden_states = self.model_slice.embed_tokens(token_tensor)
+                else:
+                    hidden_states = token_tensor
+
+                output = self._forward(
+                    hidden_states,
+                    session_id=session_id,
+                    compute_head=self.is_last_node,
+                )
+
+                if self.is_last_node:
+                    logits = output[0, -1, :]
+                    next_token = sample_next_token(logits, temperature=temperature, top_k=top_k, top_p=top_p)
+                    if stream_host and stream_port:
+                        stream_client = await self._get_stream_client(stream_host, stream_port)
+                        if stream_client and stream_client.is_connected:
+                            await stream_client.send(TensorMessage(
+                                msg_type=MessageType.STREAM_TOKEN,
+                                session_id=session_id,
+                                token_id=next_token,
+                                is_eos=False,
+                            ))
+                else:
+                    forward_msg = TensorMessage(
+                        msg_type=MessageType.ACTIVATION,
+                        session_id=session_id,
+                        tensor=output.cpu(),
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                        sample_on_node=True,
+                        stream_back_host=stream_host,
+                        stream_back_port=stream_port,
+                    )
+                    resp = await self._next_client.send_recv(forward_msg, timeout=15.0)
+                    if resp.msg_type == MessageType.TOKEN_ID:
+                        next_token = resp.token_id
+                    else:
+                        raise RuntimeError(f"Unexpected response in decode loop: {resp.msg_type}")
+
+        finally:
+            # Cleanup: evict KV cache across cluster
+            self.kv_store.evict(session_id)
+            if not self.is_last_node and self._next_client and self._next_client.is_connected:
+                try:
+                    await self._next_client.send(TensorMessage(
+                        msg_type=MessageType.CLEAR,
+                        session_id=session_id,
+                    ))
+                except Exception:
+                    pass
+
+            # Signal stream completion to Gateway
+            if stream_host and stream_port:
+                try:
+                    stream_client = await self._get_stream_client(stream_host, stream_port)
+                    if stream_client and stream_client.is_connected:
+                        await stream_client.send(TensorMessage(
+                            msg_type=MessageType.STREAM_TOKEN,
+                            session_id=session_id,
+                            token_id=0,
+                            is_eos=True,
+                            finish_reason="stop",
+                        ))
+                except Exception:
+                    pass
+
+        return TensorMessage(
+            msg_type=MessageType.TOKEN_ID,
+            session_id=session_id,
+            token_id=next_token,
+        )
 
     @torch.inference_mode()
     def _forward(

@@ -90,21 +90,114 @@ class NodeServer:
         except Exception:
             logger.exception("Error handling connection from %s", peer)
         finally:
-            writer.close()
-            await writer.wait_closed()
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
             logger.info("Connection to %s closed", peer)
 
     async def stop(self) -> None:
         """Stop the TCP server."""
         if self._server:
             self._server.close()
-            await self._server.wait_closed()
+            try:
+                await self._server.wait_closed()
+            except Exception:
+                pass
             logger.info("Node server stopped")
 
     async def serve_forever(self) -> None:
         """Start and run until cancelled."""
         await self.start()
         await self._server.serve_forever()
+
+
+class StreamReceiverServer:
+    """
+    Lightweight TCP server running on the Gateway to receive direct token streams
+    from the terminal pipeline node (Node N) with sub-millisecond dispatch.
+    """
+
+    def __init__(self, host: str = "0.0.0.0", port: int = 9600, recv_timeout: float = 60.0):
+        self.host = host
+        self.port = port
+        self.recv_timeout = recv_timeout
+        self._server: Optional[asyncio.Server] = None
+        self._session_queues: dict[str, asyncio.Queue[TensorMessage]] = {}
+        self.bound_port: int = port
+
+    async def start(self) -> int:
+        """Start the stream receiver server and return the bound port."""
+        self._server = await asyncio.start_server(
+            self._handle_connection,
+            self.host,
+            self.port,
+            reuse_address=True,
+        )
+        addr = self._server.sockets[0].getsockname()
+        self.bound_port = addr[1]
+        logger.info("Gateway StreamReceiverServer listening on %s:%d", addr[0], self.bound_port)
+        return self.bound_port
+
+    def register_session(self, session_id: str) -> asyncio.Queue[TensorMessage]:
+        """Register a session queue for incoming streamed tokens."""
+        q: asyncio.Queue[TensorMessage] = asyncio.Queue()
+        self._session_queues[session_id] = q
+        return q
+
+    def unregister_session(self, session_id: str) -> None:
+        """Unregister and cleanup a session queue."""
+        self._session_queues.pop(session_id, None)
+
+    async def _handle_connection(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Handle incoming token stream from terminal node."""
+        peer = writer.get_extra_info("peername")
+        sock = writer.get_extra_info("socket")
+        if sock:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+        try:
+            while True:
+                try:
+                    msg = await recv_message(reader, timeout=self.recv_timeout)
+                except asyncio.TimeoutError:
+                    continue
+                except (asyncio.IncompleteReadError, ConnectionError):
+                    break
+
+                q = self._session_queues.get(msg.session_id)
+                if q is not None:
+                    await q.put(msg)
+                else:
+                    logger.debug("Received token for unknown or finished session %s", msg.session_id)
+
+                if msg.is_eos or (msg.finish_reason is not None and msg.finish_reason != ""):
+                    # Stream complete for this session
+                    break
+
+        except Exception as e:
+            logger.debug("Stream connection from %s closed: %s", peer, e)
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def stop(self) -> None:
+        """Stop the stream receiver server."""
+        if self._server:
+            self._server.close()
+            try:
+                await self._server.wait_closed()
+            except Exception:
+                pass
+            logger.info("StreamReceiverServer stopped")
 
 
 class NodeClient:

@@ -52,13 +52,27 @@ from shardflow.registry.app import router as registry_router
 app.include_router(registry_router)
 
 
-# Global orchestrator reference
+# Global orchestrator and stream receiver references
 _orchestrator: Optional[Orchestrator] = None
+_stream_receiver: Optional[object] = None
 
 
 def set_orchestrator(orchestrator: Orchestrator) -> None:
     global _orchestrator
     _orchestrator = orchestrator
+
+
+async def get_stream_receiver():
+    """Lazily start and return Gateway StreamReceiverServer."""
+    global _stream_receiver
+    if _stream_receiver is None:
+        from shardflow.transport.connection import StreamReceiverServer
+        import os
+        port = int(os.getenv("SHARDFLOW_STREAM_PORT", "0"))
+        receiver = StreamReceiverServer(host="0.0.0.0", port=port)
+        await receiver.start()
+        _stream_receiver = receiver
+    return _stream_receiver
 
 
 def _format_prompt(messages: list) -> str:
@@ -124,25 +138,82 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
             )
             yield f"data: {json.dumps(role_chunk.model_dump())}\n\n"
 
+            # v2 Data Plane stream path: send START_SESSION to Node 0 and stream directly from StreamReceiver
+            session_id = str(uuid.uuid4())
+            stream_receiver = await get_stream_receiver()
+            stream_q = stream_receiver.register_session(session_id)
+
             try:
-                async for token_text in _orchestrator.generate_stream(
-                    prompt=prompt,
-                    max_tokens=req.max_tokens,
-                    temperature=req.temperature,
-                    top_k=req.top_k,
-                    top_p=req.top_p,
-                ):
+                import os
+                stream_host = os.getenv("SHARDFLOW_GATEWAY_HOST", "127.0.0.1")
+                prompt_token_ids = _orchestrator.tokenizer.encode(prompt)
+                eos_id = getattr(_orchestrator.tokenizer, "eos_token_id", None)
+
+                from shardflow.transport.protocol import TensorMessage, MessageType
+                start_msg = TensorMessage(
+                    msg_type=MessageType.START_SESSION,
+                    session_id=session_id,
+                    prompt_tokens=prompt_token_ids,
+                    max_tokens=req.max_tokens or 100,
+                    temperature=req.temperature or 0.0,
+                    top_k=req.top_k or 0,
+                    top_p=req.top_p or 1.0,
+                    eos_token_id=eos_id,
+                    stream_back_host=stream_host,
+                    stream_back_port=stream_receiver.bound_port,
+                )
+                await _orchestrator._node0_client.send(start_msg)
+
+                while True:
                     if await raw_request.is_disconnected():
+                        clear_msg = TensorMessage(msg_type=MessageType.CLEAR, session_id=session_id)
+                        try:
+                            await _orchestrator._node0_client.send(clear_msg)
+                        except Exception:
+                            pass
                         break
-                    chunk = ChatCompletionChunk(
-                        id=completion_id,
-                        created=created_ts,
-                        model=req.model,
-                        choices=[ChunkChoice(index=0, delta=DeltaMessage(content=token_text), finish_reason=None)],
-                    )
-                    yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+
+                    try:
+                        token_msg = await asyncio.wait_for(stream_q.get(), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        break
+
+                    if token_msg.is_eos or (token_msg.finish_reason is not None and token_msg.finish_reason != ""):
+                        break
+
+                    if token_msg.token_id is not None:
+                        token_text = _orchestrator.tokenizer.decode([token_msg.token_id])
+                        chunk = ChatCompletionChunk(
+                            id=completion_id,
+                            created=created_ts,
+                            model=req.model,
+                            choices=[ChunkChoice(index=0, delta=DeltaMessage(content=token_text), finish_reason=None)],
+                        )
+                        yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+
             except Exception:
-                logger.exception("Error during SSE streaming")
+                logger.exception("Error during v2 SSE streaming — falling back to generator")
+                try:
+                    async for token_text in _orchestrator.generate_stream(
+                        prompt=prompt,
+                        max_tokens=req.max_tokens,
+                        temperature=req.temperature,
+                        top_k=req.top_k,
+                        top_p=req.top_p,
+                    ):
+                        if await raw_request.is_disconnected():
+                            break
+                        chunk = ChatCompletionChunk(
+                            id=completion_id,
+                            created=created_ts,
+                            model=req.model,
+                            choices=[ChunkChoice(index=0, delta=DeltaMessage(content=token_text), finish_reason=None)],
+                        )
+                        yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+                except Exception:
+                    logger.exception("Fallback stream also encountered error")
+            finally:
+                stream_receiver.unregister_session(session_id)
 
             final_chunk = ChatCompletionChunk(
                 id=completion_id,
