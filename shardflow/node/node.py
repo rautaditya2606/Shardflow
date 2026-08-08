@@ -490,7 +490,17 @@ class PipelineNode:
             except Exception as e:
                 logger.debug("rotary_emb compute fallback: %s", e)
 
-        # Run through each layer
+        # Check layer signature once to avoid inner-loop TypeError exception overhead
+        self._layer_accepts_pos_emb = False
+        if self.model_slice.layers and len(self.model_slice.layers) > 0:
+            import inspect
+            try:
+                sig = inspect.signature(self.model_slice.layers[0].forward)
+                self._layer_accepts_pos_emb = "position_embeddings" in sig.parameters
+            except Exception:
+                self._layer_accepts_pos_emb = False
+
+        # Run through each layer with direct kwargs
         for layer in self.model_slice.layers:
             kwargs = {
                 "attention_mask": causal_mask,
@@ -498,13 +508,10 @@ class PipelineNode:
                 "past_key_values": cache,
                 "use_cache": True,
             }
-            if position_embeddings is not None:
+            if self._layer_accepts_pos_emb and position_embeddings is not None:
                 kwargs["position_embeddings"] = position_embeddings
-            try:
-                layer_output = layer(hidden_states, **kwargs)
-            except TypeError:
-                kwargs.pop("position_embeddings", None)
-                layer_output = layer(hidden_states, **kwargs)
+            
+            layer_output = layer(hidden_states, **kwargs)
 
             if isinstance(layer_output, tuple):
                 hidden_states = layer_output[0]
