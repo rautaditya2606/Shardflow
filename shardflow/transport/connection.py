@@ -66,12 +66,23 @@ class NodeServer:
         writer: asyncio.StreamWriter,
     ) -> None:
         """Handle a single TCP connection — process messages in a loop."""
+        import time
         peer = writer.get_extra_info("peername")
         logger.info("New connection from %s", peer)
 
         sock = writer.get_extra_info("socket")
         if sock:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            if hasattr(socket, "TCP_QUICKACK"):
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+                except Exception:
+                    pass
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 131072)
+            except Exception:
+                pass
 
         try:
             while True:
@@ -82,6 +93,11 @@ class NodeServer:
                 except (asyncio.IncompleteReadError, ConnectionError):
                     logger.info("Connection closed by %s", peer)
                     break
+
+                now_us = int(time.perf_counter() * 1_000_000)
+                if msg.send_ts_us > 0:
+                    hop_ms = (now_us - msg.send_ts_us) / 1000.0
+                    logger.debug("Hop latency for %s from %s: %.2f ms", msg.msg_type.name, peer, hop_ms)
 
                 response = await self.handler(msg)
                 if response is not None:
@@ -202,7 +218,7 @@ class StreamReceiverServer:
 
 class NodeClient:
     """
-    Async TCP client for connecting to a pipeline node.
+    Async TCP client for connecting to a pipeline node with zero-latency transport optimizations.
     """
 
     def __init__(
@@ -219,6 +235,8 @@ class NodeClient:
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
         self._connected = False
+        self.reconnect_count: int = 0
+        self.last_hop_latency_ms: float = 0.0
 
     async def connect(self, max_retries: int = 15, retry_delay: float = 2.0) -> None:
         """Establish TCP connection to the node, with retry for bootstrapping nodes."""
@@ -234,8 +252,21 @@ class NodeClient:
                 sock = self._writer.get_extra_info("socket")
                 if sock:
                     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    if hasattr(socket, "TCP_QUICKACK"):
+                        try:
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+                        except Exception:
+                            pass
+                    try:
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 131072)
+                    except Exception:
+                        pass
+
                 self._connected = True
-                logger.info("Connected to %s:%d (ssl=%s)", self.host, self.port, bool(use_ssl))
+                if attempt > 1:
+                    self.reconnect_count += 1
+                logger.info("Connected to %s:%d (ssl=%s, reconnects=%d)", self.host, self.port, bool(use_ssl), self.reconnect_count)
                 return
             except (OSError, asyncio.TimeoutError) as e:
                 last_err = e
@@ -260,21 +291,31 @@ class NodeClient:
             raise
 
     async def recv(self) -> TensorMessage:
-        """Receive a message from the connected node."""
+        """Receive a message from the connected node and record hop latency."""
+        import time
         if not self.is_connected:
             raise ConnectionError("Not connected. Call connect() first.")
         try:
-            return await recv_message(self._reader, timeout=self.recv_timeout)
+            msg = await recv_message(self._reader, timeout=self.recv_timeout)
+            now_us = int(time.perf_counter() * 1_000_000)
+            if msg.send_ts_us > 0:
+                self.last_hop_latency_ms = (now_us - msg.send_ts_us) / 1000.0
+            return msg
         except Exception:
             self._connected = False
             raise
 
     async def send_recv(self, msg: TensorMessage, timeout: Optional[float] = None) -> TensorMessage:
         """Send a message and wait for a response with optional timeout override."""
+        import time
         await self.send(msg)
         t = timeout if timeout is not None else self.recv_timeout
         try:
-            return await recv_message(self._reader, timeout=t)
+            resp = await recv_message(self._reader, timeout=t)
+            now_us = int(time.perf_counter() * 1_000_000)
+            if resp.send_ts_us > 0:
+                self.last_hop_latency_ms = (now_us - resp.send_ts_us) / 1000.0
+            return resp
         except Exception:
             await self.close()
             raise

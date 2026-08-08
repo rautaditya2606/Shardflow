@@ -42,19 +42,21 @@ async def profile_pipeline(
     base_port = 9300
 
     # Load model slices
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     print("Loading model slices...")
     slice0 = load_layer_slice(
         model_path=model_path,
         layer_start=0,
-        layer_end=11,
+        layer_end=4,
         include_norm=False,
         include_lm_head=False,
         device=device,
     )
     slice1 = load_layer_slice(
         model_path=model_path,
-        layer_start=11,
-        layer_end=22,
+        layer_start=4,
+        layer_end=8,
         include_norm=True,
         include_lm_head=True,
         device=device,
@@ -112,10 +114,9 @@ async def profile_pipeline(
     total_token_times = []
 
     next_token = 100
-
     print(f"\nProfiling {max_tokens} decode tokens...")
-    print(f"{'Token':<8} | {'Embed (ms)':<12} | {'TCP+Pipeline (ms)':<18} | {'Sample (ms)':<12} | {'Total (ms)':<12}")
-    print("-" * 72)
+    print(f"{'Token':<8} | {'Embed':<10} | {'Pipeline Round-Trip':<22} | {'Hop Wire (ms)':<15} | {'Total (ms)':<12}")
+    print("-" * 75)
 
     for step in range(max_tokens):
         t_start = time.perf_counter()
@@ -128,15 +129,18 @@ async def profile_pipeline(
 
         # 2. TCP + Pipeline Roundtrip
         t1 = time.perf_counter()
+        now_us = int(time.perf_counter() * 1_000_000)
         msg = TensorMessage(
             msg_type=MessageType.ACTIVATION,
             session_id=session_id,
+            send_ts_us=now_us,
             tensor=hidden_states.cpu(),
             temperature=0.0,
             sample_on_node=True,
         )
         response = await orchestrator._node0_client.send_recv(msg)
         t_pipeline = (time.perf_counter() - t1) * 1000
+        hop_wire_ms = orchestrator._node0_client.last_hop_latency_ms
 
         # 3. Sampling
         t2 = time.perf_counter()
@@ -157,25 +161,27 @@ async def profile_pipeline(
         sampling_times.append(t_sample)
         total_token_times.append(t_total)
 
-        print(f"{step+1:<8} | {t_embed:<12.2f} | {t_pipeline:<18.2f} | {t_sample:<12.2f} | {t_total:<12.2f}")
+        print(f"{step+1:<8} | {t_embed:<8.2f}ms | {t_pipeline:<20.2f}ms | {hop_wire_ms:<13.2f}ms | {t_total:<10.2f}ms")
 
+    # Summary
     avg_embed = sum(embed_times) / len(embed_times)
-    avg_pipeline = sum(transport_roundtrip_times) / len(transport_roundtrip_times)
+    avg_pipe = sum(transport_roundtrip_times) / len(transport_roundtrip_times)
     avg_sample = sum(sampling_times) / len(sampling_times)
     avg_total = sum(total_token_times) / len(total_token_times)
-    tok_s = 1000.0 / avg_total if avg_total > 0 else 0
+    tps = 1000.0 / avg_total if avg_total > 0 else 0
 
-    print("\n" + "="*60)
-    print("STAGE LATENCY BREAKDOWN (AVERAGE):")
-    print(f"  - Embedding:          {avg_embed:.2f} ms")
-    print(f"  - TCP + Node Pipeline:{avg_pipeline:.2f} ms")
-    print(f"  - Sampling:           {avg_sample:.2f} ms")
-    print(f"  - Total Per Token:    {avg_total:.2f} ms  ({tok_s:.1f} tok/s)")
-    print("="*60 + "\n")
+    print("\n" + "=" * 75)
+    print("STAGE BREAKDOWN SUMMARY (Averages):")
+    print(f"  1. Token Embedding:     {avg_embed:.2f} ms ({avg_embed/avg_total*100:.1f}%)")
+    print(f"  2. Pipeline + TCP Hop:  {avg_pipe:.2f} ms ({avg_pipe/avg_total*100:.1f}%)")
+    print(f"  3. Token Sampling:      {avg_sample:.2f} ms ({avg_sample/avg_total*100:.1f}%)")
+    print(f"  -------------------------------------------------------------")
+    print(f"  Total Per-Token Time:   {avg_total:.2f} ms")
+    print(f"  Achieved Throughput:    {tps:.2f} tokens/sec")
+    print(f"  Connection Reconnects:  {orchestrator._node0_client.reconnect_count}")
+    print("=" * 75)
 
     # Cleanup
-    clear_msg = TensorMessage(msg_type=MessageType.CLEAR, session_id=session_id, tensor=None)
-    await orchestrator._node0_client.send(clear_msg)
     await orchestrator.shutdown()
     await node0.stop()
     await node1.stop()

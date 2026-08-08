@@ -32,8 +32,8 @@ logger = logging.getLogger(__name__)
 LENGTH_PREFIX_FMT = "<Q"
 LENGTH_PREFIX_SIZE = 8
 
-# Header: 1 byte msg_type + 36 bytes session_id (UUID as string)
-HEADER_FMT = "<B36s"
+# Header: 1 byte msg_type + 36 bytes session_id (UUID as string) + 8 bytes send_ts_us (uint64 microsecond timestamp)
+HEADER_FMT = "<B36sQ"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
 # Tensor metadata: shape dims as int32 values, dtype as 1 byte
@@ -67,9 +67,10 @@ DTYPE_REVERSE = {v: k for k, v in DTYPE_MAP.items()}
 
 @dataclass
 class TensorMessage:
-    """A framed message containing a tensor and metadata."""
+    """A framed message containing a tensor and metadata with wire telemetry timestamp."""
     msg_type: MessageType
     session_id: str
+    send_ts_us: int = 0                   # Monotonic microsecond timestamp when sent
     tensor: Optional[torch.Tensor] = None  # None for CLEAR, TOKEN_ID, START_SESSION, STREAM_TOKEN
     token_id: Optional[int] = None        # Set for TOKEN_ID and STREAM_TOKEN messages
     temperature: float = 0.0              # Sampling temperature
@@ -132,31 +133,33 @@ def encode_message(msg: TensorMessage) -> bytes:
 
     Returns: length-prefixed bytes ready to send.
     """
+    import time
     session_id_bytes = msg.session_id.encode("ascii")
+    send_ts = msg.send_ts_us if msg.send_ts_us > 0 else int(time.perf_counter() * 1_000_000)
 
     if msg.msg_type == MessageType.CLEAR:
         payload_len = HEADER_SIZE
         buf = bytearray(LENGTH_PREFIX_SIZE + payload_len)
         struct.pack_into(LENGTH_PREFIX_FMT, buf, 0, payload_len)
-        struct.pack_into(HEADER_FMT, buf, LENGTH_PREFIX_SIZE, msg.msg_type, session_id_bytes)
+        struct.pack_into(HEADER_FMT, buf, LENGTH_PREFIX_SIZE, msg.msg_type, session_id_bytes, send_ts)
         return bytes(buf)
 
     elif msg.msg_type == MessageType.TOKEN_ID:
         payload_len = HEADER_SIZE + 8
         buf = bytearray(LENGTH_PREFIX_SIZE + payload_len)
         struct.pack_into(LENGTH_PREFIX_FMT, buf, 0, payload_len)
-        struct.pack_into(HEADER_FMT, buf, LENGTH_PREFIX_SIZE, msg.msg_type, session_id_bytes)
+        struct.pack_into(HEADER_FMT, buf, LENGTH_PREFIX_SIZE, msg.msg_type, session_id_bytes, send_ts)
         struct.pack_into("<q", buf, LENGTH_PREFIX_SIZE + HEADER_SIZE, msg.token_id or 0)
         return bytes(buf)
 
     elif msg.msg_type == MessageType.STREAM_TOKEN:
-        # STREAM_TOKEN: session_id + token_id (q) + is_eos (B) + finish_reason (16s)
+        # STREAM_TOKEN: session_id + send_ts + token_id (q) + is_eos (B) + finish_reason (16s)
         reason_bytes = (msg.finish_reason or "").encode("ascii")[:16]
         payload_len = HEADER_SIZE + 8 + 1 + 16
         buf = bytearray(LENGTH_PREFIX_SIZE + payload_len)
         struct.pack_into(LENGTH_PREFIX_FMT, buf, 0, payload_len)
         offset = LENGTH_PREFIX_SIZE
-        struct.pack_into(HEADER_FMT, buf, offset, msg.msg_type, session_id_bytes)
+        struct.pack_into(HEADER_FMT, buf, offset, msg.msg_type, session_id_bytes, send_ts)
         offset += HEADER_SIZE
         struct.pack_into("<qB16s", buf, offset, msg.token_id or 0, 1 if msg.is_eos else 0, reason_bytes)
         return bytes(buf)
@@ -173,7 +176,7 @@ def encode_message(msg: TensorMessage) -> bytes:
         struct.pack_into(LENGTH_PREFIX_FMT, buf, 0, payload_len)
         offset = LENGTH_PREFIX_SIZE
 
-        struct.pack_into(HEADER_FMT, buf, offset, msg.msg_type, session_id_bytes)
+        struct.pack_into(HEADER_FMT, buf, offset, msg.msg_type, session_id_bytes, send_ts)
         offset += HEADER_SIZE
 
         struct.pack_into(
@@ -225,7 +228,7 @@ def encode_message(msg: TensorMessage) -> bytes:
         struct.pack_into(LENGTH_PREFIX_FMT, buf, 0, payload_len)
         offset = LENGTH_PREFIX_SIZE
 
-        struct.pack_into(HEADER_FMT, buf, offset, msg.msg_type, session_id_bytes)
+        struct.pack_into(HEADER_FMT, buf, offset, msg.msg_type, session_id_bytes, send_ts)
         offset += HEADER_SIZE
 
         struct.pack_into(
@@ -257,17 +260,17 @@ def decode_message(data: bytes) -> TensorMessage:
     """
     Decode a wire-format payload (after length prefix has been read) into a TensorMessage.
     """
-    msg_type_raw, session_id_raw = struct.unpack_from(HEADER_FMT, data, 0)
+    msg_type_raw, session_id_raw, send_ts_us = struct.unpack_from(HEADER_FMT, data, 0)
     msg_type = MessageType(msg_type_raw)
     session_id = session_id_raw.decode("ascii").strip("\x00")
     offset = HEADER_SIZE
 
     if msg_type == MessageType.CLEAR:
-        return TensorMessage(msg_type=msg_type, session_id=session_id)
+        return TensorMessage(msg_type=msg_type, session_id=session_id, send_ts_us=send_ts_us)
 
     if msg_type == MessageType.TOKEN_ID:
         token_id = struct.unpack_from("<q", data, offset)[0]
-        return TensorMessage(msg_type=msg_type, session_id=session_id, token_id=token_id)
+        return TensorMessage(msg_type=msg_type, session_id=session_id, send_ts_us=send_ts_us, token_id=token_id)
 
     if msg_type == MessageType.STREAM_TOKEN:
         token_id, is_eos_val, reason_raw = struct.unpack_from("<qB16s", data, offset)
@@ -275,6 +278,7 @@ def decode_message(data: bytes) -> TensorMessage:
         return TensorMessage(
             msg_type=msg_type,
             session_id=session_id,
+            send_ts_us=send_ts_us,
             token_id=token_id,
             is_eos=bool(is_eos_val),
             finish_reason=reason if reason else None,
@@ -295,7 +299,6 @@ def decode_message(data: bytes) -> TensorMessage:
         # Check if extended v2 START_SESSION with eos_token_id (14 bytes) or v1 (6 bytes)
         eos_token_id = None
         remaining_header = len(data) - offset
-        # If there's enough bytes for <HqI (14 bytes), unpack with eos_token_id
         if remaining_header >= 14:
             stream_port, eos_val, num_tokens = struct.unpack_from("<HqI", data, offset)
             offset += 14
@@ -313,6 +316,7 @@ def decode_message(data: bytes) -> TensorMessage:
         return TensorMessage(
             msg_type=msg_type,
             session_id=session_id,
+            send_ts_us=send_ts_us,
             temperature=temp,
             top_k=top_k,
             top_p=top_p,
@@ -349,6 +353,7 @@ def decode_message(data: bytes) -> TensorMessage:
     return TensorMessage(
         msg_type=msg_type,
         session_id=session_id,
+        send_ts_us=send_ts_us,
         tensor=tensor,
         temperature=temp,
         top_k=top_k,
@@ -363,12 +368,16 @@ async def send_message(
     writer: asyncio.StreamWriter,
     msg: TensorMessage,
 ) -> None:
-    """Send a length-prefixed tensor message over an async TCP connection."""
+    """
+    Send a length-prefixed tensor message over an async TCP connection.
+    Unconditionally drains to flush bytes to the OS kernel socket immediately.
+    """
+    import time
+    if msg.send_ts_us <= 0:
+        msg.send_ts_us = int(time.perf_counter() * 1_000_000)
     data = encode_message(msg)
     writer.write(data)
-    # ponytail: only drain under backpressure — avoids a kernel RTT every token
-    if writer.transport.get_write_buffer_size() > 65536:
-        await writer.drain()
+    await writer.drain()
     logger.debug(
         "Sent %s for session %s (%d bytes)",
         msg.msg_type.name, msg.session_id, len(data)
@@ -381,14 +390,6 @@ async def recv_message(
 ) -> TensorMessage:
     """
     Receive a length-prefixed tensor message from an async TCP connection.
-
-    Args:
-        reader: asyncio StreamReader
-        timeout: seconds before raising TimeoutError (default 5s)
-
-    Raises:
-        asyncio.TimeoutError: if no data received within timeout
-        ConnectionError: if connection is closed
     """
     # Read length prefix
     length_bytes = await asyncio.wait_for(
