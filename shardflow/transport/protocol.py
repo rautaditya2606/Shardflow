@@ -42,6 +42,9 @@ TENSOR_META_FMT = "<B"  # num_dims as uint8
 DIM_FMT = "<I"  # each dim as uint32
 
 
+PROTOCOL_VERSION: int = 2
+
+
 class MessageType(IntEnum):
     """Wire message types."""
     ACTIVATION = 0x01
@@ -49,6 +52,7 @@ class MessageType(IntEnum):
     LOGITS = 0x03
     TOKEN_ID = 0x04
     START_SESSION = 0x05
+    STREAM_TOKEN = 0x06
 
 
 DTYPE_MAP = {
@@ -66,14 +70,17 @@ class TensorMessage:
     """A framed message containing a tensor and metadata."""
     msg_type: MessageType
     session_id: str
-    tensor: Optional[torch.Tensor] = None  # None for CLEAR, TOKEN_ID, or START_SESSION messages
-    token_id: Optional[int] = None        # Set for TOKEN_ID messages
+    tensor: Optional[torch.Tensor] = None  # None for CLEAR, TOKEN_ID, START_SESSION, STREAM_TOKEN
+    token_id: Optional[int] = None        # Set for TOKEN_ID and STREAM_TOKEN messages
     temperature: float = 0.0              # Sampling temperature
     top_k: int = 0                        # Sampling top_k
     top_p: float = 1.0                    # Sampling top_p
     sample_on_node: bool = True           # Request node to perform GPU sampling
     prompt_tokens: Optional[list[int]] = None  # Token IDs for START_SESSION
     max_tokens: int = 128                 # Max tokens for START_SESSION
+    eos_token_id: Optional[int] = None    # EOS token ID for data-plane decode loop
+    is_eos: bool = False                  # Flag indicating EOS reached in STREAM_TOKEN
+    finish_reason: Optional[str] = None   # Finish reason: "stop", "length", None
     stream_back_host: Optional[str] = None     # Host address to stream generated tokens to
     stream_back_port: Optional[int] = None     # Port address to stream generated tokens to
 
@@ -142,12 +149,24 @@ def encode_message(msg: TensorMessage) -> bytes:
         struct.pack_into("<q", buf, LENGTH_PREFIX_SIZE + HEADER_SIZE, msg.token_id or 0)
         return bytes(buf)
 
+    elif msg.msg_type == MessageType.STREAM_TOKEN:
+        # STREAM_TOKEN: session_id + token_id (q) + is_eos (B) + finish_reason (16s)
+        reason_bytes = (msg.finish_reason or "").encode("ascii")[:16]
+        payload_len = HEADER_SIZE + 8 + 1 + 16
+        buf = bytearray(LENGTH_PREFIX_SIZE + payload_len)
+        struct.pack_into(LENGTH_PREFIX_FMT, buf, 0, payload_len)
+        offset = LENGTH_PREFIX_SIZE
+        struct.pack_into(HEADER_FMT, buf, offset, msg.msg_type, session_id_bytes)
+        offset += HEADER_SIZE
+        struct.pack_into("<qB16s", buf, offset, msg.token_id or 0, 1 if msg.is_eos else 0, reason_bytes)
+        return bytes(buf)
+
     elif msg.msg_type == MessageType.START_SESSION:
         host_bytes = (msg.stream_back_host or "").encode("utf-8")
         tokens = msg.prompt_tokens or []
 
-        # SAMPLING_FMT (temp, top_k, top_p, sample_flag) + max_tokens (I) + host_len (H) + host_bytes + port (H) + num_tokens (I) + tokens (q*N)
-        extra_len = SAMPLING_SIZE + 4 + 2 + len(host_bytes) + 2 + 4 + (8 * len(tokens))
+        # SAMPLING_FMT (temp, top_k, top_p, sample_flag) + max_tokens (I) + host_len (H) + host_bytes + port (H) + eos_token_id (q) + num_tokens (I) + tokens (q*N)
+        extra_len = SAMPLING_SIZE + 4 + 2 + len(host_bytes) + 2 + 8 + 4 + (8 * len(tokens))
         payload_len = HEADER_SIZE + extra_len
         buf = bytearray(LENGTH_PREFIX_SIZE + payload_len)
 
@@ -175,8 +194,9 @@ def encode_message(msg: TensorMessage) -> bytes:
             buf[offset:offset + len(host_bytes)] = host_bytes
             offset += len(host_bytes)
 
-        struct.pack_into("<HI", buf, offset, int(msg.stream_back_port or 0), len(tokens))
-        offset += 6
+        eos_val = msg.eos_token_id if msg.eos_token_id is not None else -1
+        struct.pack_into("<HqI", buf, offset, int(msg.stream_back_port or 0), int(eos_val), len(tokens))
+        offset += 14
 
         for token in tokens:
             struct.pack_into("<q", buf, offset, int(token))
@@ -195,7 +215,11 @@ def encode_message(msg: TensorMessage) -> bytes:
         # ponytail: view(uint8).cpu().numpy().tobytes() is 700x faster than bytes(tensor.untyped_storage())
         tensor_bytes = tensor.view(torch.uint8).cpu().numpy().tobytes()
 
-        payload_len = HEADER_SIZE + SAMPLING_SIZE + len(tensor_meta) + len(tensor_bytes)
+        host_bytes = (msg.stream_back_host or "").encode("utf-8")
+        stream_port = int(msg.stream_back_port or 0)
+        stream_meta_len = 4 + len(host_bytes)
+
+        payload_len = HEADER_SIZE + SAMPLING_SIZE + stream_meta_len + len(tensor_meta) + len(tensor_bytes)
         buf = bytearray(LENGTH_PREFIX_SIZE + payload_len)
 
         struct.pack_into(LENGTH_PREFIX_FMT, buf, 0, payload_len)
@@ -214,6 +238,13 @@ def encode_message(msg: TensorMessage) -> bytes:
             1 if msg.sample_on_node else 0,
         )
         offset += SAMPLING_SIZE
+
+        struct.pack_into("<HH", buf, offset, stream_port, len(host_bytes))
+        offset += 4
+
+        if host_bytes:
+            buf[offset:offset + len(host_bytes)] = host_bytes
+            offset += len(host_bytes)
 
         buf[offset:offset + len(tensor_meta)] = tensor_meta
         offset += len(tensor_meta)
@@ -238,6 +269,17 @@ def decode_message(data: bytes) -> TensorMessage:
         token_id = struct.unpack_from("<q", data, offset)[0]
         return TensorMessage(msg_type=msg_type, session_id=session_id, token_id=token_id)
 
+    if msg_type == MessageType.STREAM_TOKEN:
+        token_id, is_eos_val, reason_raw = struct.unpack_from("<qB16s", data, offset)
+        reason = reason_raw.decode("ascii").strip("\x00")
+        return TensorMessage(
+            msg_type=msg_type,
+            session_id=session_id,
+            token_id=token_id,
+            is_eos=bool(is_eos_val),
+            finish_reason=reason if reason else None,
+        )
+
     if msg_type == MessageType.START_SESSION:
         temp, top_k, top_p, sample_flag = struct.unpack_from(SAMPLING_FMT, data, offset)
         offset += SAMPLING_SIZE
@@ -250,8 +292,17 @@ def decode_message(data: bytes) -> TensorMessage:
             stream_host = data[offset:offset + host_len].decode("utf-8")
             offset += host_len
 
-        stream_port, num_tokens = struct.unpack_from("<HI", data, offset)
-        offset += 6
+        # Check if extended v2 START_SESSION with eos_token_id (14 bytes) or v1 (6 bytes)
+        eos_token_id = None
+        remaining_header = len(data) - offset
+        # If there's enough bytes for <HqI (14 bytes), unpack with eos_token_id
+        if remaining_header >= 14:
+            stream_port, eos_val, num_tokens = struct.unpack_from("<HqI", data, offset)
+            offset += 14
+            eos_token_id = eos_val if eos_val >= 0 else None
+        else:
+            stream_port, num_tokens = struct.unpack_from("<HI", data, offset)
+            offset += 6
 
         prompt_tokens = []
         for _ in range(num_tokens):
@@ -268,6 +319,7 @@ def decode_message(data: bytes) -> TensorMessage:
             sample_on_node=bool(sample_flag),
             prompt_tokens=prompt_tokens,
             max_tokens=max_tokens,
+            eos_token_id=eos_token_id,
             stream_back_host=stream_host if stream_host else None,
             stream_back_port=stream_port if stream_port > 0 else None,
         )
@@ -276,14 +328,23 @@ def decode_message(data: bytes) -> TensorMessage:
     temp, top_k, top_p, sample_flag = struct.unpack_from(SAMPLING_FMT, data, offset)
     offset += SAMPLING_SIZE
 
+    stream_port, host_len = struct.unpack_from("<HH", data, offset)
+    offset += 4
+
+    stream_host = ""
+    if host_len > 0:
+        stream_host = data[offset:offset + host_len].decode("utf-8")
+        offset += host_len
+
     # Parse tensor metadata
     shape, dtype, offset = _decode_tensor_meta(data, offset)
 
-    # Parse tensor bytes — zero-copy from buffer
+    # Parse tensor bytes — zero-copy from writable buffer
     numel = 1
     for dim in shape:
         numel *= dim
-    tensor = torch.frombuffer(data, dtype=dtype, count=numel, offset=offset).reshape(shape).clone()
+    mutable_data = bytearray(data)
+    tensor = torch.frombuffer(mutable_data, dtype=dtype, count=numel, offset=offset).reshape(shape).clone()
 
     return TensorMessage(
         msg_type=msg_type,
@@ -293,6 +354,8 @@ def decode_message(data: bytes) -> TensorMessage:
         top_k=top_k,
         top_p=top_p,
         sample_on_node=bool(sample_flag),
+        stream_back_host=stream_host if stream_host else None,
+        stream_back_port=stream_port if stream_port > 0 else None,
     )
 
 

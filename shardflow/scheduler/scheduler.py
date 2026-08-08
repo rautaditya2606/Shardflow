@@ -23,10 +23,12 @@ class RequestScheduler:
         self.max_concurrent_sessions = max_concurrent_sessions
         self.pending_queue: asyncio.Queue[Session] = asyncio.Queue()
         self.active_sessions: Dict[str, Session] = {}
+        self._all_sessions: Dict[str, Session] = {}
         self._dispatch_task: Optional[asyncio.Task] = None
 
     async def submit_request(self, session: Session) -> str:
         """Submit a request session to the pending queue."""
+        self._all_sessions[session.session_id] = session
         await self.pending_queue.put(session)
         logger.info(
             "Submitted session %s to queue (pending depth: %d)",
@@ -35,12 +37,12 @@ class RequestScheduler:
         return session.session_id
 
     def get_session(self, session_id: str) -> Optional[Session]:
-        """Look up active session by ID."""
-        return self.active_sessions.get(session_id)
+        """Look up active or queued session by ID."""
+        return self._all_sessions.get(session_id) or self.active_sessions.get(session_id)
 
     def cancel_session(self, session_id: str) -> bool:
-        """Mark session cancelled."""
-        session = self.active_sessions.get(session_id)
+        """Mark session cancelled (whether active or pending in queue)."""
+        session = self._all_sessions.get(session_id) or self.active_sessions.get(session_id)
         if session:
             session.state = SessionState.CANCELLED
             logger.info("Cancelled session %s", session_id)
@@ -49,8 +51,8 @@ class RequestScheduler:
 
     def remove_session(self, session_id: str):
         """Remove completed or failed session from active tracking."""
-        if session_id in self.active_sessions:
-            del self.active_sessions[session_id]
+        self.active_sessions.pop(session_id, None)
+        self._all_sessions.pop(session_id, None)
 
     @property
     def current_load(self) -> dict:

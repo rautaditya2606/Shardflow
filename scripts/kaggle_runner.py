@@ -37,6 +37,10 @@ def main():
     parser.add_argument("--expected-nodes", type=int, default=None, help="Expected total cluster nodes count (optional)")
     parser.add_argument("--layer-start", type=int, default=None, help="Explicit layer start (optional)")
     parser.add_argument("--layer-end", type=int, default=None, help="Explicit layer end (optional)")
+    parser.add_argument("--load-in-4bit", action="store_true", help="Quantize weights to 4-bit NF4 via bitsandbytes to save VRAM")
+    parser.add_argument("--next-host", default=None, help="Explicit next node host (optional)")
+    parser.add_argument("--next-port", type=int, default=None, help="Explicit next node port (optional)")
+    parser.add_argument("--is-last", action="store_true", help="Explicitly mark as last node (optional)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -88,14 +92,14 @@ def main():
                 raise
             time.sleep(2)
 
-    if args.layer_start is not None and args.layer_end is not None:
+    if args.layer_start is not None and args.layer_end is not None and (args.is_last or args.next_host is not None):
         assignment = {
             "layer_start": args.layer_start,
             "layer_end": args.layer_end,
             "is_first_node": args.layer_start == 0,
-            "is_last_node": True,
-            "next_node_host": None,
-            "next_node_port": None,
+            "is_last_node": args.is_last,
+            "next_node_host": args.next_host,
+            "next_node_port": args.next_port,
             "topology_version": 0,
         }
     else:

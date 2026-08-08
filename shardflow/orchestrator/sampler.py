@@ -48,8 +48,9 @@ def sample_next_token(
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
         cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
 
-        # Remove tokens with cumulative probability above the threshold
+        # Remove tokens with cumulative probability above the threshold (always keep top-1)
         sorted_mask = cumulative_probs - F.softmax(sorted_logits, dim=-1) >= top_p
+        sorted_mask[..., 0] = False
         sorted_logits[sorted_mask] = float("-inf")
 
         # Scatter back to original ordering

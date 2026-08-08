@@ -114,7 +114,7 @@ class Orchestrator:
         except Exception as e:
             logger.debug("In-memory topology fetch unavailable: %s", e)
 
-        return self._cached_topology
+        return self._cached_topology or self.node_addresses
 
     async def fetch_topology_async(self, force: bool = False) -> list[tuple[str, int]]:
         """Async topology fetch — avoids blocking the event loop on external registry HTTP."""
@@ -147,7 +147,7 @@ class Orchestrator:
             except Exception as e:
                 logger.warning("Failed to fetch topology from registry: %s", e)
 
-        return self._cached_topology
+        return self._cached_topology or self.node_addresses
 
     async def initialize(self) -> None:
         """Load tokenizer (zero model weights on CPU) and connect to Node 0."""
@@ -324,6 +324,17 @@ class Orchestrator:
                 tokens_generated=len(generated_tokens),
                 original_error=err,
             )
+        finally:
+            # Send CLEAR to evict KV cache for this session across worker nodes
+            clear_msg = TensorMessage(
+                msg_type=MessageType.CLEAR,
+                session_id=session_id,
+                tensor=None,
+            )
+            try:
+                await self._node0_client.send(clear_msg)
+            except Exception as e:
+                logger.debug("Failed to send CLEAR message: %s", e)
 
         if stream:
             print()  # Newline after streaming
@@ -336,17 +347,6 @@ class Orchestrator:
             "Generation complete: %d tokens in %.2fs (%.1f tok/s)",
             num_tokens, total_time, tok_per_sec,
         )
-
-        # Send CLEAR to evict KV cache for this session
-        clear_msg = TensorMessage(
-            msg_type=MessageType.CLEAR,
-            session_id=session_id,
-            tensor=None,
-        )
-        try:
-            await self._node0_client.send(clear_msg)
-        except Exception as e:
-            logger.debug("Failed to send CLEAR message: %s", e)
 
         # Decode the full completion
         completion = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
