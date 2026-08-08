@@ -20,13 +20,14 @@ import torch
 
 from shardflow.node.layer_loader import load_layer_slice, ModelSlice
 from shardflow.node.kv_cache import KVCacheStore
+from shardflow.node.cuda_graph import CUDAGraphRunner
 from shardflow.orchestrator.sampler import sample_next_token
 from shardflow.transport.connection import NodeServer, NodeClient
 from shardflow.transport.protocol import (
     MessageType,
     TensorMessage,
 )
-from transformers.cache_utils import DynamicCache
+from transformers.cache_utils import DynamicCache, StaticCache
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ class PipelineNode:
 
     Holds a contiguous range of transformer layers and optionally
     the final norm + LM head (if this is the last node).
-    Maintains a per-session KV cache.
+    Maintains a per-session KV cache with CUDA Graph replay acceleration.
     """
 
     def __init__(
@@ -50,7 +51,8 @@ class PipelineNode:
         listen_host: str = "0.0.0.0",
         listen_port: int = 9000,
         kv_timeout: float = 60.0,
-        max_sessions: int = 32,
+        max_sessions: int = 4,
+        enable_cuda_graphs: bool = True,
     ):
         self.model_slice = model_slice
         self.is_first_node = is_first_node
@@ -59,9 +61,41 @@ class PipelineNode:
         self.next_node_port = next_node_port
         self.listen_host = listen_host
         self.listen_port = listen_port
+        self.enable_cuda_graphs = enable_cuda_graphs
 
-        # KV Cache Store
-        self.kv_store = KVCacheStore(eviction_timeout=kv_timeout, max_sessions=max_sessions)
+        # KV Cache Store with static slot leasing
+        self.kv_store = KVCacheStore(
+            eviction_timeout=kv_timeout,
+            max_sessions=max_sessions,
+            max_seq_len=2048,
+            enable_static_cache=True,
+        )
+
+        # Determine node dtype safely
+        node_dtype = torch.float16
+        if model_slice.layers and len(model_slice.layers) > 0:
+            params = list(model_slice.layers[0].parameters())
+            if params:
+                node_dtype = params[0].dtype
+
+        hidden_size = 2048
+        if model_slice.config is not None and hasattr(model_slice.config, "hidden_size"):
+            hidden_size = model_slice.config.hidden_size
+        elif model_slice.layers and len(model_slice.layers) > 0:
+            for p in model_slice.layers[0].parameters():
+                if len(p.shape) >= 2:
+                    hidden_size = p.shape[-1]
+                    break
+
+        # CUDA Graph Runner
+        self.graph_runner = CUDAGraphRunner(
+            layers=model_slice.layers,
+            hidden_size=hidden_size,
+            device=model_slice.device,
+            dtype=node_dtype,
+            rotary_emb=model_slice.rotary_emb,
+            enabled=enable_cuda_graphs,
+        )
 
         # Connection to next node (if not the last)
         self._next_client: Optional[NodeClient] = None
@@ -70,7 +104,22 @@ class PipelineNode:
         self._stream_clients: dict[tuple[str, int], NodeClient] = {}
 
     async def start(self) -> None:
-        """Start the node: connect to next node, start listening, start eviction loop."""
+        """Start the node: connect to next node, start listening, start eviction loop, capture CUDA graphs."""
+        node_dtype = torch.float16
+        if self.model_slice.layers and len(self.model_slice.layers) > 0:
+            params = list(self.model_slice.layers[0].parameters())
+            if params:
+                node_dtype = params[0].dtype
+
+        if self.model_slice.config is not None:
+            self.kv_store.initialize_static_pool(
+                config=self.model_slice.config,
+                device=self.model_slice.device,
+                dtype=node_dtype,
+            )
+            if self.kv_store._static_slots and self.enable_cuda_graphs:
+                self.graph_runner.capture(self.kv_store._static_slots[0].cache)
+
         await self.kv_store.start_eviction_loop()
 
         # Connect to the next node in the chain (if not last)
@@ -94,12 +143,13 @@ class PipelineNode:
         await self._server.start()
 
         logger.info(
-            "Node ready — layers [%d, %d), %s, listening on %s:%d",
+            "Node ready — layers [%d, %d), %s, listening on %s:%d (CUDA Graphs: %s)",
             self.model_slice.layer_start,
             self.model_slice.layer_end,
             "LAST node (has LM head)" if self.is_last_node else "INTERMEDIATE node",
             self.listen_host,
             self.listen_port,
+            self.graph_runner.is_captured,
         )
 
     async def update_next_node(self, host: Optional[str], port: Optional[int]) -> None:
@@ -432,7 +482,7 @@ class PipelineNode:
         compute_head: bool = True,
     ) -> torch.Tensor:
         """
-        Run hidden states through this node's layers with KV caching.
+        Run hidden states through this node's layers with KV caching and CUDA Graph replay.
 
         Args:
             hidden_states: [batch, seq_len, hidden_dim]
@@ -446,11 +496,18 @@ class PipelineNode:
         batch_size, seq_len, _ = hidden_states.shape
         device = hidden_states.device
 
-        # Lookup or initialize KV cache for this session
-        cache = self.kv_store.get(session_id)
-        if cache is None:
-            cache = DynamicCache()
-            self.kv_store.put(session_id, cache)
+        # Lookup or lease static KV cache slot (or dynamic fallback)
+        node_dtype = torch.float16
+        if self.model_slice.layers and len(self.model_slice.layers) > 0:
+            params = list(self.model_slice.layers[0].parameters())
+            if params:
+                node_dtype = params[0].dtype
+        cache = self.kv_store.get_or_create(
+            session_id,
+            config=self.model_slice.config,
+            device=self.model_slice.device,
+            dtype=node_dtype,
+        )
 
         past_seq_len = 0
         if cache is not None:
@@ -461,62 +518,80 @@ class PipelineNode:
                     past_seq_len = cache.get_seq_length()
                 except Exception:
                     past_seq_len = 0
-        if past_seq_len is None:
-            past_seq_len = 0
+        if isinstance(past_seq_len, torch.Tensor):
+            past_seq_len = past_seq_len.item()
+        past_seq_len = int(past_seq_len or 0)
 
-        position_ids = torch.arange(past_seq_len, past_seq_len + seq_len, device=device).unsqueeze(0)
+        # Fast path: CUDA Graph replay for single-token autoregressive decoding
+        if seq_len == 1 and self.graph_runner.can_use_graph(seq_len):
+            hidden_states = self.graph_runner.replay_decode(hidden_states, past_seq_len)
+        else:
+            # Eager execution for prefill / multi-token sequences
+            position_ids = torch.arange(past_seq_len, past_seq_len + seq_len, device=device).unsqueeze(0)
 
-        # Causal attention mask: prefix with past KV keys when seq_len > 1
-        causal_mask = None
-        if seq_len > 1:
-            causal_mask = torch.full(
-                (seq_len, past_seq_len + seq_len),
-                0.0,
-                device=device,
-                dtype=hidden_states.dtype,
-            )
-            current_chunk_mask = torch.triu(
-                torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=hidden_states.dtype),
-                diagonal=1,
-            )
-            causal_mask[:, past_seq_len:] = current_chunk_mask
-            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+            # Causal attention mask: prefix with past KV keys when seq_len > 1
+            causal_mask = None
+            if seq_len > 1:
+                key_len = past_seq_len + seq_len
+                if isinstance(cache, StaticCache):
+                    try:
+                        max_len = getattr(cache, "max_cache_len", None)
+                        if max_len is not None:
+                            key_len = max(key_len, int(max_len))
+                    except Exception:
+                        pass
 
-        # Compute rotary position embeddings
-        position_embeddings = None
-        if self.model_slice.rotary_emb is not None:
-            try:
-                position_embeddings = self.model_slice.rotary_emb(hidden_states, position_ids)
-            except Exception as e:
-                logger.debug("rotary_emb compute fallback: %s", e)
+                causal_mask = torch.full(
+                    (seq_len, key_len),
+                    0.0,
+                    device=device,
+                    dtype=hidden_states.dtype,
+                )
+                current_chunk_mask = torch.triu(
+                    torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=hidden_states.dtype),
+                    diagonal=1,
+                )
+                causal_mask[:, past_seq_len:past_seq_len + seq_len] = current_chunk_mask
+                if key_len > past_seq_len + seq_len:
+                    causal_mask[:, past_seq_len + seq_len:] = float("-inf")
+                causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
 
-        # Check layer signature once to avoid inner-loop TypeError exception overhead
-        self._layer_accepts_pos_emb = False
-        if self.model_slice.layers and len(self.model_slice.layers) > 0:
-            import inspect
-            try:
-                sig = inspect.signature(self.model_slice.layers[0].forward)
-                self._layer_accepts_pos_emb = "position_embeddings" in sig.parameters
-            except Exception:
+            # Compute rotary position embeddings
+            position_embeddings = None
+            if self.model_slice.rotary_emb is not None:
+                try:
+                    position_embeddings = self.model_slice.rotary_emb(hidden_states, position_ids)
+                except Exception as e:
+                    logger.debug("rotary_emb compute fallback: %s", e)
+
+            # Check layer signature once to avoid inner-loop TypeError exception overhead
+            if not hasattr(self, "_layer_accepts_pos_emb"):
                 self._layer_accepts_pos_emb = False
+                if self.model_slice.layers and len(self.model_slice.layers) > 0:
+                    import inspect
+                    try:
+                        sig = inspect.signature(self.model_slice.layers[0].forward)
+                        self._layer_accepts_pos_emb = "position_embeddings" in sig.parameters
+                    except Exception:
+                        self._layer_accepts_pos_emb = False
 
-        # Run through each layer with direct kwargs
-        for layer in self.model_slice.layers:
-            kwargs = {
-                "attention_mask": causal_mask,
-                "position_ids": position_ids,
-                "past_key_values": cache,
-                "use_cache": True,
-            }
-            if self._layer_accepts_pos_emb and position_embeddings is not None:
-                kwargs["position_embeddings"] = position_embeddings
-            
-            layer_output = layer(hidden_states, **kwargs)
+            # Run through each layer with direct kwargs
+            for layer in self.model_slice.layers:
+                kwargs = {
+                    "attention_mask": causal_mask,
+                    "position_ids": position_ids,
+                    "past_key_values": cache,
+                    "use_cache": True,
+                }
+                if self._layer_accepts_pos_emb and position_embeddings is not None:
+                    kwargs["position_embeddings"] = position_embeddings
 
-            if isinstance(layer_output, tuple):
-                hidden_states = layer_output[0]
-            else:
-                hidden_states = layer_output
+                layer_output = layer(hidden_states, **kwargs)
+
+                if isinstance(layer_output, tuple):
+                    hidden_states = layer_output[0]
+                else:
+                    hidden_states = layer_output
 
         # If last node and compute_head requested, apply final norm and LM head
         if self.is_last_node and compute_head:
