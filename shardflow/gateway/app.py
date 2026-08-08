@@ -226,25 +226,69 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-    # Non-streaming JSON response
-    from shardflow.orchestrator.orchestrator import PartialGenerationError
+    # Non-streaming JSON response: use high-throughput v2 peer-to-peer data plane
+    session_id = str(uuid.uuid4())
+    stream_receiver = await get_stream_receiver()
+    stream_q = stream_receiver.register_session(session_id)
 
+    completion_text = ""
     finish_reason = "stop"
-    try:
-        completion_text = await _orchestrator.generate(
-            prompt=prompt,
-            max_tokens=req.max_tokens,
-            temperature=req.temperature,
-            top_k=req.top_k,
-            top_p=req.top_p,
-            stream=False,
-        )
-    except PartialGenerationError as e:
-        logger.warning("Returning partial generation text due to node error: %s", e)
-        completion_text = e.partial_text
-        finish_reason = "node_failure"
+    prompt_token_ids = _orchestrator.tokenizer.encode(prompt)
+    eos_id = getattr(_orchestrator.tokenizer, "eos_token_id", None)
 
-    prompt_tokens = len(_orchestrator.tokenizer.encode(prompt))
+    try:
+        import os
+        stream_host = os.getenv("SHARDFLOW_GATEWAY_HOST", "127.0.0.1")
+
+        from shardflow.transport.protocol import TensorMessage, MessageType
+        start_msg = TensorMessage(
+            msg_type=MessageType.START_SESSION,
+            session_id=session_id,
+            prompt_tokens=prompt_token_ids,
+            max_tokens=req.max_tokens or 100,
+            temperature=req.temperature or 0.0,
+            top_k=req.top_k or 0,
+            top_p=req.top_p or 1.0,
+            eos_token_id=eos_id,
+            stream_back_host=stream_host,
+            stream_back_port=stream_receiver.bound_port,
+        )
+        await _orchestrator._node0_client.send(start_msg)
+
+        collected_tokens = []
+        while True:
+            try:
+                token_msg = await asyncio.wait_for(stream_q.get(), timeout=45.0)
+            except asyncio.TimeoutError:
+                break
+
+            if token_msg.is_eos or (token_msg.finish_reason is not None and token_msg.finish_reason != ""):
+                finish_reason = token_msg.finish_reason or "stop"
+                break
+
+            if token_msg.token_id is not None:
+                collected_tokens.append(token_msg.token_id)
+                if len(collected_tokens) >= (req.max_tokens or 100):
+                    break
+
+        completion_text = _orchestrator.tokenizer.decode(collected_tokens)
+    except Exception as e:
+        logger.exception("Error during v2 non-streaming generation, trying orchestrator fallback: %s", e)
+        try:
+            completion_text = await _orchestrator.generate(
+                prompt=prompt,
+                max_tokens=req.max_tokens,
+                temperature=req.temperature,
+                top_k=req.top_k,
+                top_p=req.top_p,
+                stream=False,
+            )
+        except Exception:
+            pass
+    finally:
+        stream_receiver.unregister_session(session_id)
+
+    prompt_tokens = len(prompt_token_ids)
     comp_tokens = len(_orchestrator.tokenizer.encode(completion_text)) if completion_text else 0
 
     return ChatCompletionResponse(

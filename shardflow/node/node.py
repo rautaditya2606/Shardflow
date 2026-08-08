@@ -575,6 +575,8 @@ class PipelineNode:
                     except Exception:
                         self._layer_accepts_pos_emb = False
 
+            cache_position = position_ids.squeeze(0)
+
             # Run through each layer with direct kwargs
             for layer in self.model_slice.layers:
                 kwargs = {
@@ -582,6 +584,7 @@ class PipelineNode:
                     "position_ids": position_ids,
                     "past_key_values": cache,
                     "use_cache": True,
+                    "cache_position": cache_position,
                 }
                 if self._layer_accepts_pos_emb and position_embeddings is not None:
                     kwargs["position_embeddings"] = position_embeddings

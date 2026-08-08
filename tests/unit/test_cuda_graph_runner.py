@@ -60,3 +60,43 @@ def test_cuda_graph_runner_decode_and_verify_capture():
     h_graph = runner.replay_decode(test_input, position=0)
     diff = torch.max(torch.abs(h_eager - h_graph)).item()
     assert diff < 1e-2, f"Eager vs CUDA Graph output discrepancy too high: {diff}"
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available() and MODEL_EXISTS), reason="CUDA and local weights required")
+def test_rope_position_varies_across_tokens():
+    """Verify that RoPE rotary embeddings change output across different token positions."""
+    model_path = "./models/TinyLlama-1.1B-Chat-v1.0"
+    device = torch.device("cuda")
+
+    model_slice = load_layer_slice(model_path, 0, 2, device="cuda")
+    dtype = next(model_slice.layers[0].parameters()).dtype
+    config = model_slice.config
+
+    static_cache = StaticCache(
+        config=config,
+        max_batch_size=1,
+        max_cache_len=128,
+        device=device,
+        dtype=dtype,
+    )
+
+    runner = CUDAGraphRunner(
+        layers=model_slice.layers,
+        hidden_size=config.hidden_size,
+        device=device,
+        dtype=dtype,
+        spec_k=4,
+        rotary_emb=model_slice.rotary_emb,
+        enabled=True,
+    )
+    runner.capture(static_cache)
+
+    test_input = torch.randn((1, 1, config.hidden_size), device=device, dtype=dtype)
+    out0 = runner.replay_decode(test_input.clone(), position=0).clone()
+    out5 = runner.replay_decode(test_input.clone(), position=5).clone()
+    out20 = runner.replay_decode(test_input.clone(), position=20).clone()
+
+    # If RoPE was frozen at position 0, out0 and out5 would be numerically identical
+    assert not torch.equal(out0, out5), "RoPE frozen at position 0 — out0 and out5 are identical!"
+    assert not torch.equal(out5, out20), "RoPE frozen across positions — out5 and out20 are identical!"
+

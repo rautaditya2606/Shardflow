@@ -41,6 +41,7 @@ def main():
     parser.add_argument("--next-host", default=None, help="Explicit next node host (optional)")
     parser.add_argument("--next-port", type=int, default=None, help="Explicit next node port (optional)")
     parser.add_argument("--is-last", action="store_true", help="Explicitly mark as last node (optional)")
+    parser.add_argument("--no-cuda-graphs", action="store_true", help="Disable CUDA Graphs and run in pure eager mode")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -148,6 +149,7 @@ def main():
         next_node_port=next_port,
         listen_host="0.0.0.0",
         listen_port=local_port,
+        enable_cuda_graphs=not args.no_cuda_graphs,
     )
 
     seen_topology_version = topology_version

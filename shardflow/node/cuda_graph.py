@@ -49,13 +49,15 @@ class CUDAGraphRunner:
         self._static_decode_in: Optional[torch.Tensor] = None
         self._static_decode_out: Optional[torch.Tensor] = None
         self._static_decode_pos: Optional[torch.Tensor] = None
-        self._static_decode_pos_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._static_decode_cos: Optional[torch.Tensor] = None
+        self._static_decode_sin: Optional[torch.Tensor] = None
 
         # Static IO Buffers for Verify [1, K, D]
         self._static_verify_in: Optional[torch.Tensor] = None
         self._static_verify_out: Optional[torch.Tensor] = None
         self._static_verify_pos: Optional[torch.Tensor] = None
-        self._static_verify_pos_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._static_verify_cos: Optional[torch.Tensor] = None
+        self._static_verify_sin: Optional[torch.Tensor] = None
 
         # Static Cache dedicated to graph capture
         self._capture_cache: Optional[StaticCache] = None
@@ -82,12 +84,25 @@ class CUDAGraphRunner:
             # 1. Capture Decode Graph [1, 1, D]
             self._static_decode_in = torch.zeros((1, 1, self.hidden_size), device=self.device, dtype=self.dtype)
             self._static_decode_pos = torch.zeros((1, 1), device=self.device, dtype=torch.long)
-            
+
+            if self.rotary_emb is not None:
+                try:
+                    pos_emb = self.rotary_emb(self._static_decode_in, self._static_decode_pos)
+                    if isinstance(pos_emb, (tuple, list)) and len(pos_emb) == 2:
+                        self._static_decode_cos = torch.zeros_like(pos_emb[0])
+                        self._static_decode_sin = torch.zeros_like(pos_emb[1])
+                except Exception as e:
+                    logger.debug("rotary_emb static buffer init exception: %s", e)
+
             # Warmup on side stream
             s = torch.cuda.Stream(device=self.device)
             s.wait_stream(torch.cuda.current_stream(device=self.device))
             with torch.cuda.stream(s):
                 for _ in range(3):
+                    if self._static_decode_cos is not None and self.rotary_emb is not None:
+                        cos, sin = self.rotary_emb(self._static_decode_in, self._static_decode_pos)
+                        self._static_decode_cos.copy_(cos)
+                        self._static_decode_sin.copy_(sin)
                     self._static_decode_out = self._forward_eager(
                         self._static_decode_in,
                         self._static_decode_pos,
@@ -108,8 +123,21 @@ class CUDAGraphRunner:
             self._static_verify_in = torch.zeros((1, self.spec_k, self.hidden_size), device=self.device, dtype=self.dtype)
             self._static_verify_pos = torch.arange(self.spec_k, device=self.device, dtype=torch.long).unsqueeze(0)
 
+            if self.rotary_emb is not None:
+                try:
+                    pos_emb = self.rotary_emb(self._static_verify_in, self._static_verify_pos)
+                    if isinstance(pos_emb, (tuple, list)) and len(pos_emb) == 2:
+                        self._static_verify_cos = torch.zeros_like(pos_emb[0])
+                        self._static_verify_sin = torch.zeros_like(pos_emb[1])
+                except Exception as e:
+                    logger.debug("verify rotary_emb static buffer init exception: %s", e)
+
             with torch.cuda.stream(s):
                 for _ in range(3):
+                    if self._static_verify_cos is not None and self.rotary_emb is not None:
+                        cos, sin = self.rotary_emb(self._static_verify_in, self._static_verify_pos)
+                        self._static_verify_cos.copy_(cos)
+                        self._static_verify_sin.copy_(sin)
                     self._static_verify_out = self._forward_eager(
                         self._static_verify_in,
                         self._static_verify_pos,
@@ -137,23 +165,36 @@ class CUDAGraphRunner:
             return False
 
     def replay_decode(self, hidden_states: torch.Tensor, position: int) -> torch.Tensor:
-        """Replay captured decode graph for [1, 1, D]."""
+        """Replay captured decode graph for [1, 1, D] with dynamic RoPE positioning."""
         if not self.is_captured or self._decode_graph is None:
             raise RuntimeError("Decode graph not captured")
 
         self._static_decode_in.copy_(hidden_states)
         self._static_decode_pos.fill_(position)
+
+        # Update static RoPE cos/sin buffers dynamically before graph replay
+        if self._static_decode_cos is not None and self.rotary_emb is not None:
+            cos, sin = self.rotary_emb(self._static_decode_in, self._static_decode_pos)
+            self._static_decode_cos.copy_(cos)
+            self._static_decode_sin.copy_(sin)
+
         self._decode_graph.replay()
         return self._static_decode_out
 
     def replay_verify(self, hidden_states: torch.Tensor, start_position: int) -> torch.Tensor:
-        """Replay captured verify graph for [1, K, D]."""
+        """Replay captured verify graph for [1, K, D] with dynamic RoPE positioning."""
         if not self.is_captured or self._verify_graph is None:
             raise RuntimeError("Verify graph not captured")
 
         self._static_verify_in.copy_(hidden_states)
         for i in range(self.spec_k):
             self._static_verify_pos[0, i] = start_position + i
+
+        if self._static_verify_cos is not None and self.rotary_emb is not None:
+            cos, sin = self.rotary_emb(self._static_verify_in, self._static_verify_pos)
+            self._static_verify_cos.copy_(cos)
+            self._static_verify_sin.copy_(sin)
+
         self._verify_graph.replay()
         return self._static_verify_out
 
@@ -165,18 +206,28 @@ class CUDAGraphRunner:
     ) -> torch.Tensor:
         """Internal eager forward pass used during graph capture."""
         h = hidden_states
+        seq_len = hidden_states.shape[1]
+
+        # Use the static position embeddings buffers if available
         pos_emb = None
-        if self.rotary_emb is not None:
+        if seq_len == 1 and self._static_decode_cos is not None and self._static_decode_sin is not None:
+            pos_emb = (self._static_decode_cos, self._static_decode_sin)
+        elif seq_len == self.spec_k and self._static_verify_cos is not None and self._static_verify_sin is not None:
+            pos_emb = (self._static_verify_cos, self._static_verify_sin)
+        elif self.rotary_emb is not None:
             try:
                 pos_emb = self.rotary_emb(h, position_ids)
             except Exception:
                 pos_emb = None
+
+        cache_position = position_ids.squeeze(0)
 
         for layer in self.layers:
             kwargs = {
                 "position_ids": position_ids,
                 "past_key_values": cache,
                 "use_cache": True,
+                "cache_position": cache_position,
             }
             if pos_emb is not None:
                 kwargs["position_embeddings"] = pos_emb
