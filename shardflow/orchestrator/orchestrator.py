@@ -237,6 +237,7 @@ class Orchestrator:
                 chunk_end = min(prompt_len, chunk_start + prefill_chunk_size)
                 chunk_input_ids = input_ids[:, chunk_start:chunk_end]
                 hidden_states = self._embed(chunk_input_ids)
+                is_final_chunk = (chunk_end == prompt_len)
 
                 msg = TensorMessage(
                     msg_type=MessageType.ACTIVATION,
@@ -245,7 +246,7 @@ class Orchestrator:
                     temperature=temperature,
                     top_k=top_k,
                     top_p=top_p,
-                    sample_on_node=True,
+                    sample_on_node=is_final_chunk,
                 )
                 response = await self._node0_client.send_recv(msg)
 
@@ -371,10 +372,11 @@ class Orchestrator:
         prompt_len = input_ids.shape[1]
 
         try:
-            # Prefill — chunked to avoid OOM on long prompts
             response = None
             for chunk_start in range(0, prompt_len, 512):
-                chunk = input_ids[:, chunk_start:min(prompt_len, chunk_start + 512)]
+                chunk_end = min(prompt_len, chunk_start + 512)
+                chunk = input_ids[:, chunk_start:chunk_end]
+                is_final_chunk = (chunk_end == prompt_len)
                 msg = TensorMessage(
                     msg_type=MessageType.ACTIVATION,
                     session_id=session_id,
@@ -382,7 +384,7 @@ class Orchestrator:
                     temperature=temperature,
                     top_k=top_k,
                     top_p=top_p,
-                    sample_on_node=True,
+                    sample_on_node=is_final_chunk,
                 )
                 response = await self._node0_client.send_recv(msg)
 

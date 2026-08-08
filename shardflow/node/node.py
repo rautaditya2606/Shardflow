@@ -163,7 +163,11 @@ class PipelineNode:
         else:
             hidden_states = tensor
 
-        output = self._forward(hidden_states, session_id=msg.session_id)
+        output = self._forward(
+            hidden_states,
+            session_id=msg.session_id,
+            compute_head=msg.sample_on_node if self.is_last_node else False,
+        )
 
         if self.is_last_node:
             if msg.sample_on_node:
@@ -181,9 +185,13 @@ class PipelineNode:
                 )
             else:
                 return TensorMessage(
-                    msg_type=MessageType.LOGITS,
+                    msg_type=MessageType.ACTIVATION,
                     session_id=msg.session_id,
                     tensor=output.cpu(),
+                    temperature=msg.temperature,
+                    top_k=msg.top_k,
+                    top_p=msg.top_p,
+                    sample_on_node=False,
                 )
         else:
             if self._next_client is None or not self._next_client.is_connected:
@@ -217,16 +225,22 @@ class PipelineNode:
                 ) from err
 
     @torch.inference_mode()
-    def _forward(self, hidden_states: torch.Tensor, session_id: str) -> torch.Tensor:
+    def _forward(
+        self,
+        hidden_states: torch.Tensor,
+        session_id: str,
+        compute_head: bool = True,
+    ) -> torch.Tensor:
         """
         Run hidden states through this node's layers with KV caching.
 
         Args:
             hidden_states: [batch, seq_len, hidden_dim]
             session_id: unique session ID for KV cache lookup
+            compute_head: if True and last node, apply final norm and LM head
 
         Returns:
-            If last node: logits [batch, seq_len, vocab_size]
+            If last node and compute_head: logits [batch, seq_len, vocab_size]
             Otherwise: hidden_states [batch, seq_len, hidden_dim]
         """
         batch_size, seq_len, _ = hidden_states.shape
@@ -238,22 +252,43 @@ class PipelineNode:
             cache = DynamicCache()
             self.kv_store.put(session_id, cache)
 
-        past_seq_len = cache.get_seq_length()
+        past_seq_len = 0
+        if cache is not None:
+            try:
+                past_seq_len = cache.get_seq_length(self.model_slice.layer_start)
+            except (TypeError, IndexError, KeyError):
+                try:
+                    past_seq_len = cache.get_seq_length()
+                except Exception:
+                    past_seq_len = 0
+        if past_seq_len is None:
+            past_seq_len = 0
+
         position_ids = torch.arange(past_seq_len, past_seq_len + seq_len, device=device).unsqueeze(0)
 
-        # Causal attention mask: only needed when input seq_len > 1 (e.g. prefill)
+        # Causal attention mask: prefix with past KV keys when seq_len > 1
         causal_mask = None
         if seq_len > 1:
-            causal_mask = torch.triu(
+            causal_mask = torch.full(
+                (seq_len, past_seq_len + seq_len),
+                0.0,
+                device=device,
+                dtype=hidden_states.dtype,
+            )
+            current_chunk_mask = torch.triu(
                 torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=hidden_states.dtype),
                 diagonal=1,
             )
+            causal_mask[:, past_seq_len:] = current_chunk_mask
             causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
 
         # Compute rotary position embeddings
         position_embeddings = None
         if self.model_slice.rotary_emb is not None:
-            position_embeddings = self.model_slice.rotary_emb(hidden_states, position_ids)
+            try:
+                position_embeddings = self.model_slice.rotary_emb(hidden_states, position_ids)
+            except Exception as e:
+                logger.debug("rotary_emb compute fallback: %s", e)
 
         # Run through each layer
         for layer in self.model_slice.layers:
@@ -276,8 +311,8 @@ class PipelineNode:
             else:
                 hidden_states = layer_output
 
-        # If last node, apply final norm and LM head
-        if self.is_last_node:
+        # If last node and compute_head requested, apply final norm and LM head
+        if self.is_last_node and compute_head:
             if self.model_slice.norm is not None:
                 hidden_states = self.model_slice.norm(hidden_states)
             if self.model_slice.lm_head is not None:

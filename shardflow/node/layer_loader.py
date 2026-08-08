@@ -148,7 +148,10 @@ class ModelSlice:
         if self.embed_tokens is not None:
             self.embed_tokens = self.embed_tokens.to(device)
         if self.rotary_emb is not None:
-            self.rotary_emb = self.rotary_emb.to(device)
+            try:
+                self.rotary_emb = self.rotary_emb.to(device)
+            except Exception as e:
+                logger.debug("Could not move rotary_emb to %s: %s", device, e)
         return self
 
 
@@ -243,8 +246,21 @@ def load_layer_slice(
             logger.info("Extracted embedding layer")
 
         rotary_emb = None
-        if hasattr(model.model, "rotary_emb"):
-            rotary_emb = model.model.rotary_emb
+        if hasattr(model.model, "rotary_emb") and model.model.rotary_emb is not None:
+            try:
+                rotary_cls = type(model.model.rotary_emb)
+                rotary_emb = rotary_cls(config).to(device)
+            except Exception:
+                try:
+                    rotary_emb = model.model.rotary_emb.to_empty(device=device)
+                except Exception:
+                    rotary_emb = None
+        elif hasattr(model, "rotary_emb") and model.rotary_emb is not None:
+            try:
+                rotary_cls = type(model.rotary_emb)
+                rotary_emb = rotary_cls(config).to(device)
+            except Exception:
+                rotary_emb = None
 
         # Collect the exact safetensors keys we need from the allocated modules.
         # This is model-agnostic: we ask the module itself what its parameters are.
