@@ -35,9 +35,9 @@ app.include_router(router)
 from shardflow.partition.engine import AutoPartitionEngine, NodeVRAMInfo
 
 EXPECTED_NODES = int(os.getenv("SHARDFLOW_EXPECTED_NODES", "2"))
-REGISTRATION_TIMEOUT = float(os.getenv("SHARDFLOW_REGISTRATION_TIMEOUT", "60.0"))
-HEARTBEAT_TIMEOUT = float(os.getenv("SHARDFLOW_HEARTBEAT_TIMEOUT", "90.0"))
-HEARTBEAT_GRACE = float(os.getenv("SHARDFLOW_HEARTBEAT_GRACE", "60.0"))
+REGISTRATION_TIMEOUT = float(os.getenv("SHARDFLOW_REGISTRATION_TIMEOUT", "120.0"))
+HEARTBEAT_TIMEOUT = float(os.getenv("SHARDFLOW_HEARTBEAT_TIMEOUT", "180.0"))
+HEARTBEAT_GRACE = float(os.getenv("SHARDFLOW_HEARTBEAT_GRACE", "120.0"))
 
 # Offline model metadata — avoids HuggingFace Hub calls during /register
 KNOWN_MODEL_LAYERS: Dict[str, int] = {

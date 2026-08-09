@@ -93,6 +93,52 @@ def main():
                 raise
             time.sleep(2)
 
+    import threading
+
+    # Shared state for background heartbeat and dynamic topology updates
+    current_node = None
+    seen_topology_version = 0
+
+    def background_heartbeat_worker():
+        """
+        Runs continuously in a daemon thread from the moment of registration.
+        Sends regular heartbeats to keep the node active in the registry even while
+        downloading large model weights, and updates next_node routing dynamically.
+        """
+        nonlocal seen_topology_version
+        hb_url = f"{args.registry_url.rstrip('/')}/heartbeat"
+        hb_payload = {"node_id": node_id}
+        while True:
+            time.sleep(5.0)
+            try:
+                hb_resp = requests.post(hb_url, json=hb_payload, timeout=5.0)
+                if hb_resp.status_code == 200:
+                    data = hb_resp.json()
+                    topo_v = data.get("topology_version", 0)
+                    if data.get("cluster_ready") and topo_v != seen_topology_version:
+                        logger.info("Topology version changed v%d -> v%d", seen_topology_version, topo_v)
+                        seen_topology_version = topo_v
+                    if data.get("cluster_ready") and current_node is not None:
+                        # Schedule routing update on running event loop if node is active
+                        nxt_h = data.get("next_node_host")
+                        nxt_p = data.get("next_node_port")
+                        if nxt_h != current_node.next_node_host or nxt_p != current_node.next_node_port:
+                            asyncio.run_coroutine_threadsafe(
+                                current_node.update_next_node(nxt_h, nxt_p),
+                                current_node_loop,
+                            )
+                elif hb_resp.status_code == 404:
+                    logger.warning("Registry lost node %s — re-registering...", node_id)
+                    re_resp = requests.post(reg_url, json=reg_payload, timeout=10.0)
+                    if re_resp.status_code in (200, 201):
+                        logger.info("Re-registration successful")
+            except Exception as e:
+                logger.debug("Background heartbeat ping error: %s", e)
+
+    hb_thread = threading.Thread(target=background_heartbeat_worker, daemon=True)
+    hb_thread.start()
+    logger.info("Persistent background heartbeat thread started (5s ping interval)")
+
     if args.layer_start is not None and args.layer_end is not None and (args.is_last or args.next_host is not None):
         assignment = {
             "layer_start": args.layer_start,
@@ -115,6 +161,7 @@ def main():
     next_host = assignment.get("next_node_host")
     next_port = assignment.get("next_node_port")
     topology_version = assignment.get("topology_version", 0)
+    seen_topology_version = topology_version
 
     logger.info(
         "Cluster ready (topology v%d)! Assigned layers [%d, %d)%s (is_first=%s, is_last=%s)",
@@ -151,50 +198,15 @@ def main():
         listen_port=local_port,
         enable_cuda_graphs=not args.no_cuda_graphs,
     )
-
-    seen_topology_version = topology_version
-
-    async def heartbeat_loop():
-        """
-        Keep node alive and apply routing updates when topology_version changes.
-        Re-register automatically if Render restarts and loses in-memory state.
-        """
-        nonlocal seen_topology_version
-        hb_url = f"{args.registry_url.rstrip('/')}/heartbeat"
-        hb_payload = {"node_id": node_id}
-        while True:
-            await asyncio.sleep(10.0)
-            try:
-                hb_resp = await asyncio.to_thread(
-                    requests.post, hb_url, json=hb_payload, timeout=5.0
-                )
-                if hb_resp.status_code == 200:
-                    data = hb_resp.json()
-                    topo_v = data.get("topology_version", 0)
-                    if data.get("cluster_ready") and topo_v != seen_topology_version:
-                        logger.info("Topology changed v%d -> v%d, updating routing...", seen_topology_version, topo_v)
-                        seen_topology_version = topo_v
-                    if data.get("cluster_ready"):
-                        await node.update_next_node(data.get("next_node_host"), data.get("next_node_port"))
-                elif hb_resp.status_code == 404:
-                    logger.warning("Registry lost node %s — re-registering...", node_id)
-                    re_resp = await asyncio.to_thread(
-                        requests.post, reg_url, json=reg_payload, timeout=10.0
-                    )
-                    if re_resp.status_code in (200, 201):
-                        data = re_resp.json()
-                        seen_topology_version = data.get("topology_version", seen_topology_version)
-                        if data.get("cluster_ready"):
-                            await node.update_next_node(data.get("next_node_host"), data.get("next_node_port"))
-                        logger.info("Re-registration successful")
-            except Exception as e:
-                logger.debug("Heartbeat ping error: %s", e)
+    current_node = node
+    current_node_loop = None
 
     async def run_node():
-        asyncio.create_task(heartbeat_loop())
+        nonlocal current_node_loop
+        current_node_loop = asyncio.get_running_loop()
         await node.serve_forever()
 
-    logger.info("Pipeline node running with background heartbeat & auto-reregistration...")
+    logger.info("Pipeline node ready — starting server on 0.0.0.0:%d ...", local_port)
     asyncio.run(run_node())
 
 
