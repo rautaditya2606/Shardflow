@@ -18,20 +18,32 @@ logger = logging.getLogger(__name__)
 
 
 def install_cloudflared() -> str:
-    """Ensure cloudflared binary is installed and executable."""
+    """Ensure cloudflared binary is installed and executable (race-condition safe)."""
     bin_path = shutil.which("cloudflared")
     if bin_path:
         return bin_path
 
     target = "/tmp/cloudflared"
-    if os.path.exists(target) and os.access(target, os.X_OK):
+    if os.path.exists(target) and os.access(target, os.X_OK) and os.path.getsize(target) > 0:
         return target
 
-    logger.info("Downloading cloudflared binary...")
-    url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-    subprocess.run(["curl", "-L", "-o", target, url], check=True)
-    subprocess.run(["chmod", "+x", target], check=True)
-    return target
+    import fcntl
+    lock_path = "/tmp/cloudflared_install.lock"
+    with open(lock_path, "w") as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        try:
+            if os.path.exists(target) and os.access(target, os.X_OK) and os.path.getsize(target) > 0:
+                return target
+
+            logger.info("Downloading cloudflared binary...")
+            url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+            tmp_target = f"/tmp/cloudflared_{os.getpid()}"
+            subprocess.run(["curl", "-sL", "-o", tmp_target, url], check=True)
+            subprocess.run(["chmod", "+x", tmp_target], check=True)
+            os.replace(tmp_target, target)
+            return target
+        finally:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
 
 def start_cloudflare_tcp_tunnel(local_port: int) -> Tuple[subprocess.Popen, str, int]:
@@ -74,22 +86,42 @@ def start_cloudflare_tcp_tunnel(local_port: int) -> Tuple[subprocess.Popen, str,
 
 
 def install_bore() -> str:
-    """Ensure bore binary is installed and executable."""
+    """Ensure bore binary is installed and executable (race-condition safe for multi-GPU runners)."""
     bin_path = shutil.which("bore")
     if bin_path:
         return bin_path
 
     target = "/tmp/bore"
-    if os.path.exists(target):
+    if os.path.exists(target) and os.access(target, os.X_OK) and os.path.getsize(target) > 0:
         return target
 
-    logger.info("Downloading bore binary...")
-    url = "https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-unknown-linux-musl.tar.gz"
-    tar_path = "/tmp/bore.tar.gz"
-    subprocess.run(["curl", "-sL", "-o", tar_path, url], check=True)
-    subprocess.run(["tar", "-xzf", tar_path, "-C", "/tmp"], check=True)
-    subprocess.run(["chmod", "+x", target], check=True)
-    return target
+    import fcntl
+    lock_path = "/tmp/bore_install.lock"
+    with open(lock_path, "w") as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        try:
+            if os.path.exists(target) and os.access(target, os.X_OK) and os.path.getsize(target) > 0:
+                return target
+
+            logger.info("Downloading bore binary...")
+            url = "https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-unknown-linux-musl.tar.gz"
+            tar_path = f"/tmp/bore_{os.getpid()}.tar.gz"
+            tmp_dir = f"/tmp/bore_extract_{os.getpid()}"
+            os.makedirs(tmp_dir, exist_ok=True)
+            subprocess.run(["curl", "-sL", "-o", tar_path, url], check=True)
+            subprocess.run(["tar", "-xzf", tar_path, "-C", tmp_dir], check=True)
+            extracted_bin = os.path.join(tmp_dir, "bore")
+            subprocess.run(["chmod", "+x", extracted_bin], check=True)
+            os.replace(extracted_bin, target)
+            subprocess.run(["chmod", "+x", target], check=True)
+            try:
+                os.remove(tar_path)
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+            return target
+        finally:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
 
 def start_bore_tunnel(local_port: int, server: str = "bore.pub", remote_port: Optional[int] = None) -> Tuple[subprocess.Popen, str, int]:
