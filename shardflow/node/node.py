@@ -184,6 +184,10 @@ class PipelineNode:
 
     async def _get_stream_client(self, host: str, port: int) -> Optional[NodeClient]:
         """Get or create a cached stream-back client to the Gateway."""
+        # Fast guard: if stream_host is 127.0.0.1/localhost and this worker node is on a remote host, do not connect locally
+        if host in ("127.0.0.1", "localhost", "0.0.0.0"):
+            return None
+
         key = (host, port)
         client = self._stream_clients.get(key)
         if client is not None and client.is_connected:
@@ -191,7 +195,7 @@ class PipelineNode:
 
         try:
             client = NodeClient(host, port, send_timeout=5.0, recv_timeout=10.0)
-            await client.connect(max_retries=3, retry_delay=0.5)
+            await client.connect(max_retries=2, retry_delay=0.2)
             self._stream_clients[key] = client
             return client
         except Exception as e:
