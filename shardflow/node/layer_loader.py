@@ -3,10 +3,12 @@ Partial model loading — load only a contiguous slice of transformer layers.
 
 Given a model path and a layer range [start, end), loads:
 - Only the specified transformer layers
-- Optionally the embedding layer (for orchestrator)
+- Optionally the embedding layer (for orchestrator / Node 0)
 - Optionally the LM head + final norm (for final node)
 
-Uses safetensors for direct weight loading without instantiating the full model.
+Supports:
+1. Targeted safetensors shard loading without instantiating full model
+2. In-place 4-bit (bitsandbytes NF4) meta-device quantization for 70B/72B scale models
 """
 
 import gc
@@ -15,13 +17,177 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Set, Any
 
 import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 logger = logging.getLogger(__name__)
+
+
+def _replace_linear_with_4bit_meta(
+    module: nn.Module,
+    compute_dtype: torch.dtype = torch.float16,
+    quant_type: str = "nf4",
+    use_double_quant: bool = True,
+) -> nn.Module:
+    """
+    Recursively replaces all nn.Linear modules with bnb.nn.Linear4bit on the 'meta' device.
+    Zero real memory is allocated during this conversion.
+    """
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        raise ImportError("bitsandbytes required for 4-bit loading. Run `pip install bitsandbytes`.")
+
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear):
+            has_bias = child.bias is not None
+
+            qlinear = bnb.nn.Linear4bit(
+                input_features=child.in_features,
+                output_features=child.out_features,
+                bias=has_bias,
+                compute_dtype=compute_dtype,
+                compress_statistics=use_double_quant,
+                quant_type=quant_type,
+                device="meta",
+            )
+            qlinear.weight = bnb.nn.Params4bit(
+                data=torch.empty(child.out_features, child.in_features, device="meta"),
+                requires_grad=False,
+                quant_type=quant_type,
+            )
+            if has_bias:
+                qlinear.bias = nn.Parameter(
+                    torch.empty(child.out_features, device="meta"),
+                    requires_grad=False,
+                )
+            setattr(module, name, qlinear)
+        else:
+            _replace_linear_with_4bit_meta(
+                child,
+                compute_dtype=compute_dtype,
+                quant_type=quant_type,
+                use_double_quant=use_double_quant,
+            )
+    return module
+
+
+def _load_state_dict_into_4bit_slice(
+    extracted_layers: nn.ModuleList,
+    state_dict: Dict[str, torch.Tensor],
+    layer_start: int,
+    layer_end: int,
+    device: torch.device,
+    compute_dtype: torch.dtype = torch.float16,
+    quant_type: str = "nf4",
+    use_double_quant: bool = True,
+    norm: Optional[nn.Module] = None,
+    lm_head: Optional[nn.Module] = None,
+    embed_tokens: Optional[nn.Module] = None,
+) -> None:
+    """
+    Quantizes and loads FP16/BF16 state_dict tensors directly into 4-bit module slice in-place.
+    Peak memory per tensor is strictly bounded to a single weight matrix.
+    """
+    try:
+        import bitsandbytes as bnb
+        import bitsandbytes.functional as bnb_F
+    except ImportError:
+        raise ImportError("bitsandbytes required for 4-bit loading.")
+
+    for key, tensor in list(state_dict.items()):
+        # Transformer layers
+        if key.startswith("model.layers."):
+            parts = key.split(".")
+            orig_idx = int(parts[2])
+            if orig_idx < layer_start or orig_idx >= layer_end:
+                continue
+
+            local_idx = orig_idx - layer_start
+            layer = extracted_layers[local_idx]
+            subpath = ".".join(parts[3:])
+
+            submod = layer
+            path_parts = subpath.split(".")
+            for part in path_parts[:-1]:
+                submod = getattr(submod, part)
+            param_name = path_parts[-1]
+
+            if isinstance(submod, bnb.nn.Linear4bit) and param_name == "weight":
+                raw_weight = tensor.to(device=device, dtype=compute_dtype, non_blocking=True)
+                q_weight, q_state = bnb_F.quantize_4bit(
+                    raw_weight,
+                    quant_type=quant_type,
+                    blocksize=64,
+                    compress_statistics=use_double_quant,
+                )
+                param = bnb.nn.Params4bit(
+                    data=q_weight,
+                    requires_grad=False,
+                    quant_type=quant_type,
+                )
+                param.quant_state = q_state
+                setattr(submod, "weight", param)
+                del raw_weight
+
+            elif isinstance(submod, bnb.nn.Linear4bit) and param_name == "bias":
+                bias_param = nn.Parameter(
+                    tensor.to(device=device, dtype=compute_dtype),
+                    requires_grad=False,
+                )
+                setattr(submod, "bias", bias_param)
+
+            else:
+                norm_param = nn.Parameter(
+                    tensor.to(device=device, dtype=compute_dtype),
+                    requires_grad=False,
+                )
+                setattr(submod, param_name, norm_param)
+
+        # Final RMSNorm
+        elif key.startswith("model.norm.") and norm is not None:
+            norm.weight = nn.Parameter(
+                tensor.to(device=device, dtype=compute_dtype),
+                requires_grad=False,
+            )
+
+        # LM Head
+        elif key.startswith("lm_head.") and lm_head is not None:
+            if isinstance(lm_head, bnb.nn.Linear4bit):
+                raw_weight = tensor.to(device=device, dtype=compute_dtype, non_blocking=True)
+                q_weight, q_state = bnb_F.quantize_4bit(
+                    raw_weight,
+                    quant_type=quant_type,
+                    blocksize=64,
+                    compress_statistics=use_double_quant,
+                )
+                param = bnb.nn.Params4bit(
+                    data=q_weight,
+                    requires_grad=False,
+                    quant_type=quant_type,
+                )
+                param.quant_state = q_state
+                lm_head.weight = param
+                del raw_weight
+            else:
+                lm_head.weight = nn.Parameter(
+                    tensor.to(device=device, dtype=compute_dtype),
+                    requires_grad=False,
+                )
+
+        # Token Embedding
+        elif key.startswith("model.embed_tokens.") and embed_tokens is not None:
+            embed_tokens.weight = nn.Parameter(
+                tensor.to(device=device, dtype=compute_dtype),
+                requires_grad=False,
+            )
+
+    gc.collect()
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _resolve_local_dir(model_path: str) -> Optional[Path]:
@@ -36,88 +202,28 @@ def _resolve_local_dir(model_path: str) -> Optional[Path]:
         return None
 
 
-def _load_weights_from_safetensors(
-    model_path: str,
-    target_keys: Set[str],
-    target_dtype: torch.dtype,
-) -> Optional[Dict[str, torch.Tensor]]:
+def _get_safetensors_shards_map(model_path: str) -> tuple[Optional[Dict[str, str]], Optional[Path]]:
     """
-    Load only the weights in target_keys from safetensors files.
-
-    Downloads ONLY the specific safetensors shard files containing target_keys,
-    eliminating full-model downloads and 14 GB RAM spikes.
-
-    Returns a state_dict (key → tensor) or None if safetensors unavailable.
+    Resolve safetensors weight_map and base directory if available.
+    Returns (weight_map, local_dir_path).
     """
-    try:
-        from safetensors.torch import load_file
-    except ImportError:
-        return None
-
-    # Check local directory first
     if os.path.isdir(model_path):
         local_dir = Path(model_path)
         index_path = local_dir / "model.safetensors.index.json"
-        single_path = local_dir / "model.safetensors"
-
         if index_path.exists():
             with open(index_path) as f:
-                weight_map: Dict[str, str] = json.load(f)["weight_map"]
-            needed_shards = {weight_map[k] for k in target_keys if k in weight_map}
-            if not needed_shards:
-                logger.warning("No safetensors shards matched target keys in local index")
-                return None
-            state_dict: Dict[str, torch.Tensor] = {}
-            for shard in sorted(needed_shards):
-                logger.info("Loading local shard %s ...", shard)
-                data = load_file(local_dir / shard, device="cpu")
-                state_dict.update({k: v.to(target_dtype) for k, v in data.items() if k in target_keys})
-            return state_dict
-
+                return json.load(f)["weight_map"], local_dir
+        single_path = local_dir / "model.safetensors"
         if single_path.exists():
-            logger.info("Loading single local safetensors file...")
-            data = load_file(single_path, device="cpu")
-            return {k: v.to(target_dtype) for k, v in data.items() if k in target_keys}
+            return None, local_dir
 
-    # Remote HuggingFace Hub loading — download ONLY required index & shards
     try:
         from huggingface_hub import hf_hub_download
-    except ImportError:
-        return None
-
-    # 1. Try downloading index file
-    try:
-        logger.info("Fetching model.safetensors.index.json for targeted shard mapping (%s)...", model_path)
         index_file = hf_hub_download(repo_id=model_path, filename="model.safetensors.index.json")
         with open(index_file) as f:
-            weight_map = json.load(f)["weight_map"]
-        needed_shards = {weight_map[k] for k in target_keys if k in weight_map}
-        if not needed_shards:
-            logger.warning("No safetensors shards matched target keys in remote index")
-            return None
-
-        state_dict = {}
-        for shard_filename in sorted(needed_shards):
-            logger.info("Downloading targeted shard %s from HuggingFace Hub...", shard_filename)
-            shard_path = hf_hub_download(repo_id=model_path, filename=shard_filename)
-            logger.info("Loading shard %s ...", shard_filename)
-            data = load_file(shard_path, device="cpu")
-            state_dict.update({k: v.to(target_dtype) for k, v in data.items() if k in target_keys})
-        return state_dict
-    except Exception as e:
-        logger.debug("Failed to load via remote index file: %s", e)
-
-    # 2. Try single safetensors file
-    try:
-        logger.info("Attempting single model.safetensors download from HuggingFace Hub (%s)...", model_path)
-        single_path = hf_hub_download(repo_id=model_path, filename="model.safetensors")
-        data = load_file(single_path, device="cpu")
-        return {k: v.to(target_dtype) for k, v in data.items() if k in target_keys}
-    except Exception as e:
-        logger.warning("Failed single safetensors download: %s", e)
-
-    return None
-
+            return json.load(f)["weight_map"], None
+    except Exception:
+        return None, None
 
 
 @dataclass
@@ -170,32 +276,26 @@ def load_layer_slice(
     """
     Load a contiguous slice of transformer layers from a model.
 
-    Strategy:
-    1. Load the full model to CPU with low memory footprint
-    2. Extract the needed layers
-    3. Delete the rest and free memory
-    4. Move the slice to the target device
-
     Args:
         model_path: local path or HF model ID
         layer_start: first layer index (inclusive)
         layer_end: last layer index (exclusive)
         include_norm: if True, include the final RMSNorm (for final node)
         include_lm_head: if True, include the LM head (for final node)
-        include_embed: if True, include the token embedding (for orchestrator)
+        include_embed: if True, include the token embedding (for orchestrator/Node 0)
         dtype: cast weights to this dtype (default: model's native dtype)
         device: target device for the slice
+        load_in_4bit: if True, quantize linear layers in-place to NF4 via bitsandbytes
 
     Returns:
         ModelSlice with the requested components
     """
     logger.info(
-        "Loading layers [%d, %d) from %s (norm=%s, lm_head=%s, embed=%s)",
+        "Loading layers [%d, %d) from %s (norm=%s, lm_head=%s, embed=%s, 4bit=%s)",
         layer_start, layer_end, model_path,
-        include_norm, include_lm_head, include_embed,
+        include_norm, include_lm_head, include_embed, load_in_4bit,
     )
 
-    # Load config to get layer count
     config = AutoConfig.from_pretrained(model_path)
     total_layers = config.num_hidden_layers
 
@@ -213,145 +313,200 @@ def load_layer_slice(
     if isinstance(target_dtype, str):
         target_dtype = getattr(torch, target_dtype)
 
-    # Fast path: Zero-RAM meta device shell instantiation
+    target_device = torch.device(device)
+
     try:
         from accelerate import init_empty_weights
         has_accelerate = True
     except ImportError:
         has_accelerate = False
 
-    if has_accelerate:
-        logger.info("Initializing meta device model shell (0 MB RAM footprint)...")
-        with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(config, dtype=target_dtype)
-        
-        # Extract requested layers and allocate memory ONLY for the slice
-        extracted_layers = nn.ModuleList([
-            model.model.layers[i] for i in range(layer_start, layer_end)
-        ]).to_empty(device=device)
+    if not has_accelerate:
+        raise RuntimeError("The 'accelerate' package is required for zero-RAM layer slicing. Run `pip install accelerate`.")
 
-        norm = None
-        if include_norm:
-            norm = model.model.norm.to_empty(device=device)
-            logger.info("Extracted final norm layer")
+    # 1. Instantiate meta shell (0 MB RAM footprint)
+    logger.info("Initializing meta device model shell (0 MB RAM footprint)...")
+    with init_empty_weights():
+        model = AutoModelForCausalLM.from_config(config, dtype=target_dtype)
 
-        lm_head = None
-        if include_lm_head:
-            lm_head = model.lm_head.to_empty(device=device)
-            logger.info("Extracted LM head")
+    # 2. Extract requested layers on meta device
+    extracted_layers = nn.ModuleList([
+        model.model.layers[i] for i in range(layer_start, layer_end)
+    ])
+    norm = model.model.norm if include_norm else None
+    lm_head = model.lm_head if include_lm_head else None
+    embed_tokens = model.model.embed_tokens if include_embed else None
 
-        embed_tokens = None
-        if include_embed:
-            embed_tokens = model.model.embed_tokens.to_empty(device=device)
-            logger.info("Extracted embedding layer")
+    rotary_emb = None
+    if hasattr(model.model, "rotary_emb") and model.model.rotary_emb is not None:
+        try:
+            rotary_cls = type(model.model.rotary_emb)
+            rotary_emb = rotary_cls(config).to(target_device)
+        except Exception:
+            rotary_emb = None
+    elif hasattr(model, "rotary_emb") and model.rotary_emb is not None:
+        try:
+            rotary_cls = type(model.rotary_emb)
+            rotary_emb = rotary_cls(config).to(target_device)
+        except Exception:
+            rotary_emb = None
 
-        rotary_emb = None
-        if hasattr(model.model, "rotary_emb") and model.model.rotary_emb is not None:
-            try:
-                rotary_cls = type(model.model.rotary_emb)
-                rotary_emb = rotary_cls(config).to(device)
-            except Exception:
-                try:
-                    rotary_emb = model.model.rotary_emb.to_empty(device=device)
-                except Exception:
-                    rotary_emb = None
-        elif hasattr(model, "rotary_emb") and model.rotary_emb is not None:
-            try:
-                rotary_cls = type(model.rotary_emb)
-                rotary_emb = rotary_cls(config).to(device)
-            except Exception:
-                rotary_emb = None
-
-        # Collect the exact safetensors keys we need from the allocated modules.
-        # This is model-agnostic: we ask the module itself what its parameters are.
-        target_keys: Set[str] = set()
-        for idx, orig_idx in enumerate(range(layer_start, layer_end)):
-            prefix = f"model.layers.{orig_idx}"
-            for param_name in dict(extracted_layers[idx].named_parameters()).keys():
-                target_keys.add(f"{prefix}.{param_name}")
-        if norm is not None:
-            for param_name in dict(norm.named_parameters()).keys():
-                target_keys.add(f"model.norm.{param_name}")
+    # 3. Handle 4-Bit In-Place Quantization vs FP16/BF16 Allocation
+    if load_in_4bit:
+        logger.info("Converting Linear layers to bnb.nn.Linear4bit on meta device (0 RAM)...")
+        for layer in extracted_layers:
+            _replace_linear_with_4bit_meta(layer, compute_dtype=target_dtype)
         if lm_head is not None:
-            for param_name in dict(lm_head.named_parameters()).keys():
-                target_keys.add(f"lm_head.{param_name}")
+            _replace_linear_with_4bit_meta(lm_head, compute_dtype=target_dtype)
+
+        # Allocate non-quantized 1D modules on target device
+        if norm is not None:
+            norm = norm.to_empty(device=target_device)
         if embed_tokens is not None:
-            for param_name in dict(embed_tokens.named_parameters()).keys():
-                target_keys.add(f"model.embed_tokens.{param_name}")
+            embed_tokens = embed_tokens.to_empty(device=target_device)
 
-        logger.info(
-            "Need %d weight tensors for layers [%d, %d)",
-            len(target_keys), layer_start, layer_end,
-        )
-
-        # Try targeted safetensors load first (only loads slice shards)
-        state_dict = _load_weights_from_safetensors(model_path, target_keys, target_dtype)
-
-        if state_dict is not None:
-            # Apply directly into the already-allocated tensors
-            for idx, orig_idx in enumerate(range(layer_start, layer_end)):
-                prefix = f"model.layers.{orig_idx}"
-                layer_sd = {
-                    k[len(prefix) + 1:]: v
-                    for k, v in state_dict.items()
-                    if k.startswith(prefix + ".")
-                }
-                extracted_layers[idx].load_state_dict(layer_sd)
-            if norm is not None:
-                norm_sd = {k[len("model.norm."):]: v for k, v in state_dict.items() if k.startswith("model.norm.")}
-                norm.load_state_dict(norm_sd)
-            if lm_head is not None:
-                head_sd = {k[len("lm_head."):]: v for k, v in state_dict.items() if k.startswith("lm_head.")}
-                lm_head.load_state_dict(head_sd)
-            if embed_tokens is not None:
-                embed_sd = {k[len("model.embed_tokens."):]: v for k, v in state_dict.items() if k.startswith("model.embed_tokens.")}
-                embed_tokens.load_state_dict(embed_sd)
-            del state_dict
-        else:
-            # Fallback: load full model to CPU and copy slice weights
-            logger.warning(
-                "Targeted safetensors load unavailable — loading full model to CPU (higher RAM usage)"
-            )
-            full_model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                torch_dtype=target_dtype,
-                device_map="cpu",
-                low_cpu_mem_usage=True,
-            )
-            for idx, orig_idx in enumerate(range(layer_start, layer_end)):
-                extracted_layers[idx].load_state_dict(full_model.model.layers[orig_idx].state_dict())
-            if norm is not None:
-                norm.load_state_dict(full_model.model.norm.state_dict())
-            if lm_head is not None:
-                lm_head.load_state_dict(full_model.lm_head.state_dict())
-            if embed_tokens is not None:
-                embed_tokens.load_state_dict(full_model.model.embed_tokens.state_dict())
-            del full_model
-
-        del model
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
     else:
-        logger.info("Loading full model to CPU...")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=target_dtype,
-            device_map="cpu",
-            low_cpu_mem_usage=True,
-        )
-        extracted_layers = nn.ModuleList([
-            model.model.layers[i] for i in range(layer_start, layer_end)
-        ])
-        norm = model.model.norm if include_norm else None
-        lm_head = model.lm_head if include_lm_head else None
-        embed_tokens = model.model.embed_tokens if include_embed else None
-        rotary_emb = getattr(model.model, "rotary_emb", None)
-        del model
-        gc.collect()
+        # FP16 / BF16 unquantized path
+        extracted_layers = extracted_layers.to_empty(device=target_device)
+        if norm is not None:
+            norm = norm.to_empty(device=target_device)
+        if lm_head is not None:
+            lm_head = lm_head.to_empty(device=target_device)
+        if embed_tokens is not None:
+            embed_tokens = embed_tokens.to_empty(device=target_device)
 
-    # Build the slice
-    model_slice = ModelSlice(
+    # 4. Resolve targeted safetensors shards
+    from safetensors.torch import load_file
+
+    weight_map, local_dir = _get_safetensors_shards_map(model_path)
+    target_prefixes = [f"model.layers.{i}." for i in range(layer_start, layer_end)]
+    if include_norm:
+        target_prefixes.append("model.norm.")
+    if include_lm_head:
+        target_prefixes.append("lm_head.")
+    if include_embed:
+        target_prefixes.append("model.embed_tokens.")
+
+    if weight_map is not None:
+        needed_shards = sorted({
+            shard for key, shard in weight_map.items()
+            if any(key.startswith(p) for p in target_prefixes)
+        })
+        logger.info("Matched %d targeted safetensors shards: %s", len(needed_shards), needed_shards)
+
+        for shard_name in needed_shards:
+            if local_dir is not None:
+                shard_path = local_dir / shard_name
+            else:
+                from huggingface_hub import hf_hub_download
+                logger.info("Downloading targeted shard %s from HuggingFace Hub...", shard_name)
+                shard_path = hf_hub_download(repo_id=model_path, filename=shard_name)
+
+            logger.info("Loading and dispatching shard %s ...", shard_name)
+            state_dict = load_file(shard_path, device="cpu")
+
+            if load_in_4bit:
+                _load_state_dict_into_4bit_slice(
+                    extracted_layers=extracted_layers,
+                    state_dict=state_dict,
+                    layer_start=layer_start,
+                    layer_end=layer_end,
+                    device=target_device,
+                    compute_dtype=target_dtype,
+                    norm=norm,
+                    lm_head=lm_head,
+                    embed_tokens=embed_tokens,
+                )
+            else:
+                # Apply FP16/BF16 weights to slice
+                for idx, orig_idx in enumerate(range(layer_start, layer_end)):
+                    prefix = f"model.layers.{orig_idx}."
+                    layer_sd = {
+                        k[len(prefix):]: v.to(target_device, dtype=target_dtype)
+                        for k, v in state_dict.items()
+                        if k.startswith(prefix)
+                    }
+                    if layer_sd:
+                        extracted_layers[idx].load_state_dict(layer_sd, strict=False)
+
+                if norm is not None:
+                    norm_sd = {
+                        k[len("model.norm."):]: v.to(target_device, dtype=target_dtype)
+                        for k, v in state_dict.items() if k.startswith("model.norm.")
+                    }
+                    if norm_sd:
+                        norm.load_state_dict(norm_sd, strict=False)
+
+                if lm_head is not None:
+                    head_sd = {
+                        k[len("lm_head."):]: v.to(target_device, dtype=target_dtype)
+                        for k, v in state_dict.items() if k.startswith("lm_head.")
+                    }
+                    if head_sd:
+                        lm_head.load_state_dict(head_sd, strict=False)
+
+                if embed_tokens is not None:
+                    embed_sd = {
+                        k[len("model.embed_tokens."):]: v.to(target_device, dtype=target_dtype)
+                        for k, v in state_dict.items() if k.startswith("model.embed_tokens.")
+                    }
+                    if embed_sd:
+                        embed_tokens.load_state_dict(embed_sd, strict=False)
+
+            del state_dict
+            gc.collect()
+
+    else:
+        # Single safetensors file or local directory
+        single_path = None
+        if local_dir is not None and (local_dir / "model.safetensors").exists():
+            single_path = local_dir / "model.safetensors"
+        else:
+            try:
+                from huggingface_hub import hf_hub_download
+                single_path = hf_hub_download(repo_id=model_path, filename="model.safetensors")
+            except Exception:
+                single_path = None
+
+        if single_path is not None:
+            logger.info("Loading single safetensors file %s...", single_path)
+            state_dict = load_file(single_path, device="cpu")
+            if load_in_4bit:
+                _load_state_dict_into_4bit_slice(
+                    extracted_layers=extracted_layers,
+                    state_dict=state_dict,
+                    layer_start=layer_start,
+                    layer_end=layer_end,
+                    device=target_device,
+                    compute_dtype=target_dtype,
+                    norm=norm,
+                    lm_head=lm_head,
+                    embed_tokens=embed_tokens,
+                )
+            else:
+                for idx, orig_idx in enumerate(range(layer_start, layer_end)):
+                    prefix = f"model.layers.{orig_idx}."
+                    layer_sd = {
+                        k[len(prefix):]: v.to(target_device, dtype=target_dtype)
+                        for k, v in state_dict.items() if k.startswith(prefix)
+                    }
+                    extracted_layers[idx].load_state_dict(layer_sd, strict=False)
+                if norm is not None:
+                    norm.load_state_dict({k[len("model.norm."):]: v.to(target_device, dtype=target_dtype) for k, v in state_dict.items() if k.startswith("model.norm.")}, strict=False)
+                if lm_head is not None:
+                    lm_head.load_state_dict({k[len("lm_head."):]: v.to(target_device, dtype=target_dtype) for k, v in state_dict.items() if k.startswith("lm_head.")}, strict=False)
+                if embed_tokens is not None:
+                    embed_tokens.load_state_dict({k[len("model.embed_tokens."):]: v.to(target_device, dtype=target_dtype) for k, v in state_dict.items() if k.startswith("model.embed_tokens.")}, strict=False)
+            del state_dict
+
+    del model
+    gc.collect()
+    if target_device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        allocated = torch.cuda.memory_allocated(target_device) / 1e9
+        logger.info("GPU VRAM after slice load: %.2f GB", allocated)
+
+    return ModelSlice(
         layers=extracted_layers,
         config=config,
         layer_start=layer_start,
@@ -360,30 +515,12 @@ def load_layer_slice(
         lm_head=lm_head,
         embed_tokens=embed_tokens,
         rotary_emb=rotary_emb,
+        device=target_device,
     )
-
-    # Move to target device
-    target_device = torch.device(device)
-
-    if load_in_4bit:
-        logger.info("Quantizing layer slice to 4-bit NF4 via bitsandbytes...")
-        quantize_module_4bit(model_slice.layers, target_device)
-        if model_slice.lm_head is not None:
-            quantize_module_4bit(model_slice.lm_head, target_device)
-
-    if target_device.type != "cpu":
-        logger.info("Moving slice to %s...", target_device)
-        model_slice.to(target_device)
-
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated(target_device) / 1e9
-            logger.info("GPU memory after loading: %.2f GB", allocated)
-
-    return model_slice
 
 
 def quantize_module_4bit(module: nn.Module, device: torch.device) -> nn.Module:
-    """Replace linear layers in module with bitsandbytes 4-bit NF4 linear layers."""
+    """Helper to replace linear layers in module with bitsandbytes 4-bit NF4 linear layers."""
     try:
         import bitsandbytes as bnb
     except ImportError:
