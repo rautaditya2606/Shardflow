@@ -2,14 +2,15 @@
 Kaggle Node Runner script for ShardFlow.
 
 Usage in Kaggle Notebook:
-1. !pip install -q torch transformers tokenizers safetensors accelerate fastapi uvicorn requests pydantic sse-starlette
+1. !pip install -q torch transformers tokenizers safetensors accelerate bitsandbytes fastapi uvicorn requests pydantic sse-starlette
 2. !git clone https://github.com/rautaditya2606/Shardflow.git /kaggle/working/Shardflow && cd /kaggle/working/Shardflow && pip install -e .
-3. !python scripts/kaggle_runner.py --registry-url https://shardflow.onrender.com --model Qwen/Qwen2.5-7B-Instruct --node-id kaggle-node-1 --port 9500
+3. !python scripts/kaggle_runner.py --registry-url https://shardflow.onrender.com --model Qwen/Qwen2.5-7B-Instruct --node-id kaggle-1-gpu0 --port 9500 --expected-nodes 4
 """
 
 import argparse
 import asyncio
 import logging
+import threading
 import time
 import requests
 import torch
@@ -30,8 +31,8 @@ def main():
     parser.add_argument(
         "--tunnel",
         choices=["bore", "cloudflare"],
-        default="cloudflare",
-        help="Tunnel backend (default: cloudflare)",
+        default="bore",
+        help="Tunnel backend (default: bore — bore.pub raw TCP proxy for high performance binary tensor transfer)",
     )
     parser.add_argument("--node-id", default=None, help="Unique node identifier")
     parser.add_argument("--expected-nodes", type=int, default=None, help="Expected total cluster nodes count (optional)")
@@ -41,6 +42,7 @@ def main():
     parser.add_argument("--next-host", default=None, help="Explicit next node host (optional)")
     parser.add_argument("--next-port", type=int, default=None, help="Explicit next node port (optional)")
     parser.add_argument("--is-last", action="store_true", help="Explicitly mark as last node (optional)")
+    parser.add_argument("--no-cuda-graphs", action="store_true", help="Disable CUDA Graphs and run in pure eager mode")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -92,6 +94,50 @@ def main():
                 raise
             time.sleep(2)
 
+    # Shared state for background heartbeat and dynamic topology updates
+    current_node = None
+    current_node_loop = None
+    seen_topology_version = 0
+
+    def background_heartbeat_worker():
+        """
+        Runs continuously in a daemon thread from the moment of registration.
+        Sends regular heartbeats to keep the node active in the registry even while
+        downloading large model weights, and updates next_node routing dynamically.
+        """
+        nonlocal seen_topology_version
+        hb_url = f"{args.registry_url.rstrip('/')}/heartbeat"
+        hb_payload = {"node_id": node_id}
+        while True:
+            time.sleep(5.0)
+            try:
+                hb_resp = requests.post(hb_url, json=hb_payload, timeout=5.0)
+                if hb_resp.status_code == 200:
+                    data = hb_resp.json()
+                    topo_v = data.get("topology_version", 0)
+                    if data.get("cluster_ready") and topo_v != seen_topology_version:
+                        logger.info("Topology version changed v%d -> v%d", seen_topology_version, topo_v)
+                        seen_topology_version = topo_v
+                    if data.get("cluster_ready") and current_node is not None and current_node_loop is not None:
+                        nxt_h = data.get("next_node_host")
+                        nxt_p = data.get("next_node_port")
+                        if nxt_h != current_node.next_node_host or nxt_p != current_node.next_node_port:
+                            asyncio.run_coroutine_threadsafe(
+                                current_node.update_next_node(nxt_h, nxt_p),
+                                current_node_loop,
+                            )
+                elif hb_resp.status_code == 404:
+                    logger.warning("Registry lost node %s — re-registering...", node_id)
+                    re_resp = requests.post(reg_url, json=reg_payload, timeout=10.0)
+                    if re_resp.status_code in (200, 201):
+                        logger.info("Re-registration successful")
+            except Exception as e:
+                logger.debug("Background heartbeat ping error: %s", e)
+
+    hb_thread = threading.Thread(target=background_heartbeat_worker, daemon=True)
+    hb_thread.start()
+    logger.info("Persistent background heartbeat thread started (5s ping interval)")
+
     if args.layer_start is not None and args.layer_end is not None and (args.is_last or args.next_host is not None):
         assignment = {
             "layer_start": args.layer_start,
@@ -114,6 +160,7 @@ def main():
     next_host = assignment.get("next_node_host")
     next_port = assignment.get("next_node_port")
     topology_version = assignment.get("topology_version", 0)
+    seen_topology_version = topology_version
 
     logger.info(
         "Cluster ready (topology v%d)! Assigned layers [%d, %d)%s (is_first=%s, is_last=%s)",
@@ -124,6 +171,8 @@ def main():
         is_first,
         is_last,
     )
+    if next_host:
+        logger.info("Next node routing target: %s:%d", next_host, next_port)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info("Loading layer slice [%d, %d) onto device %s...", layer_start, layer_end, device)
@@ -135,6 +184,7 @@ def main():
         include_norm=is_last,
         include_lm_head=is_last,
         device=device,
+        load_in_4bit=args.load_in_4bit,
     )
 
     node = PipelineNode(
@@ -145,47 +195,16 @@ def main():
         next_node_port=next_port,
         listen_host="0.0.0.0",
         listen_port=local_port,
+        enable_cuda_graphs=not args.no_cuda_graphs,
     )
-
-    seen_topology_version = topology_version
-
-    async def heartbeat_loop():
-        nonlocal seen_topology_version
-        hb_url = f"{args.registry_url.rstrip('/')}/heartbeat"
-        hb_payload = {"node_id": node_id}
-        while True:
-            await asyncio.sleep(10.0)
-            try:
-                hb_resp = await asyncio.to_thread(
-                    requests.post, hb_url, json=hb_payload, timeout=5.0
-                )
-                if hb_resp.status_code == 200:
-                    data = hb_resp.json()
-                    topo_v = data.get("topology_version", 0)
-                    if data.get("cluster_ready") and topo_v != seen_topology_version:
-                        logger.info("Topology changed v%d -> v%d, updating routing...", seen_topology_version, topo_v)
-                        seen_topology_version = topo_v
-                    if data.get("cluster_ready"):
-                        await node.update_next_node(data.get("next_node_host"), data.get("next_node_port"))
-                elif hb_resp.status_code == 404:
-                    logger.warning("Registry lost node %s — re-registering...", node_id)
-                    re_resp = await asyncio.to_thread(
-                        requests.post, reg_url, json=reg_payload, timeout=10.0
-                    )
-                    if re_resp.status_code in (200, 201):
-                        data = re_resp.json()
-                        seen_topology_version = data.get("topology_version", seen_topology_version)
-                        if data.get("cluster_ready"):
-                            await node.update_next_node(data.get("next_node_host"), data.get("next_node_port"))
-                        logger.info("Re-registration successful")
-            except Exception as e:
-                logger.debug("Heartbeat ping error: %s", e)
+    current_node = node
 
     async def run_node():
-        asyncio.create_task(heartbeat_loop())
+        nonlocal current_node_loop
+        current_node_loop = asyncio.get_running_loop()
         await node.serve_forever()
 
-    logger.info("Kaggle Pipeline node running...")
+    logger.info("Pipeline node ready — starting server on 0.0.0.0:%d ...", local_port)
     asyncio.run(run_node())
 
 
