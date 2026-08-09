@@ -216,6 +216,60 @@ class StreamReceiverServer:
             logger.info("StreamReceiverServer stopped")
 
 
+_local_ips_cache: Optional[set[str]] = None
+
+
+def get_local_machine_ips() -> set[str]:
+    """
+    Resolve and cache local interface and Tailscale IPs once on startup.
+    Avoids blocking DNS or subprocess calls during mid-session reconnect loops.
+    """
+    global _local_ips_cache
+    if _local_ips_cache is not None:
+        return _local_ips_cache
+
+    local_ips = {"127.0.0.1", "localhost", "0.0.0.0"}
+
+    # Tier 1: Hostname & DNS resolution
+    try:
+        hostname = socket.gethostname()
+        local_ips.add(socket.gethostbyname(hostname))
+        for addr_info in socket.getaddrinfo(hostname, None):
+            local_ips.add(addr_info[4][0])
+    except Exception as e:
+        logger.debug("DNS interface resolution error: %s", e)
+
+    # Tier 2: Kernel outbound route socket inspection (non-blocking)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            local_ips.add(s.getsockname()[0])
+    except Exception as e:
+        logger.debug("Outbound route socket inspection error: %s", e)
+
+    # Tier 3: Environment variable fallback
+    for env_key in ("SHARDFLOW_PUBLIC_HOST", "TAILSCALE_IP", "PUBLIC_HOST"):
+        val = os.getenv(env_key)
+        if val:
+            ip_val = val.strip()
+            local_ips.add(ip_val)
+            logger.debug("Added %s=%s to local IPs set", env_key, ip_val)
+
+    # Tier 4: Tailscale userspace CLI inspection (one-time startup query)
+    try:
+        import subprocess
+        ts_ip = subprocess.check_output(["tailscale", "ip", "-4"], timeout=0.5).decode().strip()
+        if ts_ip:
+            local_ips.add(ts_ip)
+            logger.debug("Added Tailscale CLI IP %s to local IPs set", ts_ip)
+    except Exception:
+        pass
+
+    _local_ips_cache = local_ips
+    logger.info("Resolved local machine IPs for same-host routing: %s", _local_ips_cache)
+    return _local_ips_cache
+
+
 class NodeClient:
     """
     Async TCP client for connecting to a pipeline node with zero-latency transport optimizations.
@@ -243,39 +297,7 @@ class NodeClient:
         # Same-host optimization: if target host matches local interface / Tailscale IP on this machine, route via 127.0.0.1
         connect_host = self.host
         try:
-            import socket
-            import os
-            local_ips = {"127.0.0.1", "localhost", "0.0.0.0"}
-            
-            # 1. Standard hostname & interface resolution
-            hostname = socket.gethostname()
-            local_ips.add(socket.gethostbyname(hostname))
-            for addr_info in socket.getaddrinfo(hostname, None):
-                local_ips.add(addr_info[4][0])
-                
-            # 2. Outbound route inspection
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                    s.connect(("8.8.8.8", 80))
-                    local_ips.add(s.getsockname()[0])
-            except Exception:
-                pass
-
-            # 3. Environment variable fallback (set by colab/kaggle runners)
-            for env_key in ("SHARDFLOW_PUBLIC_HOST", "TAILSCALE_IP", "PUBLIC_HOST"):
-                val = os.getenv(env_key)
-                if val:
-                    local_ips.add(val.strip())
-
-            # 4. Tailscale userspace CLI inspection fallback
-            try:
-                import subprocess
-                ts_ip = subprocess.check_output(["tailscale", "ip", "-4"], timeout=0.5).decode().strip()
-                if ts_ip:
-                    local_ips.add(ts_ip)
-            except Exception:
-                pass
-
+            local_ips = get_local_machine_ips()
             if self.host in local_ips:
                 connect_host = "127.0.0.1"
                 logger.info("Same-host routing detected for %s — connecting via local loopback 127.0.0.1:%d (< 0.2ms latency)", self.host, self.port)
