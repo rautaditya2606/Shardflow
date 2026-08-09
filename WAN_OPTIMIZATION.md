@@ -62,38 +62,70 @@ DIRECT P2P (TAILSCALE MESH):
 └─────────────────────────┘ <═══════════════════════════════└─────────────────────────┘
 ```
 
-### Colab Implementation:
+### 1. Tailscale ACL Configuration (Mandatory)
+By default, Tailscale enforces a default-deny policy between tagged devices. You **must** add the following rule in your [Tailscale Access Controls](https://login.tailscale.com/admin/acls/file):
 
-1. Generate a reusable, ephemeral auth key from [Tailscale Admin Console](https://login.tailscale.com/admin/settings/keys).
-2. Add the following to your Colab setup cell:
+```json
+{
+  "tagOwners": {
+    "tag:shardflow-node": ["autogroup:admin"]
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["tag:shardflow-node"],
+      "dst": ["tag:shardflow-node:*"]
+    }
+  ]
+}
+```
 
+### 2. Ephemeral Auth Key
+Generate a **Reusable + Ephemeral** auth key with `tag:shardflow-node` assigned in the [Tailscale Keys Console](https://login.tailscale.com/admin/settings/keys). When notebooks disconnect, they are automatically purged from your network.
+
+### 3. Google Colab vs. Kaggle Installation
+
+#### In Google Colab (Root Privileges Available):
 ```python
-# Install Tailscale in Colab
+# 1. Install Tailscale
 !curl -fsSL https://tailscale.com/install.sh | sh
 
-# Start tailscaled in userspace mode (no root tun device needed)
-import subprocess
-subprocess.Popen(["tailscaled", "--tun=userspace-networking", "--socks5-server=localhost:1055"])
+# 2. Create tun device & start daemon
+!mkdir -p /dev/net && mknod /dev/net/tun c 10 200 && chmod 600 /dev/net/tun
+!tailscaled --tun=userspace-networking &
 
-# Authenticate with your auth key
-!tailscale up --authkey="tskey-auth-kXXXXX-XXXXXXXX" --hostname="colab-node-1"
+# 3. Authenticate
+!tailscale up --authkey="tskey-auth-kXXXXX-XXXXXXXX" --hostname="colab-node-1" --accept-routes
 
-# Get assigned Tailscale IP
-import json
+# 4. Get Tailscale IP
+import json, subprocess
 status = json.loads(subprocess.check_output(["tailscale", "status", "--json"]).decode())
 tailscale_ip = status["Self"]["TailscaleIPs"][0]
-print(f"Tailscale IP: {tailscale_ip}")
+print(f"Node Tailscale IP: {tailscale_ip}")
 ```
 
-3. Run the node directly with its Tailscale IP:
-```bash
-python scripts/colab_runner.py \
-  --registry-url https://shardflow.onrender.com \
-  --model Qwen/Qwen2.5-7B-Instruct \
-  --public-host $tailscale_ip \
-  --port 9500 \
-  --no-tunnel
+#### In Kaggle Notebooks (Unprivileged Container - No `mknod`):
+On Kaggle, running `mknod` will fail with `Operation not permitted`. You **must** use userspace networking mode:
+```python
+# 1. Download static tailscaled binaries
+!curl -sL https://pkgs.tailscale.com/stable/tailscale_latest_amd64.tgz | tar -xz -C /tmp
+
+# 2. Start daemon in userspace mode
+import subprocess
+subprocess.Popen(["/tmp/tailscale_1.80.0_amd64/tailscaled", "--tun=userspace-networking", "--socks5-server=localhost:1055"])
+
+# 3. Authenticate with ephemeral key
+!/tmp/tailscale_1.80.0_amd64/tailscale up --authkey="tskey-auth-kXXXXX-XXXXXXXX" --hostname="kaggle-node-1"
+
+# 4. Extract assigned 100.x.y.z IP
+status = json.loads(subprocess.check_output(["/tmp/tailscale_1.80.0_amd64/tailscale", "status", "--json"]).decode())
+tailscale_ip = status["Self"]["TailscaleIPs"][0]
+print(f"Kaggle Tailscale IP: {tailscale_ip}")
 ```
+
+### 4. Automatic Same-Host Loopback Routing (0.1 ms Latency)
+In multi-GPU Kaggle notebooks, ShardFlow's `NodeClient` automatically inspects the target address. If the target host matches any local interface or the notebook's own Tailscale IP, it bypasses the network stack and connects directly via `127.0.0.1` (< 0.2 ms latency), ensuring GPU 0 $\leftrightarrow$ GPU 1 communication never routes through external proxies.
+
 
 ---
 

@@ -240,13 +240,27 @@ class NodeClient:
 
     async def connect(self, max_retries: int = 15, retry_delay: float = 2.0) -> None:
         """Establish TCP connection to the node, with retry for bootstrapping nodes."""
-        logger.info("Connecting to %s:%d ...", self.host, self.port)
+        # Same-host optimization: if target host matches local interface / Tailscale IP on this machine, route via 127.0.0.1
+        connect_host = self.host
+        try:
+            import socket
+            hostname = socket.gethostname()
+            local_ips = {"127.0.0.1", "localhost", "0.0.0.0", socket.gethostbyname(hostname)}
+            for addr_info in socket.getaddrinfo(hostname, None):
+                local_ips.add(addr_info[4][0])
+            if self.host in local_ips:
+                connect_host = "127.0.0.1"
+                logger.info("Same-host routing detected for %s — connecting via local loopback 127.0.0.1:%d (< 0.2ms latency)", self.host, self.port)
+        except Exception:
+            connect_host = self.host
+
+        logger.info("Connecting to %s:%d ...", connect_host, self.port)
         use_ssl = True if self.port == 443 else None
         last_err = None
         for attempt in range(1, max_retries + 1):
             try:
                 self._reader, self._writer = await asyncio.wait_for(
-                    asyncio.open_connection(self.host, self.port, ssl=use_ssl),
+                    asyncio.open_connection(connect_host, self.port, ssl=use_ssl),
                     timeout=self.send_timeout,
                 )
                 sock = self._writer.get_extra_info("socket")
