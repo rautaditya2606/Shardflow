@@ -396,64 +396,70 @@ def load_layer_slice(
 
         for shard_name in needed_shards:
             if local_dir is not None:
-                shard_path = local_dir / shard_name
+                shard_path = str(local_dir / shard_name)
             else:
                 from huggingface_hub import hf_hub_download
                 logger.info("Downloading targeted shard %s from HuggingFace Hub...", shard_name)
                 shard_path = hf_hub_download(repo_id=model_path, filename=shard_name)
 
-            logger.info("Loading and dispatching shard %s ...", shard_name)
-            state_dict = load_file(shard_path, device="cpu")
+            logger.info("Streaming and loading weights from shard %s ...", shard_name)
+            from safetensors import safe_open
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if not any(key.startswith(p) for p in target_prefixes):
+                        continue
+                    tensor = f.get_tensor(key)
 
-            if load_in_4bit:
-                _load_state_dict_into_4bit_slice(
-                    extracted_layers=extracted_layers,
-                    state_dict=state_dict,
-                    layer_start=layer_start,
-                    layer_end=layer_end,
-                    device=target_device,
-                    compute_dtype=target_dtype,
-                    norm=norm,
-                    lm_head=lm_head,
-                    embed_tokens=embed_tokens,
-                )
-            else:
-                # Apply FP16/BF16 weights to slice
-                for idx, orig_idx in enumerate(range(layer_start, layer_end)):
-                    prefix = f"model.layers.{orig_idx}."
-                    layer_sd = {
-                        k[len(prefix):]: v.to(target_device, dtype=target_dtype)
-                        for k, v in state_dict.items()
-                        if k.startswith(prefix)
-                    }
-                    if layer_sd:
-                        extracted_layers[idx].load_state_dict(layer_sd, strict=False)
+                    if load_in_4bit:
+                        _load_state_dict_into_4bit_slice(
+                            extracted_layers=extracted_layers,
+                            state_dict={key: tensor},
+                            layer_start=layer_start,
+                            layer_end=layer_end,
+                            device=target_device,
+                            compute_dtype=target_dtype,
+                            norm=norm,
+                            lm_head=lm_head,
+                            embed_tokens=embed_tokens,
+                        )
+                    else:
+                        # Direct FP16/BF16 loading to layer
+                        if key.startswith("model.layers."):
+                            parts = key.split(".")
+                            orig_idx = int(parts[2])
+                            if layer_start <= orig_idx < layer_end:
+                                local_idx = orig_idx - layer_start
+                                subpath = ".".join(parts[3:])
+                                submod = extracted_layers[local_idx]
+                                path_parts = subpath.split(".")
+                                for part in path_parts[:-1]:
+                                    submod = getattr(submod, part)
+                                param_name = path_parts[-1]
+                                param = nn.Parameter(
+                                    tensor.to(device=target_device, dtype=target_dtype),
+                                    requires_grad=False,
+                                )
+                                setattr(submod, param_name, param)
 
-                if norm is not None:
-                    norm_sd = {
-                        k[len("model.norm."):]: v.to(target_device, dtype=target_dtype)
-                        for k, v in state_dict.items() if k.startswith("model.norm.")
-                    }
-                    if norm_sd:
-                        norm.load_state_dict(norm_sd, strict=False)
+                        elif key.startswith("model.norm.") and norm is not None:
+                            norm.weight = nn.Parameter(
+                                tensor.to(device=target_device, dtype=target_dtype),
+                                requires_grad=False,
+                            )
+                        elif key.startswith("lm_head.") and lm_head is not None:
+                            lm_head.weight = nn.Parameter(
+                                tensor.to(device=target_device, dtype=target_dtype),
+                                requires_grad=False,
+                            )
+                        elif key.startswith("model.embed_tokens.") and embed_tokens is not None:
+                            embed_tokens.weight = nn.Parameter(
+                                tensor.to(device=target_device, dtype=target_dtype),
+                                requires_grad=False,
+                            )
 
-                if lm_head is not None:
-                    head_sd = {
-                        k[len("lm_head."):]: v.to(target_device, dtype=target_dtype)
-                        for k, v in state_dict.items() if k.startswith("lm_head.")
-                    }
-                    if head_sd:
-                        lm_head.load_state_dict(head_sd, strict=False)
+                    del tensor
 
-                if embed_tokens is not None:
-                    embed_sd = {
-                        k[len("model.embed_tokens."):]: v.to(target_device, dtype=target_dtype)
-                        for k, v in state_dict.items() if k.startswith("model.embed_tokens.")
-                    }
-                    if embed_sd:
-                        embed_tokens.load_state_dict(embed_sd, strict=False)
-
-            del state_dict
+            logger.info("Shard %s loaded successfully into GPU device %s", shard_name, target_device)
             gc.collect()
 
     else:
