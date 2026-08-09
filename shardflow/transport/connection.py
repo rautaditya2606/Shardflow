@@ -244,14 +244,43 @@ class NodeClient:
         connect_host = self.host
         try:
             import socket
+            import os
+            local_ips = {"127.0.0.1", "localhost", "0.0.0.0"}
+            
+            # 1. Standard hostname & interface resolution
             hostname = socket.gethostname()
-            local_ips = {"127.0.0.1", "localhost", "0.0.0.0", socket.gethostbyname(hostname)}
+            local_ips.add(socket.gethostbyname(hostname))
             for addr_info in socket.getaddrinfo(hostname, None):
                 local_ips.add(addr_info[4][0])
+                
+            # 2. Outbound route inspection
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    s.connect(("8.8.8.8", 80))
+                    local_ips.add(s.getsockname()[0])
+            except Exception:
+                pass
+
+            # 3. Environment variable fallback (set by colab/kaggle runners)
+            for env_key in ("SHARDFLOW_PUBLIC_HOST", "TAILSCALE_IP", "PUBLIC_HOST"):
+                val = os.getenv(env_key)
+                if val:
+                    local_ips.add(val.strip())
+
+            # 4. Tailscale userspace CLI inspection fallback
+            try:
+                import subprocess
+                ts_ip = subprocess.check_output(["tailscale", "ip", "-4"], timeout=0.5).decode().strip()
+                if ts_ip:
+                    local_ips.add(ts_ip)
+            except Exception:
+                pass
+
             if self.host in local_ips:
                 connect_host = "127.0.0.1"
                 logger.info("Same-host routing detected for %s — connecting via local loopback 127.0.0.1:%d (< 0.2ms latency)", self.host, self.port)
-        except Exception:
+        except Exception as e:
+            logger.debug("Same-host detection exception (falling back to %s): %s", self.host, e)
             connect_host = self.host
 
         logger.info("Connecting to %s:%d ...", connect_host, self.port)
