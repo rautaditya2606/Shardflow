@@ -46,8 +46,8 @@ def main():
     parser.add_argument("--load-in-4bit", action="store_true", help="Quantize weights to 4-bit NF4 via bitsandbytes to save VRAM")
     parser.add_argument("--next-host", default=None, help="Explicit next node host (optional)")
     parser.add_argument("--next-port", type=int, default=None, help="Explicit next node port (optional)")
-    parser.add_argument("--is-last", action="store_true", help="Explicitly mark as last node (optional)")
-    parser.add_argument("--no-cuda-graphs", action="store_true", help="Disable CUDA Graphs and run in pure eager mode")
+    parser.add_argument("--enable-cuda-graphs", action="store_true", help="Enable CUDA Graphs for low-latency kernel replay")
+    parser.add_argument("--no-cuda-graphs", action="store_true", help="Disable CUDA Graphs and run in pure eager mode (default)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -202,7 +202,7 @@ def main():
         next_node_port=next_port,
         listen_host="0.0.0.0",
         listen_port=local_port,
-        enable_cuda_graphs=not args.no_cuda_graphs,
+        enable_cuda_graphs=args.enable_cuda_graphs and not args.no_cuda_graphs,
     )
     current_node = node
     current_node_loop = None

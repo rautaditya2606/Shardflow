@@ -52,7 +52,7 @@ class PipelineNode:
         listen_port: int = 9000,
         kv_timeout: float = 60.0,
         max_sessions: int = 4,
-        enable_cuda_graphs: bool = True,
+        enable_cuda_graphs: bool = False,
     ):
         self.model_slice = model_slice
         self.is_first_node = is_first_node
