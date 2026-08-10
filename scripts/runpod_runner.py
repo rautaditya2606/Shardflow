@@ -13,6 +13,12 @@ Usage:
      --port 9500
 """
 
+import os
+
+# Disable Hugging Face Xet transfer backend which causes memory leaks and OOM in notebook environments
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+
 import argparse
 import asyncio
 import logging

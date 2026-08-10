@@ -4,8 +4,17 @@ Kaggle Node Runner script for ShardFlow.
 Usage in Kaggle Notebook:
 1. !pip install -q torch transformers tokenizers safetensors accelerate bitsandbytes fastapi uvicorn requests pydantic sse-starlette
 2. !git clone https://github.com/rautaditya2606/Shardflow.git /kaggle/working/Shardflow && cd /kaggle/working/Shardflow && pip install -e .
-3. !python scripts/kaggle_runner.py --registry-url https://shardflow.onrender.com --model Qwen/Qwen2.5-7B-Instruct --node-id kaggle-1-gpu0 --port 9500 --expected-nodes 4
+3. Pre-download model weights (optional but recommended for multi-GPU):
+   from huggingface_hub import snapshot_download
+   snapshot_download("Qwen/Qwen2.5-7B-Instruct", ignore_patterns=["*.pt", "*.bin", "*.onnx", "*.msgpack"])
+4. !python scripts/kaggle_runner.py --registry-url https://shardflow.onrender.com --model Qwen/Qwen2.5-7B-Instruct --node-id kaggle-1-gpu0 --port 9500 --expected-nodes 4
 """
+
+import os
+
+# Disable Hugging Face Xet transfer backend which causes memory leaks and OOM in notebook environments (Kaggle/Colab)
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
 
 import argparse
 import asyncio

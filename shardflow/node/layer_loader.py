@@ -11,10 +11,15 @@ Supports:
 2. In-place 4-bit (bitsandbytes NF4) meta-device quantization for 70B/72B scale models
 """
 
+import os
+
+# Disable Hugging Face Xet transfer backend which causes memory leaks and OOM in notebook environments (Kaggle/Colab)
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+
 import gc
 import json
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Set, Any
@@ -207,8 +212,8 @@ def _get_safetensors_shards_map(model_path: str) -> tuple[Optional[Dict[str, str
     Resolve safetensors weight_map and base directory if available.
     Returns (weight_map, local_dir_path).
     """
-    if os.path.isdir(model_path):
-        local_dir = Path(model_path)
+    local_dir = _resolve_local_dir(model_path)
+    if local_dir is not None:
         index_path = local_dir / "model.safetensors.index.json"
         if index_path.exists():
             with open(index_path) as f:
@@ -218,12 +223,14 @@ def _get_safetensors_shards_map(model_path: str) -> tuple[Optional[Dict[str, str
             return None, local_dir
 
     try:
-        from huggingface_hub import hf_hub_download
-        index_file = hf_hub_download(repo_id=model_path, filename="model.safetensors.index.json")
+        from huggingface_hub import hf_hub_download, try_to_load_from_cache
+        index_file = try_to_load_from_cache(repo_id=model_path, filename="model.safetensors.index.json")
+        if not (isinstance(index_file, (str, Path)) and os.path.exists(index_file)):
+            index_file = hf_hub_download(repo_id=model_path, filename="model.safetensors.index.json")
         with open(index_file) as f:
-            return json.load(f)["weight_map"], None
+            return json.load(f)["weight_map"], local_dir
     except Exception:
-        return None, None
+        return None, local_dir
 
 
 @dataclass
@@ -395,12 +402,16 @@ def load_layer_slice(
         logger.info("Matched %d targeted safetensors shards: %s", len(needed_shards), needed_shards)
 
         for shard_name in needed_shards:
-            if local_dir is not None:
+            if local_dir is not None and (local_dir / shard_name).exists():
                 shard_path = str(local_dir / shard_name)
             else:
-                from huggingface_hub import hf_hub_download
-                logger.info("Downloading targeted shard %s from HuggingFace Hub...", shard_name)
-                shard_path = hf_hub_download(repo_id=model_path, filename=shard_name)
+                from huggingface_hub import hf_hub_download, try_to_load_from_cache
+                cached = try_to_load_from_cache(repo_id=model_path, filename=shard_name)
+                if isinstance(cached, (str, Path)) and os.path.exists(cached):
+                    shard_path = str(cached)
+                else:
+                    logger.info("Downloading targeted shard %s from HuggingFace Hub...", shard_name)
+                    shard_path = hf_hub_download(repo_id=model_path, filename=shard_name)
 
             logger.info("Streaming and loading weights from shard %s ...", shard_name)
             from safetensors import safe_open
@@ -469,8 +480,12 @@ def load_layer_slice(
             single_path = local_dir / "model.safetensors"
         else:
             try:
-                from huggingface_hub import hf_hub_download
-                single_path = hf_hub_download(repo_id=model_path, filename="model.safetensors")
+                from huggingface_hub import hf_hub_download, try_to_load_from_cache
+                cached = try_to_load_from_cache(repo_id=model_path, filename="model.safetensors")
+                if isinstance(cached, (str, Path)) and os.path.exists(cached):
+                    single_path = str(cached)
+                else:
+                    single_path = hf_hub_download(repo_id=model_path, filename="model.safetensors")
             except Exception:
                 single_path = None
 

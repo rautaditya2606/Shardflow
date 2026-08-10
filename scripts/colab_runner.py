@@ -7,6 +7,12 @@ Usage in Google Colab:
 3. !python scripts/colab_runner.py --registry-url https://shardflow.onrender.com --model Qwen/Qwen2.5-7B-Instruct --node-id colab-node-1 --port 9500
 """
 
+import os
+
+# Disable Hugging Face Xet transfer backend which causes memory leaks and OOM in notebook environments (Kaggle/Colab)
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+
 import argparse
 import asyncio
 import logging
