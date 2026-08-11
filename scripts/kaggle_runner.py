@@ -16,6 +16,11 @@ import os
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
 
+# Auto-route HF cache to high-capacity /kaggle/tmp storage if running in Kaggle
+if os.path.exists("/kaggle/tmp") or os.path.exists("/kaggle"):
+    os.environ.setdefault("HF_HOME", "/kaggle/tmp/huggingface")
+    os.environ.setdefault("HF_HUB_CACHE", "/kaggle/tmp/huggingface/hub")
+
 import argparse
 import asyncio
 import logging
