@@ -20,6 +20,45 @@ from shardflow.transport.protocol import (
 logger = logging.getLogger(__name__)
 
 
+def _configure_socket_options(sock: Optional[socket.socket]) -> None:
+    """Apply high-performance and aggressive keepalive options to TCP socket."""
+    if not sock:
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except Exception:
+        pass
+    if hasattr(socket, "TCP_KEEPIDLE"):
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
+        except Exception:
+            pass
+    if hasattr(socket, "TCP_KEEPINTVL"):
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+        except Exception:
+            pass
+    if hasattr(socket, "TCP_KEEPCNT"):
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        except Exception:
+            pass
+    if hasattr(socket, "TCP_QUICKACK"):
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+        except Exception:
+            pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 131072)
+    except Exception:
+        pass
+
+
 class NodeServer:
     """
     Async TCP server for a pipeline node.
@@ -71,18 +110,7 @@ class NodeServer:
         logger.info("New connection from %s", peer)
 
         sock = writer.get_extra_info("socket")
-        if sock:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            if hasattr(socket, "TCP_QUICKACK"):
-                try:
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
-                except Exception:
-                    pass
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 131072)
-            except Exception:
-                pass
+        _configure_socket_options(sock)
 
         try:
             while True:
@@ -174,8 +202,7 @@ class StreamReceiverServer:
         """Handle incoming token stream from terminal node."""
         peer = writer.get_extra_info("peername")
         sock = writer.get_extra_info("socket")
-        if sock:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        _configure_socket_options(sock)
 
         try:
             while True:
@@ -248,31 +275,35 @@ def get_local_machine_ips() -> set[str]:
         logger.debug("Outbound route socket inspection error: %s", e)
 
     # Tier 3: Environment variable fallback
-    for env_key in ("SHARDFLOW_PUBLIC_HOST", "TAILSCALE_IP", "PUBLIC_HOST"):
-        val = os.getenv(env_key)
-        if val:
-            ip_val = val.strip()
-            local_ips.add(ip_val)
-            logger.debug("Added %s=%s to local IPs set", env_key, ip_val)
+    env_ips = os.getenv("SHARDFLOW_LOCAL_IPS", "").strip()
+    if env_ips:
+        for ip in env_ips.split(","):
+            ip = ip.strip()
+            if ip:
+                local_ips.add(ip)
 
-    # Tier 4: Tailscale userspace CLI inspection (one-time startup query)
+    # Tier 4: Tailscale IP detection
     try:
+        import shutil
         import subprocess
-        ts_ip = subprocess.check_output(["tailscale", "ip", "-4"], timeout=0.5).decode().strip()
-        if ts_ip:
-            local_ips.add(ts_ip)
-            logger.debug("Added Tailscale CLI IP %s to local IPs set", ts_ip)
-    except Exception:
-        pass
+        tailscale_bin = shutil.which("tailscale")
+        if tailscale_bin:
+            res = subprocess.run([tailscale_bin, "ip", "-4"], capture_output=True, text=True, timeout=1.0)
+            if res.returncode == 0:
+                ts_ip = res.stdout.strip()
+                if ts_ip:
+                    local_ips.add(ts_ip)
+    except Exception as e:
+        logger.debug("Tailscale interface inspection error: %s", e)
 
     _local_ips_cache = local_ips
-    logger.info("Resolved local machine IPs for same-host routing: %s", _local_ips_cache)
     return _local_ips_cache
 
 
 class NodeClient:
     """
-    Async TCP client for connecting to a pipeline node with zero-latency transport optimizations.
+    Async TCP client for connecting to a pipeline node with zero-latency transport optimizations
+    and automatic transparent reconnection across idle timeouts and transient disconnects.
     """
 
     def __init__(
@@ -291,8 +322,9 @@ class NodeClient:
         self._connected = False
         self.reconnect_count: int = 0
         self.last_hop_latency_ms: float = 0.0
+        self._lock = asyncio.Lock()
 
-    async def connect(self, max_retries: int = 15, retry_delay: float = 2.0) -> None:
+    async def connect(self, max_retries: int = 15, retry_delay: float = 1.0) -> None:
         """Establish TCP connection to the node, with retry for bootstrapping nodes."""
         # Same-host optimization: if target host matches local interface / Tailscale IP on this machine, route via 127.0.0.1
         connect_host = self.host
@@ -300,7 +332,7 @@ class NodeClient:
             local_ips = get_local_machine_ips()
             if self.host in local_ips:
                 connect_host = "127.0.0.1"
-                logger.info("Same-host routing detected for %s — connecting via local loopback 127.0.0.1:%d (< 0.2ms latency)", self.host, self.port)
+                logger.info("Same-host routing detected for %s — connecting via local loopback 127.0.0.1:%d", self.host, self.port)
         except Exception as e:
             logger.debug("Same-host detection exception (falling back to %s): %s", self.host, e)
             connect_host = self.host
@@ -315,18 +347,7 @@ class NodeClient:
                     timeout=self.send_timeout,
                 )
                 sock = self._writer.get_extra_info("socket")
-                if sock:
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    if hasattr(socket, "TCP_QUICKACK"):
-                        try:
-                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
-                        except Exception:
-                            pass
-                    try:
-                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
-                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 131072)
-                    except Exception:
-                        pass
+                _configure_socket_options(sock)
 
                 self._connected = True
                 if attempt > 1:
@@ -345,15 +366,23 @@ class NodeClient:
             f"Failed to connect to {self.host}:{self.port} after {max_retries} attempts: {last_err}"
         )
 
-    async def send(self, msg: TensorMessage) -> None:
-        """Send a message to the connected node."""
+    async def ensure_connected(self) -> None:
+        """Ensure connection is established; reconnects if socket dropped or closed."""
         if not self.is_connected:
-            raise ConnectionError("Not connected. Call connect() first.")
+            async with self._lock:
+                if not self.is_connected:
+                    await self.connect(max_retries=5, retry_delay=0.5)
+
+    async def send(self, msg: TensorMessage) -> None:
+        """Send a message to the connected node with transparent auto-reconnect."""
+        await self.ensure_connected()
         try:
             await send_message(self._writer, msg)
-        except Exception:
-            self._connected = False
-            raise
+        except Exception as e:
+            logger.warning("Send to %s:%d failed (%s) — reconnecting...", self.host, self.port, e)
+            await self.close()
+            await self.connect(max_retries=5, retry_delay=0.5)
+            await send_message(self._writer, msg)
 
     async def recv(self) -> TensorMessage:
         """Receive a message from the connected node and record hop latency."""
@@ -371,22 +400,30 @@ class NodeClient:
             raise
 
     async def send_recv(self, msg: TensorMessage, timeout: Optional[float] = None) -> TensorMessage:
-        """Send a message and wait for a response with optional timeout override."""
+        """Send a message and wait for response with automatic transparent retry on dead sockets."""
         import time
-        await self.send(msg)
         t = timeout if timeout is not None else self.recv_timeout
         try:
+            await self.ensure_connected()
+            await send_message(self._writer, msg)
             resp = await recv_message(self._reader, timeout=t)
             now_us = int(time.perf_counter() * 1_000_000)
             if resp.send_ts_us > 0:
                 self.last_hop_latency_ms = (now_us - resp.send_ts_us) / 1000.0
             return resp
-        except Exception:
+        except Exception as e:
+            logger.warning("send_recv to %s:%d failed (%s) — reconnecting and retrying...", self.host, self.port, e)
             await self.close()
-            raise
+            await self.connect(max_retries=5, retry_delay=0.5)
+            await send_message(self._writer, msg)
+            resp = await recv_message(self._reader, timeout=t)
+            now_us = int(time.perf_counter() * 1_000_000)
+            if resp.send_ts_us > 0:
+                self.last_hop_latency_ms = (now_us - resp.send_ts_us) / 1000.0
+            return resp
 
     async def close(self) -> None:
-        """Close the connection."""
+        """Close the connection cleanly."""
         if self._writer:
             try:
                 self._writer.close()

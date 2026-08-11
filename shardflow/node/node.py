@@ -122,25 +122,31 @@ class PipelineNode:
 
         await self.kv_store.start_eviction_loop()
 
-        # Connect to the next node in the chain (if not last)
-        if not self.is_last_node and self.next_node_host:
-            self._next_client = NodeClient(
-                self.next_node_host,
-                self.next_node_port,
-            )
-            await self._next_client.connect()
-            logger.info(
-                "Connected to next node at %s:%d",
-                self.next_node_host, self.next_node_port
-            )
-
-        # Start TCP server for incoming activations
+        # 1. Start TCP server immediately so this node is listening for incoming connections
         self._server = NodeServer(
             host=self.listen_host,
             port=self.listen_port,
             handler=self._handle_message,
         )
         await self._server.start()
+
+        # 2. Connect to the next node in the chain (if not last)
+        if not self.is_last_node and self.next_node_host:
+            self._next_client = NodeClient(
+                self.next_node_host,
+                self.next_node_port,
+            )
+            try:
+                await self._next_client.connect(max_retries=5, retry_delay=1.0)
+                logger.info(
+                    "Connected to next node at %s:%d",
+                    self.next_node_host, self.next_node_port
+                )
+            except Exception as e:
+                logger.info(
+                    "Next node at %s:%d is still booting — will connect on first request: %s",
+                    self.next_node_host, self.next_node_port, e
+                )
 
         logger.info(
             "Node ready — layers [%d, %d), %s, listening on %s:%d (CUDA Graphs: %s)",
@@ -291,9 +297,12 @@ class PipelineNode:
                     logger.warning("Next client disconnected — attempting emergency reconnect to %s:%d...", self.next_node_host, self.next_node_port)
                     await self.update_next_node(self.next_node_host, self.next_node_port)
 
-            if self._next_client is None or not self._next_client.is_connected:
-                logger.error("Cannot forward activation — next node target (%s:%s) is not connected", self.next_node_host, self.next_node_port)
-                raise RuntimeError(f"Next node target ({self.next_node_host}:{self.next_node_port}) is not connected")
+            if self._next_client is None and self.next_node_host and self.next_node_port:
+                self._next_client = NodeClient(self.next_node_host, self.next_node_port)
+
+            if self._next_client is None:
+                logger.error("Cannot forward activation — next node target is not configured")
+                raise RuntimeError(f"Next node target is not configured")
 
             forward_msg = TensorMessage(
                 msg_type=MessageType.ACTIVATION,
@@ -307,9 +316,9 @@ class PipelineNode:
                 stream_back_port=msg.stream_back_port,
             )
             try:
-                response = await self._next_client.send_recv(forward_msg, timeout=15.0)
+                response = await self._next_client.send_recv(forward_msg, timeout=20.0)
                 return response
-            except (asyncio.TimeoutError, ConnectionError, OSError) as err:
+            except (asyncio.TimeoutError, ConnectionError, OSError, Exception) as err:
                 logger.error(
                     "Forward to next node (%s:%s) failed or timed out for session %s: %s",
                     self.next_node_host, self.next_node_port, msg.session_id, err,
