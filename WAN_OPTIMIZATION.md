@@ -85,7 +85,20 @@ Generate a **Reusable + Ephemeral** auth key with `tag:shardflow-node` assigned 
 
 ### 3. Google Colab vs. Kaggle Installation
 
-#### In Google Colab (Root Privileges Available):
+#### In Google Colab (Automated 1-Line CLI or Manual Setup):
+
+**Option A: Automated via Runner Flag (Recommended):**
+```python
+!python scripts/colab_runner.py \
+    --registry-url https://shardflow.onrender.com \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --node-id colab-node-1 \
+    --tailscale-authkey "tskey-auth-kXXXXX-XXXXXXXX"
+```
+
+**Option B: Manual Tailscale Setup & MagicDNS Hostnames:**
+> **Tip on MagicDNS:** Tailscale MagicDNS provides stable hostnames (`colab-node-1.your-tailnet.ts.net`) that persist across Colab session restarts, so peer routing targets remain constant even when new ephemeral IPs are assigned.
+
 ```python
 # 1. Install Tailscale
 !curl -fsSL https://tailscale.com/install.sh | sh
@@ -97,11 +110,12 @@ Generate a **Reusable + Ephemeral** auth key with `tag:shardflow-node` assigned 
 # 3. Authenticate
 !tailscale up --authkey="tskey-auth-kXXXXX-XXXXXXXX" --hostname="colab-node-1" --accept-routes
 
-# 4. Get Tailscale IP
+# 4. Get Tailscale IP and MagicDNS Hostname
 import json, subprocess
 status = json.loads(subprocess.check_output(["tailscale", "status", "--json"]).decode())
 tailscale_ip = status["Self"]["TailscaleIPs"][0]
-print(f"Node Tailscale IP: {tailscale_ip}")
+magicdns_name = status["Self"].get("DNSName", "").rstrip(".")
+print(f"Node Tailscale IP: {tailscale_ip} | Hostname: {magicdns_name}")
 ```
 
 #### In Kaggle Notebooks (Unprivileged Container - No `mknod`):

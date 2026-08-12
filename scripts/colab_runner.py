@@ -43,11 +43,13 @@ def main():
     parser.add_argument("--expected-nodes", type=int, default=None, help="Expected total cluster nodes count (optional)")
     parser.add_argument("--layer-start", type=int, default=None, help="Explicit layer start (optional)")
     parser.add_argument("--layer-end", type=int, default=None, help="Explicit layer end (optional)")
-    parser.add_argument("--load-in-4bit", action="store_true", help="Quantize weights to 4-bit NF4 via bitsandbytes to save VRAM")
+    parser.add_argument("--load-in-4bit", action="store_true", help="Quantize weights to 4-bit NF4 (Note: for 7B models on 2x T4, pure FP16 is faster and fits VRAM)")
     parser.add_argument("--next-host", default=None, help="Explicit next node host (optional)")
     parser.add_argument("--next-port", type=int, default=None, help="Explicit next node port (optional)")
-    parser.add_argument("--enable-cuda-graphs", action="store_true", help="Enable CUDA Graphs for low-latency kernel replay")
-    parser.add_argument("--no-cuda-graphs", action="store_true", help="Disable CUDA Graphs and run in pure eager mode (default)")
+    parser.add_argument("--enable-cuda-graphs", action="store_true", default=True, help="Enable CUDA Graphs for low-latency kernel replay (default: True)")
+    parser.add_argument("--no-cuda-graphs", action="store_true", help="Disable CUDA Graphs and run in pure eager mode")
+    parser.add_argument("--tailscale-authkey", default=None, help="Tailscale ephemeral auth key for direct P2P mesh WireGuard networking (<5ms latency)")
+    parser.add_argument("--draft-model", default=None, help="Small draft model for speculative decoding on Node 0 (e.g. Qwen/Qwen2.5-0.5B-Instruct)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -58,14 +60,21 @@ def main():
     node_id = args.node_id or f"colab-node-{int(time.time())}"
     local_port = args.port
 
-    if args.tunnel == "bore":
+    if args.tailscale_authkey:
+        from shardflow.transport.tailscale import setup_tailscale_colab
+        logger.info("Setting up direct Tailscale P2P Mesh VPN...")
+        ts_ip, ts_hname = setup_tailscale_colab(authkey=args.tailscale_authkey, hostname=node_id)
+        pub_host = ts_hname or ts_ip
+        pub_port = local_port
+        logger.info("Tailscale P2P direct endpoint: %s:%d", pub_host, pub_port)
+    elif args.tunnel == "bore":
         logger.info("Starting bore tunnel on local port %d...", local_port)
         tunnel_proc, pub_host, pub_port = start_bore_tunnel(local_port)
+        logger.info("Tunnel established at %s:%d", pub_host, pub_port)
     else:
         logger.info("Starting Cloudflare TCP tunnel on local port %d...", local_port)
         tunnel_proc, pub_host, pub_port = start_cloudflare_tcp_tunnel(local_port)
-
-    logger.info("Tunnel established at %s:%d", pub_host, pub_port)
+        logger.info("Tunnel established at %s:%d", pub_host, pub_port)
 
     vram = 0.0
     if torch.cuda.is_available():
