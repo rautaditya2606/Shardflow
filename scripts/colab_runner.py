@@ -64,9 +64,10 @@ def main():
         from shardflow.transport.tailscale import setup_tailscale_colab
         logger.info("Setting up direct Tailscale P2P Mesh VPN...")
         ts_ip, ts_hname = setup_tailscale_colab(authkey=args.tailscale_authkey, hostname=node_id)
-        pub_host = ts_hname or ts_ip
+        # ponytail: use direct 100.x.y.z IP to avoid container DNS resolution failures with MagicDNS
+        pub_host = ts_ip
         pub_port = local_port
-        logger.info("Tailscale P2P direct endpoint: %s:%d", pub_host, pub_port)
+        logger.info("Tailscale P2P direct endpoint: %s:%d (Hostname: %s)", pub_host, pub_port, ts_hname)
     elif args.tunnel == "bore":
         logger.info("Starting bore tunnel on local port %d...", local_port)
         tunnel_proc, pub_host, pub_port = start_bore_tunnel(local_port)
