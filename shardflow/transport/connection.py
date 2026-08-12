@@ -301,56 +301,6 @@ def get_local_machine_ips() -> set[str]:
     return _local_ips_cache
 
 
-async def _open_socks5_connection(
-    target_host: str,
-    target_port: int,
-    proxy_host: str = "127.0.0.1",
-    proxy_port: int = 1055,
-    timeout: float = 5.0,
-) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    """Open a TCP stream through a local SOCKS5 proxy (used for Tailscale userspace mode in containers)."""
-    import socket
-    import struct
-
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(proxy_host, proxy_port),
-        timeout=timeout,
-    )
-    # 1. SOCKS5 greeting: VER=5, NMETHODS=1, METHOD=0 (no auth)
-    writer.write(b"\x05\x01\x00")
-    await writer.drain()
-    res = await reader.readexactly(2)
-    if res != b"\x05\x00":
-        writer.close()
-        raise ConnectionError(f"SOCKS5 proxy authentication failed: {res}")
-
-    # 2. SOCKS5 connect request
-    try:
-        ip_bytes = socket.inet_aton(target_host)
-        req = b"\x05\x01\x00\x01" + ip_bytes + struct.pack("!H", target_port)
-    except Exception:
-        host_bytes = target_host.encode("ascii")
-        req = b"\x05\x01\x00\x03" + struct.pack("!B", len(host_bytes)) + host_bytes + struct.pack("!H", target_port)
-
-    writer.write(req)
-    await writer.drain()
-    resp = await reader.readexactly(4)
-    if resp[1] != 0:
-        writer.close()
-        raise ConnectionError(f"SOCKS5 connection to {target_host}:{target_port} failed (code={resp[1]})")
-
-    atyp = resp[3]
-    if atyp == 1:
-        await reader.readexactly(4 + 2)
-    elif atyp == 3:
-        dlen = (await reader.readexactly(1))[0]
-        await reader.readexactly(dlen + 2)
-    elif atyp == 4:
-        await reader.readexactly(16 + 2)
-
-    return reader, writer
-
-
 class NodeClient:
     """
     Async TCP client for connecting to a pipeline node with zero-latency transport optimizations
@@ -407,26 +357,7 @@ class NodeClient:
                 logger.info("Connected to %s:%d (ssl=%s, reconnects=%d)", self.host, self.port, bool(use_ssl), self.reconnect_count)
                 return
             except (OSError, asyncio.TimeoutError) as e:
-                # SOCKS5 fallback for Tailscale userspace mode in containers
-                if "100." in connect_host or ".ts.net" in connect_host:
-                    try:
-                        self._reader, self._writer = await _open_socks5_connection(
-                            target_host=connect_host,
-                            target_port=self.port,
-                            timeout=self.send_timeout,
-                        )
-                        sock = self._writer.get_extra_info("socket")
-                        _configure_socket_options(sock)
-                        self._connected = True
-                        if attempt > 1:
-                            self.reconnect_count += 1
-                        logger.info("Connected to %s:%d via Tailscale SOCKS5 proxy", self.host, self.port)
-                        return
-                    except Exception as s_err:
-                        last_err = s_err
-                else:
-                    last_err = e
-
+                last_err = e
                 if attempt < max_retries:
                     logger.debug(
                         "Connect to %s:%d failed (attempt %d/%d): %s. Retrying in %.1fs...",

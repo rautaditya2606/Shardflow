@@ -59,11 +59,13 @@ def get_tailscale_hostname() -> Optional[str]:
 def setup_tailscale_colab(authkey: str, hostname: str = "shardflow-colab") -> Tuple[str, str]:
     """
     Configure and authenticate Tailscale in Google Colab environment.
+    Uses kernel TUN mode (via systemctl) so 100.x.x.x addresses are natively
+    routable by the Linux kernel over WireGuard UDP — no SOCKS5 proxy.
     Returns: (tailscale_ip, magicdns_hostname)
     """
     logger.info("Setting up Tailscale P2P Mesh for Colab (%s)...", hostname)
-    
-    # 1. Install Tailscale if not present
+
+    # 1. Install Tailscale if not present (registers tailscaled.service via systemd)
     if not shutil.which("tailscale"):
         logger.info("Installing Tailscale...")
         subprocess.run(
@@ -73,64 +75,63 @@ def setup_tailscale_colab(authkey: str, hostname: str = "shardflow-colab") -> Tu
             timeout=60.0,
         )
 
-    # 2. Ensure system state directories and tun device exist
-    os.makedirs("/var/run/tailscale", exist_ok=True)
-    os.makedirs("/var/lib/tailscale", exist_ok=True)
-    os.makedirs("/dev/net", exist_ok=True)
-    if not os.path.exists("/dev/net/tun"):
-        try:
-            subprocess.run("mknod /dev/net/tun c 10 200 && chmod 600 /dev/net/tun", shell=True, timeout=5.0)
-        except Exception:
-            pass
-
-    tailscaled_bin = shutil.which("tailscaled") or "/usr/sbin/tailscaled"
     tailscale_bin = shutil.which("tailscale") or "/usr/bin/tailscale"
 
-    # Check if tailscaled is already running
+    # 2. Start tailscaled via systemd (kernel TUN mode — creates real tailscale0 interface)
+    #    Colab VMs have full systemd; the install.sh registers tailscaled.service.
+    #    This makes 100.x.x.x routable directly via kernel routing table.
     p_check = subprocess.run(["pgrep", "tailscaled"], capture_output=True)
     if p_check.returncode != 0:
-        log_f = open("/tmp/tailscaled.log", "a")
-        # ponytail: userspace-networking with socks5 proxy runs without root/kernel TUN constraints in all containers
-        subprocess.Popen(
-            [
-                tailscaled_bin,
-                "--tun=userspace-networking",
-                "--socks5-server=localhost:1055",
-                "--outbound-http-proxy-listen=localhost:1055",
-                "--state=/var/lib/tailscale/tailscaled.state",
-                "--socket=/var/run/tailscale/tailscaled.sock",
-            ],
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-        )
-        
-        # Wait up to 10s for socket to become ready
-        for _ in range(20):
-            if os.path.exists("/var/run/tailscale/tailscaled.sock"):
-                break
-            time.sleep(0.5)
+        started = False
+        # Try systemctl first (preferred — full kernel TUN, direct WireGuard UDP)
+        if shutil.which("systemctl"):
+            r = subprocess.run(["systemctl", "start", "tailscaled"], capture_output=True)
+            if r.returncode == 0:
+                time.sleep(2.0)
+                started = subprocess.run(["pgrep", "tailscaled"], capture_output=True).returncode == 0
+                if started:
+                    logger.info("tailscaled started via systemctl (kernel TUN mode)")
 
-    # 3. Authenticate with ephemeral auth key
+        # Fallback: direct Popen with kernel TUN (no userspace-networking)
+        if not started:
+            tailscaled_bin = shutil.which("tailscaled") or "/usr/sbin/tailscaled"
+            os.makedirs("/var/run/tailscale", exist_ok=True)
+            os.makedirs("/var/lib/tailscale", exist_ok=True)
+            os.makedirs("/dev/net", exist_ok=True)
+            if not os.path.exists("/dev/net/tun"):
+                subprocess.run("mknod /dev/net/tun c 10 200 && chmod 600 /dev/net/tun", shell=True, timeout=5.0)
+            log_f = open("/tmp/tailscaled.log", "a")
+            subprocess.Popen(
+                [tailscaled_bin,
+                 "--state=/var/lib/tailscale/tailscaled.state",
+                 "--socket=/var/run/tailscale/tailscaled.sock"],
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+            )
+            # Wait up to 10s for socket
+            for _ in range(20):
+                if os.path.exists("/var/run/tailscale/tailscaled.sock"):
+                    break
+                time.sleep(0.5)
+            logger.info("tailscaled started via Popen (kernel TUN mode)")
+
+    # 3. Authenticate
     logger.info("Authenticating with Tailscale network...")
     subprocess.run(
-        [
-            tailscale_bin,
-            "--socket=/var/run/tailscale/tailscaled.sock",
-            "up",
-            f"--authkey={authkey}",
-            f"--hostname={hostname}",
-            "--accept-routes",
-        ],
+        [tailscale_bin, "up",
+         f"--authkey={authkey}",
+         f"--hostname={hostname}",
+         "--accept-routes"],
         check=True,
         timeout=30.0,
     )
 
-    # 4. Read assigned IP and hostname
+    # 4. Read assigned IP
     for _ in range(10):
         ip = get_tailscale_ip()
         hname = get_tailscale_hostname() or ip
         if ip:
-            logger.info("Tailscale connected! IP: %s | Hostname: %s", ip, hname)
+            logger.info("Tailscale connected! IP: %s | Hostname: %s (kernel TUN, direct WireGuard)", ip, hname)
             return ip, hname
         time.sleep(1.0)
 
