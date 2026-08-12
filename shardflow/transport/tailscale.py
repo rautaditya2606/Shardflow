@@ -73,7 +73,9 @@ def setup_tailscale_colab(authkey: str, hostname: str = "shardflow-colab") -> Tu
             timeout=60.0,
         )
 
-    # 2. Create tun device & start daemon with kernel TUN for native Linux network routing
+    # 2. Ensure system state directories and tun device exist
+    os.makedirs("/var/run/tailscale", exist_ok=True)
+    os.makedirs("/var/lib/tailscale", exist_ok=True)
     os.makedirs("/dev/net", exist_ok=True)
     if not os.path.exists("/dev/net/tun"):
         try:
@@ -81,29 +83,40 @@ def setup_tailscale_colab(authkey: str, hostname: str = "shardflow-colab") -> Tu
         except Exception:
             pass
 
+    tailscaled_bin = shutil.which("tailscaled") or "/usr/sbin/tailscaled"
+    tailscale_bin = shutil.which("tailscale") or "/usr/bin/tailscale"
+
     # Check if tailscaled is already running
     p_check = subprocess.run(["pgrep", "tailscaled"], capture_output=True)
     if p_check.returncode != 0:
-        # ponytail: try kernel TUN mode first so Linux kernel routes 100.x.y.z natively
+        log_f = open("/tmp/tailscaled.log", "a")
+        # ponytail: start tailscaled with explicit socket and state paths
         try:
             subprocess.Popen(
-                ["tailscaled"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                [tailscaled_bin, "--state=/var/lib/tailscale/tailscaled.state", "--socket=/var/run/tailscale/tailscaled.sock"],
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
             )
         except Exception:
             subprocess.Popen(
-                ["tailscaled", "--tun=userspace-networking"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                [tailscaled_bin, "--tun=userspace-networking", "--state=/var/lib/tailscale/tailscaled.state", "--socket=/var/run/tailscale/tailscaled.sock"],
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
             )
-        time.sleep(2.0)
+        
+        # Wait up to 10s for socket to become ready
+        for _ in range(20):
+            if os.path.exists("/var/run/tailscale/tailscaled.sock"):
+                break
+            time.sleep(0.5)
 
     # 3. Authenticate with ephemeral auth key
     logger.info("Authenticating with Tailscale network...")
     subprocess.run(
         [
-            "tailscale", "up",
+            tailscale_bin,
+            "--socket=/var/run/tailscale/tailscaled.sock",
+            "up",
             f"--authkey={authkey}",
             f"--hostname={hostname}",
             "--accept-routes",
