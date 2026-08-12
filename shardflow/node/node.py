@@ -52,7 +52,7 @@ class PipelineNode:
         listen_port: int = 9000,
         kv_timeout: float = 60.0,
         max_sessions: int = 4,
-        enable_cuda_graphs: bool = False,
+        enable_cuda_graphs: bool = True,
     ):
         self.model_slice = model_slice
         self.is_first_node = is_first_node
@@ -71,12 +71,12 @@ class PipelineNode:
             enable_static_cache=True,
         )
 
-        # Determine node dtype safely
-        node_dtype = torch.float16
+        # Determine and cache node dtype safely (ponytail: cached once on init)
+        self._node_dtype = torch.float16
         if model_slice.layers and len(model_slice.layers) > 0:
             params = list(model_slice.layers[0].parameters())
             if params:
-                node_dtype = params[0].dtype
+                self._node_dtype = params[0].dtype
 
         hidden_size = 2048
         if model_slice.config is not None and hasattr(model_slice.config, "hidden_size"):
@@ -92,7 +92,7 @@ class PipelineNode:
             layers=model_slice.layers,
             hidden_size=hidden_size,
             device=model_slice.device,
-            dtype=node_dtype,
+            dtype=self._node_dtype,
             rotary_emb=model_slice.rotary_emb,
             enabled=enable_cuda_graphs,
         )
@@ -190,8 +190,7 @@ class PipelineNode:
 
     async def _get_stream_client(self, host: str, port: int) -> Optional[NodeClient]:
         """Get or create a cached stream-back client to the Gateway."""
-        # Fast guard: if stream_host is 127.0.0.1/localhost and this worker node is on a remote host, do not connect locally
-        if host in ("127.0.0.1", "localhost", "0.0.0.0"):
+        if not host or not port:
             return None
 
         key = (host, port)
@@ -510,16 +509,11 @@ class PipelineNode:
         device = hidden_states.device
 
         # Lookup or lease static KV cache slot (or dynamic fallback)
-        node_dtype = torch.float16
-        if self.model_slice.layers and len(self.model_slice.layers) > 0:
-            params = list(self.model_slice.layers[0].parameters())
-            if params:
-                node_dtype = params[0].dtype
         cache = self.kv_store.get_or_create(
             session_id,
             config=self.model_slice.config,
             device=self.model_slice.device,
-            dtype=node_dtype,
+            dtype=getattr(self, "_node_dtype", torch.float16),
         )
 
         past_seq_len = 0
