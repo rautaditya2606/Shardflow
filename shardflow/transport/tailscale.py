@@ -117,7 +117,12 @@ def setup_tailscale_colab(authkey: str, hostname: str = "shardflow-colab") -> Tu
 
         # Fallback: userspace mode (TCP-over-proxy, but guaranteed to work)
         if not started_kernel:
-            logger.warning("Kernel TUN mode unavailable — falling back to userspace-networking + SOCKS5")
+            if not os.getenv("TAILSCALE_FORCE_USERSPACE"):
+                logger.warning(
+                    "Tailscale kernel TUN unavailable — falling back to SOCKS5. "
+                    "Expect degraded latency (~200ms RTT vs ~5ms). "
+                    "Set TAILSCALE_FORCE_USERSPACE=1 to suppress this warning."
+                )
             log_f = open("/tmp/tailscaled.log", "a")
             subprocess.Popen(
                 [tailscaled_bin,

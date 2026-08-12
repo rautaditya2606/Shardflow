@@ -376,6 +376,7 @@ class NodeClient:
         self._connected = False
         self.reconnect_count: int = 0
         self.last_hop_latency_ms: float = 0.0
+        self.transport_path: str = "unknown"  # "wireguard" | "socks5" | "loopback"
         self._lock = asyncio.Lock()
 
     async def connect(self, max_retries: int = 15, retry_delay: float = 1.0) -> None:
@@ -407,7 +408,11 @@ class NodeClient:
                 self._connected = True
                 if attempt > 1:
                     self.reconnect_count += 1
-                logger.info("Connected to %s:%d (ssl=%s, reconnects=%d)", self.host, self.port, bool(use_ssl), self.reconnect_count)
+                if connect_host in ("127.0.0.1", "localhost"):
+                    self.transport_path = "loopback"
+                else:
+                    self.transport_path = "wireguard"
+                logger.info("Connected to %s:%d via %s (ssl=%s, reconnects=%d)", self.host, self.port, self.transport_path, bool(use_ssl), self.reconnect_count)
                 return
             except (OSError, asyncio.TimeoutError) as e:
                 # SOCKS5 fallback: only for Tailscale IPs when kernel TUN is unavailable (userspace mode)
@@ -423,7 +428,13 @@ class NodeClient:
                         self._connected = True
                         if attempt > 1:
                             self.reconnect_count += 1
-                        logger.info("Connected to %s:%d via SOCKS5 (Tailscale userspace mode)", self.host, self.port)
+                        self.transport_path = "socks5"
+                        logger.warning(
+                            "Connected to %s:%d via SOCKS5 (Tailscale userspace mode). "
+                            "Expect ~200ms RTT per token vs ~5ms with kernel TUN. "
+                            "Check tailscaled logs at /tmp/tailscaled.log for kernel TUN failure reason.",
+                            self.host, self.port,
+                        )
                         return
                     except Exception as s_err:
                         last_err = s_err

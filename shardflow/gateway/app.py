@@ -297,6 +297,14 @@ async def cancel_session(session_id: str):
     raise HTTPException(status_code=503, detail="Orchestrator not ready")
 
 
+@app.get("/debug/transport")
+async def debug_transport():
+    """Return the active transport path of the node0 connection (wireguard / socks5 / loopback / unknown)."""
+    if _orchestrator and _orchestrator._node0_client:
+        return {"node0_transport_path": _orchestrator._node0_client.transport_path}
+    return {"node0_transport_path": "unknown"}
+
+
 @app.on_event("startup")
 async def startup_event():
     """
