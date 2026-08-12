@@ -174,43 +174,60 @@ def setup_tailscale_kaggle(authkey: str, hostname: str = "shardflow-kaggle") -> 
     tailscaled_path = os.path.join(bin_dir, "tailscaled")
     tailscale_path = os.path.join(bin_dir, "tailscale")
 
-    if not os.path.exists(tailscale_path):
+    # 1. Download and extract static binaries cleanly
+    if not os.path.exists(tailscale_path) or not os.path.exists(tailscaled_path):
         logger.info("Downloading static Tailscale userspace binaries...")
         tar_url = "https://pkgs.tailscale.com/stable/tailscale_latest_amd64.tgz"
         subprocess.run(
-            f"curl -sL {tar_url} | tar -xz -C /tmp && cp /tmp/tailscale_*_amd64/* {bin_dir}/",
+            f"curl -sL {tar_url} | tar -xz -C /tmp && cp -f /tmp/tailscale_*_amd64/tailscale* {bin_dir}/ 2>/dev/null || cp -f /tmp/tailscale_*_amd64/tailscale /tmp/tailscale_*_amd64/tailscaled {bin_dir}/",
             shell=True,
             check=True,
             timeout=60.0,
         )
+        os.chmod(tailscale_path, 0o755)
+        os.chmod(tailscaled_path, 0o755)
 
-    # Start tailscaled in userspace mode
+    # 2. Start tailscaled in userspace mode if not running
+    socket_path = "/tmp/tailscaled.sock"
     p_check = subprocess.run(["pgrep", "tailscaled"], capture_output=True)
     if p_check.returncode != 0:
+        log_f = open("/tmp/tailscaled.log", "a")
         subprocess.Popen(
-            [tailscaled_path, "--tun=userspace-networking", "--socks5-server=localhost:1055"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            [
+                tailscaled_path,
+                "--tun=userspace-networking",
+                "--socks5-server=localhost:1055",
+                "--state=/tmp/tailscaled.state",
+                f"--socket={socket_path}",
+            ],
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
         )
-        time.sleep(2.0)
+        for _ in range(20):
+            if os.path.exists(socket_path):
+                break
+            time.sleep(0.5)
 
-    # Authenticate
-    logger.info("Authenticating Kaggle node with Tailscale...")
-    subprocess.run(
-        [
-            tailscale_path, "up",
-            f"--authkey={authkey}",
-            f"--hostname={hostname}",
-        ],
-        check=True,
-        timeout=30.0,
-    )
+    # 3. Authenticate if not already connected
+    curr_ip = get_tailscale_ip()
+    if not curr_ip:
+        logger.info("Authenticating Kaggle node with Tailscale...")
+        subprocess.run(
+            [
+                tailscale_path,
+                f"--socket={socket_path}",
+                "up",
+                f"--authkey={authkey}",
+                f"--hostname={hostname}",
+            ],
+            check=True,
+            timeout=30.0,
+        )
 
-    for _ in range(10):
-        status = get_tailscale_status()
-        if status and "Self" in status and "TailscaleIPs" in status["Self"]:
-            ip = status["Self"]["TailscaleIPs"][0]
-            hname = status["Self"].get("DNSName", "").rstrip(".") or ip
+    for _ in range(15):
+        ip = get_tailscale_ip()
+        hname = get_tailscale_hostname() or ip
+        if ip:
             logger.info("Kaggle Tailscale connected! IP: %s | Hostname: %s", ip, hname)
             return ip, hname
         time.sleep(1.0)
