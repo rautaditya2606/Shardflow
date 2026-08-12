@@ -301,6 +301,59 @@ def get_local_machine_ips() -> set[str]:
     return _local_ips_cache
 
 
+async def _open_socks5_connection(
+    target_host: str,
+    target_port: int,
+    proxy_host: str = "127.0.0.1",
+    proxy_port: int = 1055,
+    timeout: float = 5.0,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """
+    Open a TCP stream through the local Tailscale SOCKS5 proxy.
+    Used as a transparent fallback when kernel TUN mode is unavailable (userspace mode).
+    With kernel TUN mode, asyncio.open_connection() to 100.x.x.x routes through WireGuard
+    directly and this function is never called.
+    """
+    import socket
+    import struct
+
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(proxy_host, proxy_port),
+        timeout=timeout,
+    )
+    writer.write(b"\x05\x01\x00")
+    await writer.drain()
+    res = await reader.readexactly(2)
+    if res != b"\x05\x00":
+        writer.close()
+        raise ConnectionError(f"SOCKS5 auth failed: {res}")
+
+    try:
+        ip_bytes = socket.inet_aton(target_host)
+        req = b"\x05\x01\x00\x01" + ip_bytes + struct.pack("!H", target_port)
+    except Exception:
+        host_bytes = target_host.encode("ascii")
+        req = b"\x05\x01\x00\x03" + struct.pack("!B", len(host_bytes)) + host_bytes + struct.pack("!H", target_port)
+
+    writer.write(req)
+    await writer.drain()
+    resp = await reader.readexactly(4)
+    if resp[1] != 0:
+        writer.close()
+        raise ConnectionError(f"SOCKS5 connect failed (code={resp[1]})")
+
+    atyp = resp[3]
+    if atyp == 1:
+        await reader.readexactly(4 + 2)
+    elif atyp == 3:
+        dlen = (await reader.readexactly(1))[0]
+        await reader.readexactly(dlen + 2)
+    elif atyp == 4:
+        await reader.readexactly(16 + 2)
+
+    return reader, writer
+
+
 class NodeClient:
     """
     Async TCP client for connecting to a pipeline node with zero-latency transport optimizations
@@ -341,23 +394,42 @@ class NodeClient:
         logger.info("Connecting to %s:%d ...", connect_host, self.port)
         use_ssl = True if self.port == 443 else None
         last_err = None
+        is_tailscale_ip = connect_host.startswith("100.") or ".ts.net" in connect_host
         for attempt in range(1, max_retries + 1):
             try:
-                # Direct TCP connection
+                # Direct TCP — with kernel TUN, 100.x.x.x routes through WireGuard natively
                 self._reader, self._writer = await asyncio.wait_for(
                     asyncio.open_connection(connect_host, self.port, ssl=use_ssl),
                     timeout=self.send_timeout,
                 )
                 sock = self._writer.get_extra_info("socket")
                 _configure_socket_options(sock)
-
                 self._connected = True
                 if attempt > 1:
                     self.reconnect_count += 1
                 logger.info("Connected to %s:%d (ssl=%s, reconnects=%d)", self.host, self.port, bool(use_ssl), self.reconnect_count)
                 return
             except (OSError, asyncio.TimeoutError) as e:
-                last_err = e
+                # SOCKS5 fallback: only for Tailscale IPs when kernel TUN is unavailable (userspace mode)
+                if is_tailscale_ip:
+                    try:
+                        self._reader, self._writer = await _open_socks5_connection(
+                            target_host=connect_host,
+                            target_port=self.port,
+                            timeout=self.send_timeout,
+                        )
+                        sock = self._writer.get_extra_info("socket")
+                        _configure_socket_options(sock)
+                        self._connected = True
+                        if attempt > 1:
+                            self.reconnect_count += 1
+                        logger.info("Connected to %s:%d via SOCKS5 (Tailscale userspace mode)", self.host, self.port)
+                        return
+                    except Exception as s_err:
+                        last_err = s_err
+                else:
+                    last_err = e
+
                 if attempt < max_retries:
                     logger.debug(
                         "Connect to %s:%d failed (attempt %d/%d): %s. Retrying in %.1fs...",
