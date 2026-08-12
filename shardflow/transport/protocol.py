@@ -84,6 +84,8 @@ class TensorMessage:
     finish_reason: Optional[str] = None   # Finish reason: "stop", "length", None
     stream_back_host: Optional[str] = None     # Host address to stream generated tokens to
     stream_back_port: Optional[int] = None     # Port address to stream generated tokens to
+    accepted_count: int = 1                    # Number of accepted speculative tokens
+    draft_tokens: Optional[list[int]] = None   # Speculative candidate token IDs
 
 
 
@@ -145,11 +147,11 @@ def encode_message(msg: TensorMessage) -> bytes:
         return bytes(buf)
 
     elif msg.msg_type == MessageType.TOKEN_ID:
-        payload_len = HEADER_SIZE + 8
+        payload_len = HEADER_SIZE + 8 + 4
         buf = bytearray(LENGTH_PREFIX_SIZE + payload_len)
         struct.pack_into(LENGTH_PREFIX_FMT, buf, 0, payload_len)
         struct.pack_into(HEADER_FMT, buf, LENGTH_PREFIX_SIZE, msg.msg_type, session_id_bytes, send_ts)
-        struct.pack_into("<q", buf, LENGTH_PREFIX_SIZE + HEADER_SIZE, msg.token_id or 0)
+        struct.pack_into("<qI", buf, LENGTH_PREFIX_SIZE + HEADER_SIZE, msg.token_id or 0, msg.accepted_count or 1)
         return bytes(buf)
 
     elif msg.msg_type == MessageType.STREAM_TOKEN:
@@ -270,7 +272,16 @@ def decode_message(data: bytes) -> TensorMessage:
 
     if msg_type == MessageType.TOKEN_ID:
         token_id = struct.unpack_from("<q", data, offset)[0]
-        return TensorMessage(msg_type=msg_type, session_id=session_id, send_ts_us=send_ts_us, token_id=token_id)
+        accepted_count = 1
+        if len(data) >= offset + 12:
+            accepted_count = struct.unpack_from("<I", data, offset + 8)[0]
+        return TensorMessage(
+            msg_type=msg_type,
+            session_id=session_id,
+            send_ts_us=send_ts_us,
+            token_id=token_id,
+            accepted_count=accepted_count,
+        )
 
     if msg_type == MessageType.STREAM_TOKEN:
         token_id, is_eos_val, reason_raw = struct.unpack_from("<qB16s", data, offset)
@@ -343,12 +354,12 @@ def decode_message(data: bytes) -> TensorMessage:
     # Parse tensor metadata
     shape, dtype, offset = _decode_tensor_meta(data, offset)
 
-    # Parse tensor bytes — zero-copy from writable buffer
+    # Parse tensor bytes — zero-copy from writable buffer (ponytail: no redundant clone)
     numel = 1
     for dim in shape:
         numel *= dim
     mutable_data = bytearray(data)
-    tensor = torch.frombuffer(mutable_data, dtype=dtype, count=numel, offset=offset).reshape(shape).clone()
+    tensor = torch.frombuffer(mutable_data, dtype=dtype, count=numel, offset=offset).reshape(shape)
 
     return TensorMessage(
         msg_type=msg_type,

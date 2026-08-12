@@ -53,8 +53,9 @@ def _configure_socket_options(sock: Optional[socket.socket]) -> None:
         except Exception:
             pass
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 131072)
+        # ponytail: 4MB socket buffer fits full 7B prefill activations (~3.5MB) in a single TCP write
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4194304)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4194304)
     except Exception:
         pass
 
@@ -414,13 +415,18 @@ class NodeClient:
         except Exception as e:
             logger.warning("send_recv to %s:%d failed (%s) — reconnecting and retrying...", self.host, self.port, e)
             await self.close()
-            await self.connect(max_retries=5, retry_delay=0.5)
-            await send_message(self._writer, msg)
-            resp = await recv_message(self._reader, timeout=t)
-            now_us = int(time.perf_counter() * 1_000_000)
-            if resp.send_ts_us > 0:
-                self.last_hop_latency_ms = (now_us - resp.send_ts_us) / 1000.0
-            return resp
+            try:
+                await self.connect(max_retries=5, retry_delay=0.5)
+                await send_message(self._writer, msg)
+                resp = await recv_message(self._reader, timeout=t)
+                now_us = int(time.perf_counter() * 1_000_000)
+                if resp.send_ts_us > 0:
+                    self.last_hop_latency_ms = (now_us - resp.send_ts_us) / 1000.0
+                return resp
+            except Exception:
+                self._connected = False
+                await self.close()
+                raise
 
     async def close(self) -> None:
         """Close the connection cleanly."""

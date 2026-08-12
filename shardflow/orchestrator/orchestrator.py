@@ -437,6 +437,47 @@ class Orchestrator:
             except Exception:
                 pass
 
+    async def start_session_v2(
+        self,
+        prompt: str,
+        max_tokens: int = 100,
+        temperature: float = 0.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        stream_back_host: Optional[str] = None,
+        stream_back_port: Optional[int] = None,
+        session_id: Optional[str] = None,
+    ) -> str:
+        """
+        v2 Data-Plane: Fire-and-forget START_SESSION message to Node 0.
+        Node 0 drives the full decode loop peer-to-peer across worker nodes.
+        Terminal node streams token IDs back to Gateway (stream_back_host:stream_back_port).
+        Returns session_id. Caller consumes tokens from StreamReceiverServer queue.
+        """
+        if session_id is None:
+            session_id = str(uuid.uuid4())
+        await self._ensure_node0_connected()
+
+        # Tokenize prompt
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        prompt_tokens = inputs["input_ids"][0].tolist()
+
+        start_msg = TensorMessage(
+            msg_type=MessageType.START_SESSION,
+            session_id=session_id,
+            prompt_tokens=prompt_tokens,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            eos_token_id=self.tokenizer.eos_token_id,
+            stream_back_host=stream_back_host,
+            stream_back_port=stream_back_port,
+        )
+        # Fire-and-forget send to Node 0 (ponytail: non-blocking, gateway immediately reads stream queue)
+        await self._node0_client.send(start_msg)
+        return session_id
+
     async def shutdown(self) -> None:
         """Disconnect from all nodes."""
         if self._node0_client:

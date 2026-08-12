@@ -122,6 +122,12 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created_ts = int(time.time())
 
+    # Check if v2 data plane stream host is configured
+    import os
+    stream_host = os.getenv("SHARDFLOW_STREAM_HOST")
+    ttft_timeout = float(os.getenv("SHARDFLOW_TTFT_TIMEOUT", "45.0"))
+    per_token_timeout = float(os.getenv("SHARDFLOW_PER_TOKEN_TIMEOUT", "5.0"))
+
     # Handle streaming SSE response
     if req.stream:
         async def event_generator() -> AsyncGenerator[str, None]:
@@ -134,22 +140,67 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
             yield f"data: {json.dumps(role_chunk.model_dump())}\n\n"
 
             try:
-                async for token_text in _orchestrator.generate_stream(
-                    prompt=prompt,
-                    max_tokens=req.max_tokens or 100,
-                    temperature=req.temperature if req.temperature is not None else 0.0,
-                    top_k=req.top_k or 0,
-                    top_p=req.top_p if req.top_p is not None else 1.0,
-                ):
-                    if await raw_request.is_disconnected():
-                        break
-                    chunk = ChatCompletionChunk(
-                        id=completion_id,
-                        created=created_ts,
-                        model=req.model,
-                        choices=[ChunkChoice(index=0, delta=DeltaMessage(content=token_text), finish_reason=None)],
-                    )
-                    yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+                if stream_host:
+                    # v2 Data-Plane: Terminal node streams tokens directly to Gateway StreamReceiverServer
+                    receiver = await get_stream_receiver()
+                    session_id = str(uuid.uuid4())
+                    stream_q = receiver.register_session(session_id)
+                    try:
+                        await _orchestrator.start_session_v2(
+                            prompt=prompt,
+                            max_tokens=req.max_tokens or 100,
+                            temperature=req.temperature if req.temperature is not None else 0.0,
+                            top_k=req.top_k or 0,
+                            top_p=req.top_p if req.top_p is not None else 1.0,
+                            stream_back_host=stream_host,
+                            stream_back_port=receiver.bound_port,
+                            session_id=session_id,
+                        )
+
+                        first_token = True
+                        while True:
+                            timeout = ttft_timeout if first_token else per_token_timeout
+                            try:
+                                token_msg = await asyncio.wait_for(stream_q.get(), timeout=timeout)
+                            except asyncio.TimeoutError:
+                                logger.warning("Stream timeout for session %s (first=%s)", session_id, first_token)
+                                break
+
+                            first_token = False
+                            if token_msg.is_eos or (token_msg.finish_reason is not None and token_msg.finish_reason != ""):
+                                break
+
+                            token_text = _orchestrator.tokenizer.decode([token_msg.token_id])
+                            if await raw_request.is_disconnected():
+                                break
+
+                            chunk = ChatCompletionChunk(
+                                id=completion_id,
+                                created=created_ts,
+                                model=req.model,
+                                choices=[ChunkChoice(index=0, delta=DeltaMessage(content=token_text), finish_reason=None)],
+                            )
+                            yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+                    finally:
+                        receiver.unregister_session(session_id)
+                else:
+                    # v1 Fallback: Gateway-driven token decode loop
+                    async for token_text in _orchestrator.generate_stream(
+                        prompt=prompt,
+                        max_tokens=req.max_tokens or 100,
+                        temperature=req.temperature if req.temperature is not None else 0.0,
+                        top_k=req.top_k or 0,
+                        top_p=req.top_p if req.top_p is not None else 1.0,
+                    ):
+                        if await raw_request.is_disconnected():
+                            break
+                        chunk = ChatCompletionChunk(
+                            id=completion_id,
+                            created=created_ts,
+                            model=req.model,
+                            choices=[ChunkChoice(index=0, delta=DeltaMessage(content=token_text), finish_reason=None)],
+                        )
+                        yield f"data: {json.dumps(chunk.model_dump())}\n\n"
             except Exception:
                 logger.exception("Error during streaming generation")
 
@@ -166,14 +217,45 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
 
     # Non-streaming JSON response
     try:
-        completion_text = await _orchestrator.generate(
-            prompt=prompt,
-            max_tokens=req.max_tokens or 100,
-            temperature=req.temperature if req.temperature is not None else 0.0,
-            top_k=req.top_k or 0,
-            top_p=req.top_p if req.top_p is not None else 1.0,
-            stream=False,
-        )
+        if stream_host:
+            # v2 Data-Plane non-streaming path
+            receiver = await get_stream_receiver()
+            session_id = str(uuid.uuid4())
+            stream_q = receiver.register_session(session_id)
+            tokens = []
+            try:
+                await _orchestrator.start_session_v2(
+                    prompt=prompt,
+                    max_tokens=req.max_tokens or 100,
+                    temperature=req.temperature if req.temperature is not None else 0.0,
+                    top_k=req.top_k or 0,
+                    top_p=req.top_p if req.top_p is not None else 1.0,
+                    stream_back_host=stream_host,
+                    stream_back_port=receiver.bound_port,
+                    session_id=session_id,
+                )
+
+                first_token = True
+                while True:
+                    timeout = ttft_timeout if first_token else per_token_timeout
+                    token_msg = await asyncio.wait_for(stream_q.get(), timeout=timeout)
+                    first_token = False
+                    if token_msg.is_eos or (token_msg.finish_reason is not None and token_msg.finish_reason != ""):
+                        break
+                    tokens.append(token_msg.token_id)
+            finally:
+                receiver.unregister_session(session_id)
+            completion_text = _orchestrator.tokenizer.decode(tokens, skip_special_tokens=True)
+        else:
+            # v1 Fallback non-streaming path
+            completion_text = await _orchestrator.generate(
+                prompt=prompt,
+                max_tokens=req.max_tokens or 100,
+                temperature=req.temperature if req.temperature is not None else 0.0,
+                top_k=req.top_k or 0,
+                top_p=req.top_p if req.top_p is not None else 1.0,
+                stream=False,
+            )
     except Exception as e:
         logger.exception("Error during non-streaming generation: %s", e)
         raise HTTPException(
