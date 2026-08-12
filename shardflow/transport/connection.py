@@ -376,57 +376,60 @@ class NodeClient:
 
     async def send(self, msg: TensorMessage) -> None:
         """Send a message to the connected node with transparent auto-reconnect."""
-        await self.ensure_connected()
-        try:
-            await send_message(self._writer, msg)
-        except Exception as e:
-            logger.warning("Send to %s:%d failed (%s) — reconnecting...", self.host, self.port, e)
-            await self.close()
-            await self.connect(max_retries=5, retry_delay=0.5)
-            await send_message(self._writer, msg)
+        async with self._lock:
+            await self.ensure_connected()
+            try:
+                await send_message(self._writer, msg)
+            except Exception as e:
+                logger.warning("Send to %s:%d failed (%s) — reconnecting...", self.host, self.port, e)
+                await self.close()
+                await self.connect(max_retries=5, retry_delay=0.5)
+                await send_message(self._writer, msg)
 
     async def recv(self) -> TensorMessage:
         """Receive a message from the connected node and record hop latency."""
         import time
-        if not self.is_connected:
-            raise ConnectionError("Not connected. Call connect() first.")
-        try:
-            msg = await recv_message(self._reader, timeout=self.recv_timeout)
-            now_us = int(time.perf_counter() * 1_000_000)
-            if msg.send_ts_us > 0:
-                self.last_hop_latency_ms = (now_us - msg.send_ts_us) / 1000.0
-            return msg
-        except Exception:
-            self._connected = False
-            raise
+        async with self._lock:
+            if not self.is_connected:
+                raise ConnectionError("Not connected. Call connect() first.")
+            try:
+                msg = await recv_message(self._reader, timeout=self.recv_timeout)
+                now_us = int(time.perf_counter() * 1_000_000)
+                if msg.send_ts_us > 0:
+                    self.last_hop_latency_ms = (now_us - msg.send_ts_us) / 1000.0
+                return msg
+            except Exception:
+                self._connected = False
+                raise
 
     async def send_recv(self, msg: TensorMessage, timeout: Optional[float] = None) -> TensorMessage:
         """Send a message and wait for response with automatic transparent retry on dead sockets."""
         import time
-        t = timeout if timeout is not None else self.recv_timeout
-        try:
-            await self.ensure_connected()
-            await send_message(self._writer, msg)
-            resp = await recv_message(self._reader, timeout=t)
-            now_us = int(time.perf_counter() * 1_000_000)
-            if resp.send_ts_us > 0:
-                self.last_hop_latency_ms = (now_us - resp.send_ts_us) / 1000.0
-            return resp
-        except Exception as e:
-            logger.warning("send_recv to %s:%d failed (%s) — reconnecting and retrying...", self.host, self.port, e)
-            await self.close()
+        async with self._lock:
+            t = timeout if timeout is not None else self.recv_timeout
             try:
-                await self.connect(max_retries=5, retry_delay=0.5)
+                await self.ensure_connected()
                 await send_message(self._writer, msg)
                 resp = await recv_message(self._reader, timeout=t)
                 now_us = int(time.perf_counter() * 1_000_000)
                 if resp.send_ts_us > 0:
                     self.last_hop_latency_ms = (now_us - resp.send_ts_us) / 1000.0
                 return resp
-            except Exception:
-                self._connected = False
+            except Exception as e:
+                logger.warning("send_recv to %s:%d failed (%s) — reconnecting and retrying...", self.host, self.port, e)
                 await self.close()
-                raise
+                try:
+                    await self.connect(max_retries=5, retry_delay=0.5)
+                    await send_message(self._writer, msg)
+                    resp = await recv_message(self._reader, timeout=t)
+                    now_us = int(time.perf_counter() * 1_000_000)
+                    if resp.send_ts_us > 0:
+                        self.last_hop_latency_ms = (now_us - resp.send_ts_us) / 1000.0
+                    return resp
+                except Exception:
+                    self._connected = False
+                    await self.close()
+                    raise
 
     async def close(self) -> None:
         """Close the connection cleanly."""
