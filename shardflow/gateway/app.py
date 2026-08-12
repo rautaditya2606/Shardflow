@@ -76,18 +76,13 @@ async def get_stream_receiver():
 
 
 def _format_prompt(messages: list) -> str:
-    """Format messages list into a plain text prompt."""
+    """Format messages list into ChatML compliant prompt."""
     prompt_parts = []
     for msg in messages:
         role = msg.role.lower()
         content = msg.content.strip()
-        if role == "system":
-            prompt_parts.append(f"System: {content}\n")
-        elif role == "user":
-            prompt_parts.append(f"User: {content}\n")
-        elif role == "assistant":
-            prompt_parts.append(f"Assistant: {content}\n")
-    prompt_parts.append("Assistant:")
+        prompt_parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
+    prompt_parts.append("<|im_start|>assistant\n")
     return "\n".join(prompt_parts)
 
 

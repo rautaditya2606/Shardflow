@@ -193,6 +193,18 @@ print()
 | **Overall End-to-End Throughput** | Render Gateway $\rightarrow$ `bore.pub` TCP Tunnels $\rightarrow$ Client | **2.87 tok/s** |
 | **Completion Reliability** | 40/40 Tokens Generated | **100% (0 transport errors)** |
 
+### 3. Model: Qwen/Qwen2.5-14B-Instruct (2 Google Colab T4 GPUs + 4-Bit NF4 + Render Gateway + `bore.pub`)
+
+| Benchmark Metric | Setup | Result |
+|---|---|---|
+| **Total Model Layers** | 48 Transformer Layers across 2 Colab T4 Nodes | **48 Layers** |
+| **Auto-Partition Split** | Colab 1 (`[0, 24)`), Colab 2 (`[24, 48)` + LM Head) | **24 / 24 Layers** |
+| **Quantization** | In-Place 4-Bit NF4 (bitsandbytes zero-RAM meta slicing) | **4-Bit NF4** |
+| **VRAM Footprint** | ~4.2 GB per Colab T4 GPU (leaves >10 GB free) | **~28% T4 VRAM Capacity** |
+| **End-to-End Latency** | 100 Tokens Generated (Non-Streaming OpenAI Spec) | **49.92s** |
+| **Throughput (TPS)** | Continuous WAN token generation over `bore.pub` | **2.00 tok/s** |
+| **Completion Reliability** | 100/100 Tokens Generated (TCP Keepalive & Auto-Reconnect) | **100% (0 transport disconnects)** |
+
 ### 4. Model: Qwen/Qwen2.5-14B-Instruct (3 Google Colab T4 GPUs + Render Gateway + `bore.pub`)
 
 | Benchmark Metric | Setup | Result |
@@ -202,6 +214,22 @@ print()
 | **VRAM Footprint** | ~5.2 GB per Colab T4 GPU | **~35% T4 VRAM Capacity** |
 | **End-to-End Latency** | 60 Tokens Generated | **43.18s (1.39 tok/s)** |
 | **Completion Reliability** | 60/60 Tokens Generated | **100% (0 transport errors)** |
+
+---
+
+### Latency Breakdown per Token (Public WAN vs GPU Compute)
+
+During cross-cloud execution (Render Gateway $\leftrightarrow$ Colab $1 \leftrightarrow$ Colab $2$), the per-token latency breaks down as follows:
+
+| Stage | Execution Component | Latency (ms) | % of Token Time |
+|---|---|---|---|
+| **Hop 1** | Render Gateway $\rightarrow$ `bore.pub` $\rightarrow$ Colab 1 (Token/Embeddings) | **~85 ms** | 17% |
+| **GPU Compute 1** | Colab 1: 24 Transformer Layers on T4 (NF4 GEMM) | **~70 ms** | 14% |
+| **Hop 2** | Colab 1 $\rightarrow$ `bore.pub` $\rightarrow$ Colab 2 (Intermediate Activations) | **~105 ms** | 21% |
+| **GPU Compute 2** | Colab 2: 24 Layers + RMSNorm + LM Head + GPU Sampling | **~80 ms** | 16% |
+| **Hop 3** | Colab 2 $\rightarrow$ Colab 1 $\rightarrow$ Render Gateway (Token ID Response) | **~95 ms** | 19% |
+| **TCP / Proxy Queuing** | Multiplexer framing, socket buffering, kernel context switches | **~65 ms** | 13% |
+| **TOTAL** | **Full 1-Token Round-Trip across Global Clouds** | **~500 ms** | **100% (2.00 tok/s)** |
 
 ---
 
