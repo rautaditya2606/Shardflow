@@ -73,7 +73,7 @@ def setup_tailscale_colab(authkey: str, hostname: str = "shardflow-colab") -> Tu
             timeout=60.0,
         )
 
-    # 2. Create tun device & start daemon in background
+    # 2. Create tun device & start daemon with kernel TUN for native Linux network routing
     os.makedirs("/dev/net", exist_ok=True)
     if not os.path.exists("/dev/net/tun"):
         try:
@@ -84,11 +84,19 @@ def setup_tailscale_colab(authkey: str, hostname: str = "shardflow-colab") -> Tu
     # Check if tailscaled is already running
     p_check = subprocess.run(["pgrep", "tailscaled"], capture_output=True)
     if p_check.returncode != 0:
-        subprocess.Popen(
-            ["tailscaled", "--tun=userspace-networking"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        # ponytail: try kernel TUN mode first so Linux kernel routes 100.x.y.z natively
+        try:
+            subprocess.Popen(
+                ["tailscaled"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            subprocess.Popen(
+                ["tailscaled", "--tun=userspace-networking"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         time.sleep(2.0)
 
     # 3. Authenticate with ephemeral auth key
