@@ -165,13 +165,15 @@ print()
 
 ## Key Architecture & Performance Features
 
-1. **Dynamic Registration Barrier & Fallback Timeout**: Workers send `--expected-nodes N` during registration. As soon as $N$ nodes connect, the registry calculates layer boundaries **instantly** (0s delay). If a node fails to connect, a 60s fallback timeout partitions across active available nodes instead of hanging.
-2. **VRAM-Weighted Auto-Partitioning**: `AutoPartitionEngine` dynamically calculates layer boundaries based on available VRAM and deducts LM head overhead for the terminal node.
-3. **Zero-RAM Meta-Device Slicing**: Model skeletons instantiate on PyTorch `meta` device in 0.00s with **0 MB CPU RAM overhead**, loading safetensors directly into assigned layer slices.
-4. **Single-Buffer Fast Tensor Serialization**: Replaced slow PyTorch element-wise storage loops with C-level numpy view reinterpret (`tensor.view(torch.uint8).cpu().numpy().tobytes()`), reducing tensor serialization overhead to **0.005ms (700x faster)**.
-5. **GPU-Side Token Sampling**: Terminal node samples tokens directly on GPU logits and returns an **8-byte `TOKEN_ID`** message, reducing reverse transport overhead.
-6. **Auto-Reconnect & SSL Auto-Detection**: `NodeClient` detects closed transports (`writer.is_closing()`) and auto-reconnects, while auto-detecting TLS/SSL for port 443 endpoints.
-7. **Control / Data Plane Primitive (`START_SESSION`)**: Supports protocol primitive for peer-to-peer session delegation (`MessageType.START_SESSION`).
+1. **v2 Peer-to-Peer Data Plane (`START_SESSION`)**: The Gateway sends session metadata *once* to Node 0. Node 0 drives the entire decode loop peer-to-peer across worker GPU nodes, while terminal Node $N$ streams token IDs asynchronously back to the Gateway's `StreamReceiverServer`. This eliminates Gateway round-trip chattiness and cuts per-token WAN hops in half.
+2. **Two-Phase Session Timeouts (`TTFT_TIMEOUT` & `PER_TOKEN_TIMEOUT`)**: Handles cold-start prefill and JIT compilation gracefully (45s TTFT) while enforcing strict 5s steady-state decode timeouts to detect hung or crashed workers immediately.
+3. **Tailscale Direct WireGuard Mesh (`--tailscale-authkey`)**: Replaces public reverse tunnels with direct P2P WireGuard UDP networking, reducing cross-node RTT from ~200ms to <5ms intra-cloud.
+4. **CUDA Graphs by Default**: Captures static execution graphs during node initialization for near-instant (<10 µs) GPU kernel replay, eliminating CPU-GPU driver launch jitter.
+5. **4 MB High-Throughput Socket Buffers**: Pre-tuned socket buffers (`SO_SNDBUF` / `SO_RCVBUF` = 4 MB) prevent packet stalls when transmitting multi-megabyte prefill hidden state tensors.
+6. **VRAM-Weighted Auto-Partitioning**: `AutoPartitionEngine` dynamically calculates layer boundaries based on available VRAM and deducts LM head overhead for the terminal node.
+7. **Zero-RAM Meta-Device Slicing**: Model skeletons instantiate on PyTorch `meta` device in 0.00s with **0 MB CPU RAM overhead**, loading safetensors directly into assigned layer slices.
+8. **Native FP16 on Dual-T4 GPUs**: Fits 7B parameter models in native FP16 across 2× T4 GPUs (6.3 GB & 7.4 GB VRAM) without bitsandbytes NF4 dequantization overhead.
+9. **Speculative Decoding Framework**: Supports local draft models (e.g. `Qwen2.5-0.5B`) on Node 0 with `replay_verify()` to generate and verify $K=4$ candidate tokens per network roundtrip.
 
 ---
 
