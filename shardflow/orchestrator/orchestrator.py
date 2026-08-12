@@ -376,11 +376,12 @@ class Orchestrator:
             for chunk_start in range(0, prompt_len, 512):
                 chunk_end = min(prompt_len, chunk_start + 512)
                 chunk = input_ids[:, chunk_start:chunk_end]
+                hidden_states = self._embed(chunk)  # embed before sending — nodes expect float activations
                 is_final_chunk = (chunk_end == prompt_len)
                 msg = TensorMessage(
                     msg_type=MessageType.ACTIVATION,
                     session_id=session_id,
-                    tensor=chunk.cpu(),
+                    tensor=hidden_states.cpu(),
                     temperature=temperature,
                     top_k=top_k,
                     top_p=top_p,
@@ -407,10 +408,11 @@ class Orchestrator:
                 if next_token == self.tokenizer.eos_token_id:
                     break
 
+                hidden_states = self._embed(torch.tensor([[next_token]], dtype=torch.long))
                 msg = TensorMessage(
                     msg_type=MessageType.ACTIVATION,
                     session_id=session_id,
-                    tensor=torch.tensor([[next_token]], dtype=torch.long),
+                    tensor=hidden_states.cpu(),
                     temperature=temperature,
                     top_k=top_k,
                     top_p=top_p,
