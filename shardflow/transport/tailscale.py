@@ -90,19 +90,19 @@ def setup_tailscale_colab(authkey: str, hostname: str = "shardflow-colab") -> Tu
     p_check = subprocess.run(["pgrep", "tailscaled"], capture_output=True)
     if p_check.returncode != 0:
         log_f = open("/tmp/tailscaled.log", "a")
-        # ponytail: start tailscaled with explicit socket and state paths
-        try:
-            subprocess.Popen(
-                [tailscaled_bin, "--state=/var/lib/tailscale/tailscaled.state", "--socket=/var/run/tailscale/tailscaled.sock"],
-                stdout=log_f,
-                stderr=subprocess.STDOUT,
-            )
-        except Exception:
-            subprocess.Popen(
-                [tailscaled_bin, "--tun=userspace-networking", "--state=/var/lib/tailscale/tailscaled.state", "--socket=/var/run/tailscale/tailscaled.sock"],
-                stdout=log_f,
-                stderr=subprocess.STDOUT,
-            )
+        # ponytail: userspace-networking with socks5 proxy runs without root/kernel TUN constraints in all containers
+        subprocess.Popen(
+            [
+                tailscaled_bin,
+                "--tun=userspace-networking",
+                "--socks5-server=localhost:1055",
+                "--outbound-http-proxy-listen=localhost:1055",
+                "--state=/var/lib/tailscale/tailscaled.state",
+                "--socket=/var/run/tailscale/tailscaled.sock",
+            ],
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+        )
         
         # Wait up to 10s for socket to become ready
         for _ in range(20):
