@@ -62,8 +62,25 @@ def main():
     parser.add_argument("--tailscale-authkey", default=None, help="Tailscale ephemeral auth key for direct P2P mesh networking")
     parser.add_argument("--draft-model", default=None, help="Small draft model for speculative decoding on Node 0 (e.g. Qwen/Qwen2.5-0.5B-Instruct)")
     parser.add_argument("--spec-k", type=int, default=4, help="Number of speculative candidate draft tokens per verification step (default: 4)")
+    parser.add_argument("--hf-model-id", default=None, help="Hugging Face repo ID if --model is a local path (e.g. Qwen/Qwen2.5-7B-Instruct)")
     parser.add_argument("--force-single-gpu", action="store_true", help="Force single-GPU mode even if multiple GPUs are detected")
     args = parser.parse_args()
+
+    def get_registry_model_id(model_path: str, explicit_id: str = None) -> str:
+        if explicit_id:
+            return explicit_id
+        if not os.path.isabs(model_path) and "/" in model_path and not os.path.exists(model_path):
+            return model_path
+        base = os.path.basename(model_path.rstrip("/")).lower()
+        if "qwen2.5-7b" in base or "qwen2.5-7b" in model_path.lower():
+            return "Qwen/Qwen2.5-7B-Instruct"
+        elif "qwen2.5-0.5b" in base or "qwen2.5-0.5b" in model_path.lower():
+            return "Qwen/Qwen2.5-0.5B-Instruct"
+        elif "tinyllama" in base or "tinyllama" in model_path.lower():
+            return "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        return model_path
+
+    reg_model_id = get_registry_model_id(args.model, args.hf_model_id)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -171,7 +188,7 @@ def main():
             "port": pub_port,
             "vram_available_mb": vram_total,
             "vram_total_mb": vram_total,
-            "model_id": args.model,
+            "model_id": reg_model_id,
             "layer_start": 0,
             "layer_end": total_layers,
             "expected_nodes": 1,
@@ -226,7 +243,7 @@ def main():
         "port": pub_port,
         "vram_available_mb": vram,
         "vram_total_mb": vram,
-        "model_id": args.model,
+        "model_id": reg_model_id,
     }
     if args.expected_nodes is not None:
         reg_payload["expected_nodes"] = args.expected_nodes
