@@ -107,6 +107,17 @@ def benchmark(url="http://127.0.0.1:8000/v1/chat/completions", max_tokens=50, nu
         ttft_results.append(ttft)
         total_time_results.append(total_time)
 
+    # Refresh transport path after warm requests
+    final_transport = get_transport_path(base_url)
+    if final_transport != "unknown":
+        transport = final_transport
+        transport_label = {
+            "wireguard": "✅ WireGuard (direct UDP — ~5ms RTT)",
+            "socks5":    "⚠️  SOCKS5 (userspace proxy — ~200ms RTT) — RESULTS ARE DEGRADED",
+            "loopback":  "🔁 Loopback (same-host)",
+            "unknown":   "❓ Unknown (gateway may not expose /debug/transport yet)",
+        }.get(transport, f"❓ {transport}")
+
     print("\n" + "=" * 65)
     print("📊 BENCHMARK SUMMARY")
     print("=" * 65)
@@ -118,7 +129,7 @@ def benchmark(url="http://127.0.0.1:8000/v1/chat/completions", max_tokens=50, nu
     if transport == "socks5":
         print()
         print("  ⚠️  These results reflect SOCKS5 latency, not GPU throughput.")
-        print("  ⚠️  Re-run after fixing kernel TUN to get real numbers.")
+        print("  ⚠️  Re-run after fixing kernel TUN or running on Kaggle 2x T4 to get real numbers.")
     print("=" * 65)
 
 

@@ -125,8 +125,8 @@ async def chat_completions(req: ChatCompletionRequest, raw_request: Request):
     # Check if v2 data plane stream host is configured
     import os
     stream_host = os.getenv("SHARDFLOW_STREAM_HOST")
-    ttft_timeout = float(os.getenv("SHARDFLOW_TTFT_TIMEOUT", "45.0"))
-    per_token_timeout = float(os.getenv("SHARDFLOW_PER_TOKEN_TIMEOUT", "5.0"))
+    ttft_timeout = float(os.getenv("SHARDFLOW_TTFT_TIMEOUT", "60.0"))
+    per_token_timeout = float(os.getenv("SHARDFLOW_PER_TOKEN_TIMEOUT", "15.0"))
 
     # Handle streaming SSE response
     if req.stream:
@@ -300,8 +300,33 @@ async def cancel_session(session_id: str):
 @app.get("/debug/transport")
 async def debug_transport():
     """Return the active transport path of the node0 connection (wireguard / socks5 / loopback / unknown)."""
-    if _orchestrator and _orchestrator._node0_client:
+    global _orchestrator
+    if _orchestrator and _orchestrator._node0_client and _orchestrator._node0_client.is_connected:
         return {"node0_transport_path": _orchestrator._node0_client.transport_path}
+    # Check if registry has an active Node 0 registered
+    try:
+        from shardflow.registry.app import get_topology
+        topo = get_topology()
+        active_nodes = [n for n in topo.nodes if n.is_active]
+        if active_nodes:
+            n0_addr = active_nodes[0].addr
+            if n0_addr in ("127.0.0.1", "localhost", "0.0.0.0"):
+                return {"node0_transport_path": "loopback"}
+            elif n0_addr.startswith("100.") or ".ts.net" in n0_addr:
+                # Inspect if SOCKS5 proxy is active or native WireGuard interface exists
+                import subprocess, shutil
+                has_tun = False
+                ts_bin = shutil.which("tailscale")
+                if ts_bin:
+                    try:
+                        res = subprocess.run([ts_bin, "status", "--json"], capture_output=True, text=True, timeout=1.0)
+                        if res.returncode == 0 and "TUN" in res.stdout:
+                            has_tun = True
+                    except Exception:
+                        pass
+                return {"node0_transport_path": "wireguard" if has_tun else "socks5"}
+    except Exception:
+        pass
     return {"node0_transport_path": "unknown"}
 
 

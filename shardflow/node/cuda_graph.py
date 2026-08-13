@@ -71,11 +71,11 @@ class CUDAGraphRunner:
         """Return True if a graph exists for this sequence length."""
         if not self.enabled or not self.is_captured:
             return False
-        return seq_len == 1 or seq_len == self.spec_k
+        return seq_len == 1 or seq_len == (self.spec_k + 1)
 
     def capture(self, static_cache: StaticCache) -> bool:
         """
-        Capture CUDA Graphs for [1, 1, D] and [1, K, D] forward passes.
+        Capture CUDA Graphs for [1, 1, D] and [1, K+1, D] forward passes.
         """
         if not self.enabled:
             logger.info("CUDA Graphs disabled or running on non-CUDA device.")
@@ -127,10 +127,11 @@ class CUDAGraphRunner:
                     cache_position=self._static_decode_cache_pos,
                 )
 
-            # 2. Capture Verify Graph [1, K, D]
-            self._static_verify_in = torch.zeros((1, self.spec_k, self.hidden_size), device=self.device, dtype=self.dtype)
-            self._static_verify_pos = torch.arange(self.spec_k, device=self.device, dtype=torch.long).unsqueeze(0)
-            self._static_verify_cache_pos = torch.arange(self.spec_k, device=self.device, dtype=torch.long)
+            # 2. Capture Verify Graph [1, K+1, D]
+            verify_len = self.spec_k + 1
+            self._static_verify_in = torch.zeros((1, verify_len, self.hidden_size), device=self.device, dtype=self.dtype)
+            self._static_verify_pos = torch.arange(verify_len, device=self.device, dtype=torch.long).unsqueeze(0)
+            self._static_verify_cache_pos = torch.arange(verify_len, device=self.device, dtype=torch.long)
 
             if self.rotary_emb is not None:
                 try:
@@ -165,7 +166,7 @@ class CUDAGraphRunner:
                 )
 
             self.is_captured = True
-            logger.info("CUDA Graphs successfully captured for decode [1, 1, D] and verify [1, %d, D]!", self.spec_k)
+            logger.info("CUDA Graphs successfully captured for decode [1, 1, D] and verify [1, %d, D]!", verify_len)
             return True
 
         except Exception as e:
@@ -195,12 +196,13 @@ class CUDAGraphRunner:
         return self._static_decode_out
 
     def replay_verify(self, hidden_states: torch.Tensor, start_position: int) -> torch.Tensor:
-        """Replay captured verify graph for [1, K, D] with dynamic RoPE positioning."""
+        """Replay captured verify graph for [1, K+1, D] with dynamic RoPE positioning."""
         if not self.is_captured or self._verify_graph is None:
             raise RuntimeError("Verify graph not captured")
 
+        verify_len = hidden_states.shape[1]
         self._static_verify_in.copy_(hidden_states)
-        for i in range(self.spec_k):
+        for i in range(verify_len):
             self._static_verify_pos[0, i] = start_position + i
             # ponytail: update cache_position in-place so verify KV writes land correctly
             self._static_verify_cache_pos[i] = start_position + i

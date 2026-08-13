@@ -40,8 +40,8 @@ def test_cuda_graph_runner_decode_and_verify_capture():
     assert captured is True
     assert runner.is_captured is True
     assert runner.can_use_graph(1) is True
-    assert runner.can_use_graph(4) is True
-    assert runner.can_use_graph(5) is False
+    assert runner.can_use_graph(5) is True  # spec_k + 1 candidate sequence length
+    assert runner.can_use_graph(4) is False
 
     # Eager vs Graph replay parity
     test_input = torch.randn((1, 1, config.hidden_size), device=device, dtype=dtype)

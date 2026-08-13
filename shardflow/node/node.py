@@ -278,7 +278,9 @@ class PipelineNode:
         if self.is_last_node:
             if msg.sample_on_node:
                 if msg.draft_tokens:
-                    # ponytail: speculative candidate verification on terminal node
+                    # ponytail: causal speculative candidate verification on terminal node
+                    # Input contains [T_current, d_0, ..., d_{K-1}] (length K+1)
+                    # Output at index i predicts token following candidate_tokens[i] -> compare with drafts[i]
                     drafts = msg.draft_tokens
                     accepted_tokens = []
                     next_token = None
@@ -296,7 +298,7 @@ class PipelineNode:
                             break
 
                     if next_token is None:
-                        # All K drafts verified; bonus sample from final logits
+                        # All K drafts verified; bonus sample from final candidate position (K)
                         next_token = sample_next_token(
                             output[0, -1, :],
                             temperature=msg.temperature,
@@ -319,7 +321,8 @@ class PipelineNode:
                                 past_seq = 0
                         if isinstance(past_seq, torch.Tensor):
                             past_seq = past_seq.item()
-                        rewind_kv_cache(cache, int(past_seq or 0) - len(drafts) + accepted_count)
+                        past_seq_before = int(past_seq or 0) - (len(drafts) + 1)
+                        rewind_kv_cache(cache, past_seq_before + accepted_count)
 
                     # Stream accepted tokens directly to Gateway
                     if msg.stream_back_host and msg.stream_back_port:
@@ -429,8 +432,9 @@ class PipelineNode:
                                 past_seq = 0
                         if isinstance(past_seq, torch.Tensor):
                             past_seq = past_seq.item()
+                        past_seq_before = int(past_seq or 0) - (len(msg.draft_tokens) + 1)
                         accepted_count = response.accepted_count or 1
-                        rewind_kv_cache(cache, int(past_seq or 0) - len(msg.draft_tokens) + accepted_count)
+                        rewind_kv_cache(cache, past_seq_before + accepted_count)
                 return response
             except (asyncio.TimeoutError, ConnectionError, OSError, Exception) as err:
                 logger.error(
@@ -540,11 +544,13 @@ class PipelineNode:
                         top_k=top_k,
                         top_p=top_p,
                     )
-                    draft_tensor = torch.tensor([drafts], dtype=torch.long, device=self.model_slice.device)
+                    # Candidate sequence: [T_current, d_0, ..., d_{K-1}] (length K+1)
+                    candidate_tokens = [next_token] + drafts
+                    cand_tensor = torch.tensor([candidate_tokens], dtype=torch.long, device=self.model_slice.device)
                     if self.model_slice.embed_tokens is not None:
-                        hidden_states = self.model_slice.embed_tokens(draft_tensor)
+                        hidden_states = self.model_slice.embed_tokens(cand_tensor)
                     else:
-                        hidden_states = draft_tensor
+                        hidden_states = cand_tensor
 
                     cache = self.kv_store.get(session_id)
                     past_seq_len = 0
@@ -614,7 +620,7 @@ class PipelineNode:
                             stream_back_port=stream_port,
                             draft_tokens=drafts,
                         )
-                        resp = await self._next_client.send_recv(forward_msg, timeout=15.0)
+                        resp = await self._next_client.send_recv(forward_msg, timeout=20.0)
                         if resp.msg_type == MessageType.TOKEN_ID:
                             next_token = resp.token_id
                             accepted_count = resp.accepted_count or 1
@@ -755,7 +761,7 @@ class PipelineNode:
             # (frozen at prefill end) and all KV writes land on the same slot → gibberish.
             if cache is not None and hasattr(cache, "_seen_tokens"):
                 cache._seen_tokens = past_seq_len + 1
-        elif seq_len == self.graph_runner.spec_k and self.graph_runner.can_use_graph(seq_len):
+        elif seq_len == (self.graph_runner.spec_k + 1) and self.graph_runner.can_use_graph(seq_len):
             # ponytail: fast CUDA Graph replay for speculative verification of K candidate tokens
             hidden_states = self.graph_runner.replay_verify(hidden_states, past_seq_len)
             if cache is not None and hasattr(cache, "_seen_tokens"):
