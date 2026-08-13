@@ -231,9 +231,10 @@ def _get_safetensors_shards_map(model_path: str) -> tuple[Optional[Dict[str, str
     try:
         from huggingface_hub import hf_hub_download, try_to_load_from_cache
         target_cache_dir = "/kaggle/working/hf_home" if os.path.exists("/kaggle") else None
-        index_file = try_to_load_from_cache(repo_id=model_path, filename="model.safetensors.index.json", cache_dir=target_cache_dir)
+        hf_tok = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+        index_file = try_to_load_from_cache(repo_id=model_path, filename="model.safetensors.index.json", cache_dir=target_cache_dir, token=hf_tok)
         if not (isinstance(index_file, (str, Path)) and os.path.exists(index_file)):
-            index_file = hf_hub_download(repo_id=model_path, filename="model.safetensors.index.json", cache_dir=target_cache_dir)
+            index_file = hf_hub_download(repo_id=model_path, filename="model.safetensors.index.json", cache_dir=target_cache_dir, token=hf_tok)
         with open(index_file) as f:
             return json.load(f)["weight_map"], local_dir
     except Exception:
@@ -414,12 +415,13 @@ def load_layer_slice(
             else:
                 from huggingface_hub import hf_hub_download, try_to_load_from_cache
                 target_cache_dir = "/kaggle/working/hf_home" if os.path.exists("/kaggle") else None
-                cached = try_to_load_from_cache(repo_id=model_path, filename=shard_name, cache_dir=target_cache_dir)
+                hf_tok = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+                cached = try_to_load_from_cache(repo_id=model_path, filename=shard_name, cache_dir=target_cache_dir, token=hf_tok)
                 if isinstance(cached, (str, Path)) and os.path.exists(cached):
                     shard_path = str(cached)
                 else:
                     logger.info("Downloading targeted shard %s from HuggingFace Hub (cache_dir=%s)...", shard_name, target_cache_dir)
-                    shard_path = hf_hub_download(repo_id=model_path, filename=shard_name, cache_dir=target_cache_dir)
+                    shard_path = hf_hub_download(repo_id=model_path, filename=shard_name, cache_dir=target_cache_dir, token=hf_tok)
 
             logger.info("Streaming and loading weights from shard %s ...", shard_name)
             from safetensors import safe_open
