@@ -892,6 +892,8 @@ def main():
     parser.add_argument("--reg-layer-end", type=int, default=None, help="Explicit layer_end to register with registry")
     parser.add_argument("--expected-nodes", type=int, default=None, help="Explicit expected cluster node count")
     parser.add_argument("--hf-model-id", default=None, help="Explicit HF repo ID for registry reporting")
+    parser.add_argument("--enable-cuda-graphs", action="store_true", default=True, help="Enable CUDA Graphs (default: True)")
+    parser.add_argument("--no-cuda-graphs", action="store_true", help="Disable CUDA Graphs and run in pure eager mode")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -1005,6 +1007,7 @@ def main():
         next_node_port=next_port,
         listen_host=args.host,
         listen_port=args.port,
+        enable_cuda_graphs=args.enable_cuda_graphs and not args.no_cuda_graphs,
         draft_model=args.draft_model,
         spec_k=args.spec_k,
     )

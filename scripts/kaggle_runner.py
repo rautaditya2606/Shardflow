@@ -137,6 +137,9 @@ def main():
             "--port", str(local_port + 1),
             "--device", "cuda",
         ]
+        if args.no_cuda_graphs:
+            node1_cmd.append("--no-cuda-graphs")
+
         logger.info("Spawning Node 1 isolated subprocess on GPU 1 (port %d)...", local_port + 1)
         node1_proc = subprocess.Popen(node1_cmd, env=node1_env)
 
@@ -177,6 +180,8 @@ def main():
         ]
         if args.draft_model:
             node0_cmd.extend(["--draft-model", args.draft_model, "--spec-k", str(args.spec_k)])
+        if args.no_cuda_graphs:
+            node0_cmd.append("--no-cuda-graphs")
 
         logger.info("Spawning Node 0 isolated subprocess on GPU 0 (port %d)...", local_port)
         node0_proc = subprocess.Popen(node0_cmd, env=node0_env)
