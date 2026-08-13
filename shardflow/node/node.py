@@ -14,6 +14,11 @@ import argparse
 import asyncio
 import logging
 import sys
+import warnings
+# ponytail: suppress transformers' max_cache_len DeprecationWarning — it fires from inside
+# model layer forward passes we don't control (fixed upstream in transformers >= 5.16)
+warnings.filterwarnings("ignore", message=".*max_cache_len.*deprecated.*", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=".*max_cache_len.*deprecated.*", category=FutureWarning)
 from typing import Optional
 
 import torch
@@ -761,7 +766,8 @@ class PipelineNode:
                 key_len = past_seq_len + seq_len
                 if isinstance(cache, StaticCache):
                     try:
-                        max_len = getattr(cache, "max_cache_len", None)
+                        # ponytail: get_max_cache_shape() is the non-deprecated API in newer transformers
+                        max_len = cache.get_max_cache_shape() if hasattr(cache, "get_max_cache_shape") else getattr(cache, "max_cache_len", None)
                         if max_len is not None:
                             key_len = max(key_len, int(max_len))
                     except Exception:

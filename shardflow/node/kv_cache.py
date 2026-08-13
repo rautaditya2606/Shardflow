@@ -44,12 +44,14 @@ class StaticKVSlot:
         self.seq_len: int = 0
 
         # Pre-allocate StaticCache on target device
+        # ponytail: pass device/dtype/max_batch_size via kwargs for forward-compat with
+        # newer transformers that moved these params out of the explicit signature
         self.cache = StaticCache(
             config=config,
-            max_batch_size=1,
             max_cache_len=max_seq_len,
             device=self.device,
             dtype=self.dtype,
+            max_batch_size=1,
         )
 
     def is_free(self) -> bool:
