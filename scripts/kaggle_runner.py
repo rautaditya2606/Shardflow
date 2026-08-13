@@ -124,110 +124,71 @@ def main():
         total_layers = config.num_hidden_layers
         mid_layer = total_layers // 2
 
-        # Diagnostics: inspect RAM consumption before model load
-        try:
-            import psutil
-            proc = psutil.Process(os.getpid())
-            print(f"RAM before load: {proc.memory_info().rss / 1e9:.2f} GB")
-            print(f"System available: {psutil.virtual_memory().available / 1e9:.2f} GB")
-        except Exception as e:
-            logger.debug("psutil error: %s", e)
+        import subprocess, sys, socket
+        # 1. Start Node 1 subprocess (isolated CUDA context on GPU 1)
+        node1_env = os.environ.copy()
+        node1_env["CUDA_VISIBLE_DEVICES"] = "1"
+        node1_cmd = [
+            sys.executable, "-m", "shardflow.node.node",
+            "--model", args.model,
+            "--layer-start", str(mid_layer),
+            "--layer-end", str(total_layers),
+            "--host", "127.0.0.1",
+            "--port", str(local_port + 1),
+            "--device", "cuda",
+        ]
+        logger.info("Spawning Node 1 isolated subprocess on GPU 1 (port %d)...", local_port + 1)
+        node1_proc = subprocess.Popen(node1_cmd, env=node1_env)
 
-        # 1. Load Node 1 slice (cuda:1, layers mid_layer..total_layers + norm + lm_head)
-        logger.info("Loading Node 1 layers [%d, %d) onto device cuda:1...", mid_layer, total_layers)
-        slice1 = load_layer_slice(
-            model_path=args.model,
-            layer_start=mid_layer,
-            layer_end=total_layers,
-            include_norm=True,
-            include_lm_head=True,
-            device="cuda:1",
-            load_in_4bit=args.load_in_4bit,
-        )
-        node1 = PipelineNode(
-            model_slice=slice1,
-            is_first_node=False,
-            is_last_node=True,
-            next_node_host=None,
-            next_node_port=None,
-            listen_host="127.0.0.1",
-            listen_port=local_port + 1,
-            enable_cuda_graphs=args.enable_cuda_graphs and not args.no_cuda_graphs,
-            spec_k=args.spec_k,
-        )
-
-        # 2. Load Node 0 slice (cuda:0, layers 0..mid_layer + embed + draft model)
-        logger.info("Loading Node 0 layers [0, %d) onto device cuda:0...", mid_layer)
-        slice0 = load_layer_slice(
-            model_path=args.model,
-            layer_start=0,
-            layer_end=mid_layer,
-            include_norm=False,
-            include_lm_head=False,
-            device="cuda:0",
-            load_in_4bit=args.load_in_4bit,
-        )
-        node0 = PipelineNode(
-            model_slice=slice0,
-            is_first_node=True,
-            is_last_node=False,
-            next_node_host="127.0.0.1",
-            next_node_port=local_port + 1,
-            listen_host="0.0.0.0",
-            listen_port=local_port,
-            enable_cuda_graphs=args.enable_cuda_graphs and not args.no_cuda_graphs,
-            draft_model=args.draft_model,
-            spec_k=args.spec_k,
-        )
-
-        # 3. Register Node 0 as the public cluster endpoint with the registry
-        vram_total = (torch.cuda.get_device_properties(0).total_memory + torch.cuda.get_device_properties(1).total_memory) / (1024 * 1024)
-        reg_payload = {
-            "node_id": node_id,
-            "addr": pub_host,
-            "port": pub_port,
-            "vram_available_mb": vram_total,
-            "vram_total_mb": vram_total,
-            "model_id": reg_model_id,
-            "layer_start": 0,
-            "layer_end": total_layers,
-            "expected_nodes": 1,
-        }
-        reg_url = f"{args.registry_url.rstrip('/')}/register"
-        for attempt in range(3):
+        # 2. Wait until Node 1 is listening on 127.0.0.1:9501
+        logger.info("Waiting for Node 1 to initialize and listen on 127.0.0.1:%d...", local_port + 1)
+        for _ in range(120):
+            if node1_proc.poll() is not None:
+                raise RuntimeError(f"Node 1 process exited unexpectedly with code {node1_proc.returncode}")
             try:
-                logger.info("Registering dual-GPU cluster endpoint %s (attempt %d/3)...", node_id, attempt + 1)
-                resp = requests.post(reg_url, json=reg_payload, timeout=30.0)
-                resp.raise_for_status()
-                break
-            except Exception as e:
-                logger.warning("Registration attempt %d failed: %s", attempt + 1, e)
-                if attempt == 2:
-                    raise
-                time.sleep(2)
+                with socket.create_connection(("127.0.0.1", local_port + 1), timeout=1.0):
+                    logger.info("✅ Node 1 is online and listening!")
+                    break
+            except Exception:
+                time.sleep(1.0)
+        else:
+            raise TimeoutError("Node 1 failed to start within 120 seconds")
 
-        def background_heartbeat_worker():
-            hb_url = f"{args.registry_url.rstrip('/')}/heartbeat"
-            hb_payload = {"node_id": node_id}
-            while True:
-                time.sleep(5.0)
-                try:
-                    requests.post(hb_url, json=hb_payload, timeout=5.0)
-                except Exception:
-                    pass
+        # 3. Start Node 0 subprocess (isolated CUDA context on GPU 0)
+        node0_env = os.environ.copy()
+        node0_env["CUDA_VISIBLE_DEVICES"] = "0"
+        node0_cmd = [
+            sys.executable, "-m", "shardflow.node.node",
+            "--model", args.model,
+            "--layer-start", "0",
+            "--layer-end", str(mid_layer),
+            "--next-host", "127.0.0.1",
+            "--next-port", str(local_port + 1),
+            "--host", "0.0.0.0",
+            "--port", str(local_port),
+            "--public-host", pub_host,
+            "--public-port", str(pub_port),
+            "--registry-url", args.registry_url,
+            "--reg-layer-start", "0",
+            "--reg-layer-end", str(total_layers),
+            "--expected-nodes", "1",
+            "--hf-model-id", reg_model_id,
+            "--device", "cuda",
+        ]
+        if args.draft_model:
+            node0_cmd.extend(["--draft-model", args.draft_model, "--spec-k", str(args.spec_k)])
 
-        hb_thread = threading.Thread(target=background_heartbeat_worker, daemon=True)
-        hb_thread.start()
+        logger.info("Spawning Node 0 isolated subprocess on GPU 0 (port %d)...", local_port)
+        node0_proc = subprocess.Popen(node0_cmd, env=node0_env)
 
-        async def run_dual_pipeline():
-            logger.info("Starting Node 1 server on 127.0.0.1:%d ...", local_port + 1)
-            await node1.start()
-            logger.info("Starting Node 0 server on 0.0.0.0:%d ...", local_port)
-            await node0.start()
+        try:
             logger.info("🚀 Dual-GPU pipeline is live and ready for inference!")
-            await asyncio.Event().wait()
-
-        asyncio.run(run_dual_pipeline())
+            node0_proc.wait()
+        except KeyboardInterrupt:
+            logger.info("Shutting down dual-GPU pipeline...")
+        finally:
+            node1_proc.terminate()
+            node0_proc.terminate()
         return
 
     # -------------------------------------------------------------

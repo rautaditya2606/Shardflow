@@ -888,6 +888,10 @@ def main():
     parser.add_argument("--node-id", default=None, help="Unique node identifier")
     parser.add_argument("--draft-model", default=None, help="Draft model path or ID for speculative decoding on Node 0")
     parser.add_argument("--spec-k", type=int, default=4, help="Number of speculative draft tokens per verification step (default: 4)")
+    parser.add_argument("--reg-layer-start", type=int, default=None, help="Explicit layer_start to register with registry")
+    parser.add_argument("--reg-layer-end", type=int, default=None, help="Explicit layer_end to register with registry")
+    parser.add_argument("--expected-nodes", type=int, default=None, help="Explicit expected cluster node count")
+    parser.add_argument("--hf-model-id", default=None, help="Explicit HF repo ID for registry reporting")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -914,19 +918,29 @@ def main():
         if torch.cuda.is_available():
             vram = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
         try:
+            reported_model_id = args.hf_model_id or args.model
+            if "/" not in reported_model_id and "qwen" in reported_model_id.lower():
+                reported_model_id = "Qwen/Qwen2.5-7B-Instruct"
             reg_payload = {
                 "node_id": node_id,
                 "addr": pub_host,
                 "port": pub_port,
                 "vram_available_mb": vram,
                 "vram_total_mb": vram,
-                "model_id": args.model,
+                "model_id": reported_model_id,
             }
-            # Only send explicit bounds if given — otherwise let registry auto-assign
-            if layer_start is not None:
+            if args.reg_layer_start is not None:
+                reg_payload["layer_start"] = args.reg_layer_start
+            elif layer_start is not None:
                 reg_payload["layer_start"] = layer_start
-            if layer_end is not None:
+
+            if args.reg_layer_end is not None:
+                reg_payload["layer_end"] = args.reg_layer_end
+            elif layer_end is not None:
                 reg_payload["layer_end"] = layer_end
+
+            if args.expected_nodes is not None:
+                reg_payload["expected_nodes"] = args.expected_nodes
 
             resp = requests.post(
                 f"{args.registry_url.rstrip('/')}/register",
