@@ -444,7 +444,7 @@ def load_layer_slice(
                             embed_tokens=embed_tokens,
                         )
                     else:
-                        # Direct FP16/BF16 loading to layer
+                        # Direct in-place FP16/BF16 loading to avoid doubling VRAM allocation
                         if key.startswith("model.layers."):
                             parts = key.split(".")
                             orig_idx = int(parts[2])
@@ -456,32 +456,47 @@ def load_layer_slice(
                                 for part in path_parts[:-1]:
                                     submod = getattr(submod, part)
                                 param_name = path_parts[-1]
-                                param = nn.Parameter(
-                                    tensor.to(device=target_device, dtype=target_dtype),
-                                    requires_grad=False,
-                                )
-                                setattr(submod, param_name, param)
+                                current_param = getattr(submod, param_name, None)
+                                if current_param is not None and current_param.device == target_device:
+                                    current_param.data.copy_(tensor)
+                                else:
+                                    param = nn.Parameter(
+                                        tensor.to(device=target_device, dtype=target_dtype, non_blocking=True),
+                                        requires_grad=False,
+                                    )
+                                    setattr(submod, param_name, param)
 
                         elif key.startswith("model.norm.") and norm is not None:
-                            norm.weight = nn.Parameter(
-                                tensor.to(device=target_device, dtype=target_dtype),
-                                requires_grad=False,
-                            )
+                            if hasattr(norm, "weight") and norm.weight is not None and norm.weight.device == target_device:
+                                norm.weight.data.copy_(tensor)
+                            else:
+                                norm.weight = nn.Parameter(
+                                    tensor.to(device=target_device, dtype=target_dtype, non_blocking=True),
+                                    requires_grad=False,
+                                )
                         elif key.startswith("lm_head.") and lm_head is not None:
-                            lm_head.weight = nn.Parameter(
-                                tensor.to(device=target_device, dtype=target_dtype),
-                                requires_grad=False,
-                            )
+                            if hasattr(lm_head, "weight") and lm_head.weight is not None and lm_head.weight.device == target_device:
+                                lm_head.weight.data.copy_(tensor)
+                            else:
+                                lm_head.weight = nn.Parameter(
+                                    tensor.to(device=target_device, dtype=target_dtype, non_blocking=True),
+                                    requires_grad=False,
+                                )
                         elif key.startswith("model.embed_tokens.") and embed_tokens is not None:
-                            embed_tokens.weight = nn.Parameter(
-                                tensor.to(device=target_device, dtype=target_dtype),
-                                requires_grad=False,
-                            )
+                            if hasattr(embed_tokens, "weight") and embed_tokens.weight is not None and embed_tokens.weight.device == target_device:
+                                embed_tokens.weight.data.copy_(tensor)
+                            else:
+                                embed_tokens.weight = nn.Parameter(
+                                    tensor.to(device=target_device, dtype=target_dtype, non_blocking=True),
+                                    requires_grad=False,
+                                )
 
                     del tensor
 
             logger.info("Shard %s loaded successfully into GPU device %s", shard_name, target_device)
             gc.collect()
+            if target_device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     else:
         # Single safetensors file or local directory
