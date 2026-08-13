@@ -48,9 +48,9 @@ def main():
     parser.add_argument("--port", type=int, default=9500, help="Local TCP port for Node 0")
     parser.add_argument(
         "--tunnel",
-        choices=["bore", "cloudflare"],
-        default="bore",
-        help="Tunnel backend (default: bore — bore.pub raw TCP proxy for high performance binary tensor transfer)",
+        choices=["bore", "cloudflare", "none"],
+        default="none",
+        help="Tunnel backend (default: none for local loopback / no tunnel; bore or cloudflare for public endpoint)",
     )
     parser.add_argument("--node-id", default=None, help="Unique node identifier")
     parser.add_argument("--expected-nodes", type=int, default=None, help="Expected total cluster nodes count (default: 2 for single-GPU distributed mode)")
@@ -107,7 +107,11 @@ def main():
     node_id = args.node_id or f"kaggle-node-{int(time.time())}"
     local_port = args.port
 
-    # Setup public endpoint (Tailscale, Bore, or Cloudflare)
+    pub_host = "127.0.0.1"
+    pub_port = local_port
+    tunnel_proc = None
+
+    # Setup public endpoint (Tailscale, Bore, Cloudflare, or None)
     if args.tailscale_authkey:
         from shardflow.transport.tailscale import setup_tailscale_kaggle
         logger.info("Setting up direct Tailscale userspace mode on Kaggle...")
@@ -119,10 +123,12 @@ def main():
         logger.info("Starting bore tunnel on local port %d...", local_port)
         tunnel_proc, pub_host, pub_port = start_bore_tunnel(local_port)
         logger.info("Tunnel established at %s:%d", pub_host, pub_port)
-    else:
+    elif args.tunnel == "cloudflare":
         logger.info("Starting Cloudflare TCP tunnel on local port %d...", local_port)
         tunnel_proc, pub_host, pub_port = start_cloudflare_tcp_tunnel(local_port)
         logger.info("Tunnel established at %s:%d", pub_host, pub_port)
+    else:
+        logger.info("No external tunnel configured — running local loopback endpoint %s:%d", pub_host, pub_port)
 
     # -------------------------------------------------------------
     # CASE 1: DUAL-GPU LOCAL PIPELINE (2x T4 on the same Kaggle VM)
