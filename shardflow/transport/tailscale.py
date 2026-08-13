@@ -36,18 +36,19 @@ def get_tailscale_status() -> Optional[dict]:
 def get_tailscale_ip() -> Optional[str]:
     """Return the assigned 100.x.y.z IPv4 address."""
     status = get_tailscale_status()
-    if status and "Self" in status and "TailscaleIPs" in status["Self"]:
-        ips = status["Self"]["TailscaleIPs"]
-        for ip in ips:
-            if "." in ip:  # IPv4
-                return ip
+    if status and isinstance(status, dict) and "Self" in status and isinstance(status["Self"], dict):
+        ips = status["Self"].get("TailscaleIPs")
+        if ips and isinstance(ips, (list, tuple)):
+            for ip in ips:
+                if isinstance(ip, str) and "." in ip:  # IPv4
+                    return ip
     return None
 
 
 def get_tailscale_hostname() -> Optional[str]:
     """Return the MagicDNS FQDN hostname (stable across restarts)."""
     status = get_tailscale_status()
-    if status and "Self" in status:
+    if status and isinstance(status, dict) and "Self" in status and isinstance(status["Self"], dict):
         # MagicDNS DNSName e.g. "colab-node-1.tail1234.ts.net."
         dns_name = status["Self"].get("DNSName", "").rstrip(".")
         if dns_name:
