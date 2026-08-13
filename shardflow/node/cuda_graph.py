@@ -51,6 +51,9 @@ class CUDAGraphRunner:
         self._static_decode_pos: Optional[torch.Tensor] = None
         self._static_decode_cos: Optional[torch.Tensor] = None
         self._static_decode_sin: Optional[torch.Tensor] = None
+        # ponytail: cache_position must be a static in-place buffer so graph replay
+        # writes to the correct KV slot — derived tensors freeze at capture position 0
+        self._static_decode_cache_pos: Optional[torch.Tensor] = None
 
         # Static IO Buffers for Verify [1, K, D]
         self._static_verify_in: Optional[torch.Tensor] = None
@@ -58,6 +61,7 @@ class CUDAGraphRunner:
         self._static_verify_pos: Optional[torch.Tensor] = None
         self._static_verify_cos: Optional[torch.Tensor] = None
         self._static_verify_sin: Optional[torch.Tensor] = None
+        self._static_verify_cache_pos: Optional[torch.Tensor] = None
 
         # Static Cache dedicated to graph capture
         self._capture_cache: Optional[StaticCache] = None
@@ -84,6 +88,8 @@ class CUDAGraphRunner:
             # 1. Capture Decode Graph [1, 1, D]
             self._static_decode_in = torch.zeros((1, 1, self.hidden_size), device=self.device, dtype=self.dtype)
             self._static_decode_pos = torch.zeros((1, 1), device=self.device, dtype=torch.long)
+            # Static cache_position buffer — must be updated in-place before every replay
+            self._static_decode_cache_pos = torch.zeros((1,), device=self.device, dtype=torch.long)
 
             if self.rotary_emb is not None:
                 try:
@@ -107,6 +113,7 @@ class CUDAGraphRunner:
                         self._static_decode_in,
                         self._static_decode_pos,
                         self._capture_cache,
+                        cache_position=self._static_decode_cache_pos,
                     )
             torch.cuda.current_stream(device=self.device).wait_stream(s)
 
@@ -117,11 +124,13 @@ class CUDAGraphRunner:
                     self._static_decode_in,
                     self._static_decode_pos,
                     self._capture_cache,
+                    cache_position=self._static_decode_cache_pos,
                 )
 
             # 2. Capture Verify Graph [1, K, D]
             self._static_verify_in = torch.zeros((1, self.spec_k, self.hidden_size), device=self.device, dtype=self.dtype)
             self._static_verify_pos = torch.arange(self.spec_k, device=self.device, dtype=torch.long).unsqueeze(0)
+            self._static_verify_cache_pos = torch.arange(self.spec_k, device=self.device, dtype=torch.long)
 
             if self.rotary_emb is not None:
                 try:
@@ -142,6 +151,7 @@ class CUDAGraphRunner:
                         self._static_verify_in,
                         self._static_verify_pos,
                         self._capture_cache,
+                        cache_position=self._static_verify_cache_pos,
                     )
             torch.cuda.current_stream(device=self.device).wait_stream(s)
 
@@ -151,6 +161,7 @@ class CUDAGraphRunner:
                     self._static_verify_in,
                     self._static_verify_pos,
                     self._capture_cache,
+                    cache_position=self._static_verify_cache_pos,
                 )
 
             self.is_captured = True
@@ -171,6 +182,8 @@ class CUDAGraphRunner:
 
         self._static_decode_in.copy_(hidden_states)
         self._static_decode_pos.fill_(position)
+        # ponytail: update cache_position in-place so KV writes go to correct slot
+        self._static_decode_cache_pos.fill_(position)
 
         # Update static RoPE cos/sin buffers dynamically before graph replay
         if self._static_decode_cos is not None and self.rotary_emb is not None:
@@ -189,6 +202,8 @@ class CUDAGraphRunner:
         self._static_verify_in.copy_(hidden_states)
         for i in range(self.spec_k):
             self._static_verify_pos[0, i] = start_position + i
+            # ponytail: update cache_position in-place so verify KV writes land correctly
+            self._static_verify_cache_pos[i] = start_position + i
 
         if self._static_verify_cos is not None and self.rotary_emb is not None:
             cos, sin = self.rotary_emb(self._static_verify_in, self._static_verify_pos)
@@ -203,6 +218,7 @@ class CUDAGraphRunner:
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         cache: Optional[StaticCache],
+        cache_position: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Internal eager forward pass used during graph capture."""
         h = hidden_states
@@ -220,7 +236,10 @@ class CUDAGraphRunner:
             except Exception:
                 pos_emb = None
 
-        cache_position = position_ids.squeeze(0)
+        # ponytail: use the passed-in static cache_position buffer (updated in-place before replay)
+        # so the graph writes KV entries to the correct advancing slot — never derive from position_ids
+        if cache_position is None:
+            cache_position = position_ids.squeeze(0)
 
         for layer in self.layers:
             kwargs = {
