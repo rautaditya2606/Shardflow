@@ -53,7 +53,8 @@ def main():
         help="Tunnel backend (default: bore — bore.pub raw TCP proxy for high performance binary tensor transfer)",
     )
     parser.add_argument("--node-id", default=None, help="Unique node identifier")
-    parser.add_argument("--expected-nodes", type=int, default=None, help="Expected total cluster nodes count (optional)")
+    parser.add_argument("--expected-nodes", type=int, default=None, help="Expected total cluster nodes count (default: 2 for single-GPU distributed mode)")
+    parser.add_argument("--reset-registry", action="store_true", help="Reset remote registry state before registering")
     parser.add_argument("--layer-start", type=int, default=None, help="Explicit layer start (optional)")
     parser.add_argument("--layer-end", type=int, default=None, help="Explicit layer end (optional)")
     parser.add_argument("--load-in-4bit", action="store_true", help="Quantize weights to 4-bit NF4 (Note: for 7B models on 2x T4, pure FP16 is faster and fits VRAM)")
@@ -68,6 +69,15 @@ def main():
     parser.add_argument("--is-last", action="store_true", help="Explicitly mark this node as the final/terminal node")
     parser.add_argument("--force-single-gpu", action="store_true", help="Force single-GPU mode even if multiple GPUs are detected")
     args = parser.parse_args()
+
+    if args.reset_registry:
+        try:
+            reset_url = f"{args.registry_url.rstrip('/')}/reset"
+            logger.info("Resetting registry state at %s...", reset_url)
+            requests.post(reset_url, timeout=10.0)
+            logger.info("Registry state reset successfully.")
+        except Exception as e:
+            logger.warning("Could not reset registry: %s", e)
 
     def get_registry_model_id(model_path: str, explicit_id: str = None) -> str:
         if explicit_id:
@@ -244,6 +254,10 @@ def main():
     if torch.cuda.is_available():
         vram = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
 
+    expected_nodes_val = args.expected_nodes
+    if expected_nodes_val is None and (args.layer_start is None or args.layer_end is None):
+        expected_nodes_val = 2
+
     reg_payload = {
         "node_id": node_id,
         "addr": pub_host,
@@ -252,8 +266,8 @@ def main():
         "vram_total_mb": vram,
         "model_id": reg_model_id,
     }
-    if args.expected_nodes is not None:
-        reg_payload["expected_nodes"] = args.expected_nodes
+    if expected_nodes_val is not None:
+        reg_payload["expected_nodes"] = expected_nodes_val
     if args.layer_start is not None:
         reg_payload["layer_start"] = args.layer_start
     if args.layer_end is not None:
@@ -262,7 +276,7 @@ def main():
     reg_url = f"{args.registry_url.rstrip('/')}/register"
     for attempt in range(3):
         try:
-            logger.info("Registering node %s (attempt %d/3)...", node_id, attempt + 1)
+            logger.info("Registering node %s (attempt %d/3, expected_nodes=%s)...", node_id, attempt + 1, expected_nodes_val)
             resp = requests.post(reg_url, json=reg_payload, timeout=30.0)
             resp.raise_for_status()
             break

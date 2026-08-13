@@ -151,6 +151,13 @@ _first_registration_time: Optional[float] = None
 _cluster_partition_calculated: bool = False
 
 
+def _reset_cluster_init_state() -> None:
+    global _first_registration_time, _cluster_partition_calculated, _expected_nodes_target
+    _first_registration_time = None
+    _cluster_partition_calculated = False
+    _expected_nodes_target = None
+
+
 def _reset_registry_state() -> None:
     global _nodes, _topology_version, _expected_nodes_target, _first_registration_time, _cluster_partition_calculated
     _nodes.clear()
@@ -208,6 +215,10 @@ def _cleanup_inactive_nodes() -> None:
     for nid in dead_nodes:
         logger.warning("Evicting dead node %s (no heartbeat for %.1fs)", nid, now - _nodes[nid].last_heartbeat)
         del _nodes[nid]
+
+    active = [n for n in _nodes.values() if n.is_active]
+    if not active:
+        _reset_cluster_init_state()
 
 
 def _get_model_dims(model_id: str) -> tuple[int, int]:
@@ -316,11 +327,20 @@ def _rebalance_assignments(model_id: str) -> None:
 @router.post("/register", status_code=status.HTTP_201_CREATED, response_model=NodeRegistrationResponse)
 def register_node(payload: NodeRegistration):
     """Register or update a pipeline node and receive dynamic layer assignments."""
-    global _expected_nodes_target, _first_registration_time
+    global _expected_nodes_target, _first_registration_time, _cluster_partition_calculated
     _cleanup_inactive_nodes()
     now = time.time()
 
-    if payload.expected_nodes is not None and payload.expected_nodes > 0:
+    # If all existing nodes were inactive or empty, start a fresh registration window
+    active_before = [n for n in _nodes.values() if n.is_active and n.node_id != payload.node_id]
+    if not active_before:
+        _first_registration_time = now
+        _cluster_partition_calculated = False
+        if payload.expected_nodes is not None and payload.expected_nodes > 0:
+            _expected_nodes_target = payload.expected_nodes
+        else:
+            _expected_nodes_target = None
+    elif payload.expected_nodes is not None and payload.expected_nodes > 0:
         if _expected_nodes_target != payload.expected_nodes:
             logger.info("Dynamic expected nodes target updated to %d by node %s", payload.expected_nodes, payload.node_id)
             _expected_nodes_target = payload.expected_nodes
@@ -362,6 +382,13 @@ def register_node(payload: NodeRegistration):
         cluster_ready=_is_cluster_ready(payload.model_id),
         topology_version=_topology_version,
     )
+
+
+@router.post("/reset")
+def reset_registry():
+    """Reset all nodes and cluster topology state."""
+    _reset_registry_state()
+    return {"status": "ok", "message": "Registry state reset successfully"}
 
 
 class HeartbeatResponse(BaseModel):
