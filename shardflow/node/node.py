@@ -464,6 +464,10 @@ class PipelineNode:
         )
 
         try:
+            # Prefill draft sampler with prompt context for aligned speculative proposals
+            if self.draft_sampler is not None:
+                self.draft_sampler.prefill(prompt_tokens)
+
             # 1. Chunked Prefill Phase (windows of 512 tokens)
             prefill_chunk_size = 512
             prompt_len = len(prompt_tokens)
@@ -760,19 +764,25 @@ class PipelineNode:
             # Eager execution for prefill / multi-token sequences
             position_ids = torch.arange(past_seq_len, past_seq_len + seq_len, device=device).unsqueeze(0)
 
-            # Causal attention mask: prefix with past KV keys when seq_len > 1
+            # Causal attention mask: ensure SDPA never attends to unwritten trailing slots in StaticCache
             causal_mask = None
-            if seq_len > 1:
+            if isinstance(cache, StaticCache):
+                try:
+                    max_len = cache.get_max_cache_shape() if hasattr(cache, "get_max_cache_shape") else getattr(cache, "max_cache_len", None)
+                    if max_len is not None:
+                        key_len = int(max_len)
+                        causal_mask = torch.full(
+                            (1, 1, seq_len, key_len),
+                            float("-inf"),
+                            device=device,
+                            dtype=hidden_states.dtype,
+                        )
+                        for i in range(seq_len):
+                            causal_mask[0, 0, i, : past_seq_len + i + 1] = 0.0
+                except Exception as e:
+                    logger.debug("StaticCache causal mask construction fallback: %s", e)
+            elif seq_len > 1:
                 key_len = past_seq_len + seq_len
-                if isinstance(cache, StaticCache):
-                    try:
-                        # ponytail: get_max_cache_shape() is the non-deprecated API in newer transformers
-                        max_len = cache.get_max_cache_shape() if hasattr(cache, "get_max_cache_shape") else getattr(cache, "max_cache_len", None)
-                        if max_len is not None:
-                            key_len = max(key_len, int(max_len))
-                    except Exception:
-                        pass
-
                 causal_mask = torch.full(
                     (seq_len, key_len),
                     0.0,
@@ -783,9 +793,7 @@ class PipelineNode:
                     torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=hidden_states.dtype),
                     diagonal=1,
                 )
-                causal_mask[:, past_seq_len:past_seq_len + seq_len] = current_chunk_mask
-                if key_len > past_seq_len + seq_len:
-                    causal_mask[:, past_seq_len + seq_len:] = float("-inf")
+                causal_mask[:, past_seq_len : past_seq_len + seq_len] = current_chunk_mask
                 causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
 
             # Compute rotary position embeddings

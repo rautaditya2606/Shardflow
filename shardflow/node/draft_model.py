@@ -28,9 +28,17 @@ def rewind_dynamic_cache(cache: DynamicCache, target_seq_len: int) -> None:
 
 
 def rewind_static_cache(cache: StaticCache, target_seq_len: int) -> None:
-    """Rewind StaticCache to target_seq_len by updating seen_tokens pointer."""
+    """Rewind StaticCache to target_seq_len by zeroing out rejected key/value slots."""
     if hasattr(cache, "_seen_tokens"):
         cache._seen_tokens = target_seq_len
+    # ponytail: zero out all rejected slots from target_seq_len onwards so SDPA
+    # does not attend to rejected phantom key/values
+    if hasattr(cache, "layers"):
+        for layer in cache.layers:
+            if hasattr(layer, "keys") and layer.keys is not None:
+                layer.keys[:, :, target_seq_len:, :] = 0.0
+            if hasattr(layer, "values") and layer.values is not None:
+                layer.values[:, :, target_seq_len:, :] = 0.0
 
 
 def rewind_kv_cache(cache: Cache, target_seq_len: int) -> None:
@@ -71,6 +79,22 @@ class DraftSampler:
     def reset(self) -> None:
         """Reset draft model KV cache for a new session."""
         self.cache = DynamicCache()
+
+    @torch.inference_mode()
+    def prefill(self, prompt_tokens: List[int]) -> None:
+        """
+        Prefill draft model with prompt tokens so candidate tokens are generated
+        in the correct conversational context (prevents gibberish / repetition loops).
+        """
+        self.reset()
+        if not prompt_tokens:
+            return
+        input_ids = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
+        self.model(
+            input_ids=input_ids,
+            past_key_values=self.cache,
+            use_cache=True,
+        )
 
     def rewind(self, target_seq_len: int) -> None:
         """Rewind draft model KV cache after speculative rejection."""
