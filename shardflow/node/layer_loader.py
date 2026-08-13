@@ -424,12 +424,31 @@ def load_layer_slice(
                     shard_path = hf_hub_download(repo_id=model_path, filename=shard_name, cache_dir=target_cache_dir, token=hf_tok)
 
             logger.info("Streaming and loading weights from shard %s ...", shard_name)
+            import psutil
+            proc = psutil.Process()
+            rss = proc.memory_info().rss / 1024**3
+            avail = psutil.virtual_memory().available / 1024**3
+            gpu_alloc = torch.cuda.memory_allocated(target_device) / 1024**3 if target_device.type == "cuda" else 0.0
+            gpu_res = torch.cuda.memory_reserved(target_device) / 1024**3 if target_device.type == "cuda" else 0.0
+            logger.info("SHARD START %s | RSS=%.2f GB | available=%.2f GB | GPU alloc=%.2f GB | GPU reserved=%.2f GB", shard_name, rss, avail, gpu_alloc, gpu_res)
+
             from safetensors import safe_open
             with safe_open(shard_path, framework="pt", device="cpu") as f:
                 for key in f.keys():
                     if not any(key.startswith(p) for p in target_prefixes):
                         continue
+
+                    rss = proc.memory_info().rss / 1024**3
+                    avail = psutil.virtual_memory().available / 1024**3
+                    gpu_alloc = torch.cuda.memory_allocated(target_device) / 1024**3 if target_device.type == "cuda" else 0.0
+                    gpu_res = torch.cuda.memory_reserved(target_device) / 1024**3 if target_device.type == "cuda" else 0.0
+                    logger.info(
+                        "MEM key=%s | RSS=%.2f GB | available=%.2f GB | GPU alloc=%.2f GB | GPU reserved=%.2f GB",
+                        key, rss, avail, gpu_alloc, gpu_res,
+                    )
+
                     tensor = f.get_tensor(key)
+                    logger.info("GOT tensor=%s | shape=%s | dtype=%s", key, list(tensor.shape), tensor.dtype)
 
                     if load_in_4bit:
                         _load_state_dict_into_4bit_slice(
@@ -493,7 +512,11 @@ def load_layer_slice(
 
                     del tensor
 
-            logger.info("Shard %s loaded successfully into GPU device %s", shard_name, target_device)
+            rss = proc.memory_info().rss / 1024**3
+            avail = psutil.virtual_memory().available / 1024**3
+            gpu_alloc = torch.cuda.memory_allocated(target_device) / 1024**3 if target_device.type == "cuda" else 0.0
+            gpu_res = torch.cuda.memory_reserved(target_device) / 1024**3 if target_device.type == "cuda" else 0.0
+            logger.info("SHARD END %s | RSS=%.2f GB | available=%.2f GB | GPU alloc=%.2f GB | GPU reserved=%.2f GB", shard_name, rss, avail, gpu_alloc, gpu_res)
             gc.collect()
             if target_device.type == "cuda" and torch.cuda.is_available():
                 torch.cuda.empty_cache()
