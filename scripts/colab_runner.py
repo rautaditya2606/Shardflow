@@ -213,6 +213,7 @@ def main():
         listen_host="0.0.0.0",
         listen_port=local_port,
         enable_cuda_graphs=args.enable_cuda_graphs and not args.no_cuda_graphs,
+        draft_model=args.draft_model,
     )
     current_node = node
     current_node_loop = None

@@ -151,3 +151,47 @@ def test_start_session_prompt_tokens_framing():
     assert decoded.temperature == 0.0
     assert decoded.stream_back_host == "10.0.0.5"
     assert decoded.stream_back_port == 9500
+
+
+def test_activation_draft_tokens_framing():
+    """Verify ACTIVATION message encodes and decodes candidate draft tokens."""
+    session_id = "draft-session-001"
+    tensor = torch.randn(1, 4, 32, dtype=torch.float16)
+    draft_tokens = [1024, 2048, 3072, 4096]
+
+    msg = TensorMessage(
+        msg_type=MessageType.ACTIVATION,
+        session_id=session_id,
+        tensor=tensor,
+        draft_tokens=draft_tokens,
+        sample_on_node=True,
+    )
+
+    raw_bytes = encode_message(msg)
+    decoded = decode_message(raw_bytes[LENGTH_PREFIX_SIZE:])
+
+    assert decoded.msg_type == MessageType.ACTIVATION
+    assert decoded.session_id == session_id
+    assert decoded.draft_tokens == draft_tokens
+    assert decoded.tensor is not None
+    assert torch.equal(decoded.tensor, tensor)
+
+
+def test_token_id_accepted_count_framing():
+    """Verify TOKEN_ID message encodes and decodes speculative accepted_count."""
+    session_id = "spec-token-sess"
+    msg = TensorMessage(
+        msg_type=MessageType.TOKEN_ID,
+        session_id=session_id,
+        token_id=50256,
+        accepted_count=4,
+    )
+
+    raw_bytes = encode_message(msg)
+    decoded = decode_message(raw_bytes[LENGTH_PREFIX_SIZE:])
+
+    assert decoded.msg_type == MessageType.TOKEN_ID
+    assert decoded.session_id == session_id
+    assert decoded.token_id == 50256
+    assert decoded.accepted_count == 4
+

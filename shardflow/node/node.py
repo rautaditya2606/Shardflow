@@ -21,6 +21,7 @@ import torch
 from shardflow.node.layer_loader import load_layer_slice, ModelSlice
 from shardflow.node.kv_cache import KVCacheStore
 from shardflow.node.cuda_graph import CUDAGraphRunner
+from shardflow.node.draft_model import DraftSampler, rewind_kv_cache
 from shardflow.orchestrator.sampler import sample_next_token
 from shardflow.transport.connection import NodeServer, NodeClient
 from shardflow.transport.protocol import (
@@ -53,6 +54,8 @@ class PipelineNode:
         kv_timeout: float = 60.0,
         max_sessions: int = 4,
         enable_cuda_graphs: bool = True,
+        draft_model: Optional[str] = None,
+        spec_k: int = 4,
     ):
         self.model_slice = model_slice
         self.is_first_node = is_first_node
@@ -62,6 +65,7 @@ class PipelineNode:
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.enable_cuda_graphs = enable_cuda_graphs
+        self.spec_k = spec_k
 
         # KV Cache Store with static slot leasing
         self.kv_store = KVCacheStore(
@@ -93,9 +97,25 @@ class PipelineNode:
             hidden_size=hidden_size,
             device=model_slice.device,
             dtype=self._node_dtype,
+            spec_k=spec_k,
             rotary_emb=model_slice.rotary_emb,
             enabled=enable_cuda_graphs,
         )
+
+        # Speculative Decoding Draft Sampler on Node 0 (ponytail: lazy local draft generation)
+        self.draft_sampler: Optional[DraftSampler] = None
+        if self.is_first_node and draft_model:
+            try:
+                self.draft_sampler = DraftSampler(
+                    model_path=draft_model,
+                    device=model_slice.device,
+                    dtype=self._node_dtype,
+                    spec_k=spec_k,
+                )
+                logger.info("DraftSampler initialized on Node 0 (draft_model=%s, K=%d)", draft_model, spec_k)
+            except Exception as e:
+                logger.warning("Could not initialize DraftSampler (%s) — falling back to standard autoregression", e)
+                self.draft_sampler = None
 
         # Connection to next node (if not the last)
         self._next_client: Optional[NodeClient] = None
@@ -252,43 +272,116 @@ class PipelineNode:
 
         if self.is_last_node:
             if msg.sample_on_node:
-                logits = output[0, -1, :]
-                token_id = sample_next_token(
-                    logits,
-                    temperature=msg.temperature,
-                    top_k=msg.top_k,
-                    top_p=msg.top_p,
-                )
+                if msg.draft_tokens:
+                    # ponytail: speculative candidate verification on terminal node
+                    drafts = msg.draft_tokens
+                    accepted_tokens = []
+                    next_token = None
+                    for i in range(len(drafts)):
+                        cand = sample_next_token(
+                            output[0, i, :],
+                            temperature=msg.temperature,
+                            top_k=msg.top_k,
+                            top_p=msg.top_p,
+                        )
+                        if cand == drafts[i]:
+                            accepted_tokens.append(drafts[i])
+                        else:
+                            next_token = cand
+                            break
 
-                # Direct stream-back to Gateway over dedicated TCP channel
-                if msg.stream_back_host and msg.stream_back_port:
-                    try:
-                        stream_client = await self._get_stream_client(msg.stream_back_host, msg.stream_back_port)
-                        if stream_client and stream_client.is_connected:
-                            stream_msg = TensorMessage(
-                                msg_type=MessageType.STREAM_TOKEN,
-                                session_id=msg.session_id,
-                                token_id=token_id,
-                                is_eos=False,
-                            )
-                            await stream_client.send(stream_msg)
-                    except Exception as e:
-                        logger.debug("Stream-back to %s:%d failed: %s", msg.stream_back_host, msg.stream_back_port, e)
+                    if next_token is None:
+                        # All K drafts verified; bonus sample from final logits
+                        next_token = sample_next_token(
+                            output[0, -1, :],
+                            temperature=msg.temperature,
+                            top_k=msg.top_k,
+                            top_p=msg.top_p,
+                        )
 
-                return TensorMessage(
-                    msg_type=MessageType.TOKEN_ID,
-                    session_id=msg.session_id,
-                    token_id=token_id,
-                )
+                    accepted_count = len(accepted_tokens) + 1
+
+                    # Rewind terminal KV cache to exact accepted sequence length
+                    cache = self.kv_store.get(msg.session_id)
+                    if cache is not None:
+                        past_seq = 0
+                        try:
+                            past_seq = cache.get_seq_length(self.model_slice.layer_start)
+                        except Exception:
+                            try:
+                                past_seq = cache.get_seq_length()
+                            except Exception:
+                                past_seq = 0
+                        if isinstance(past_seq, torch.Tensor):
+                            past_seq = past_seq.item()
+                        rewind_kv_cache(cache, int(past_seq or 0) - len(drafts) + accepted_count)
+
+                    # Stream accepted tokens directly to Gateway
+                    if msg.stream_back_host and msg.stream_back_port:
+                        try:
+                            stream_client = await self._get_stream_client(msg.stream_back_host, msg.stream_back_port)
+                            if stream_client and stream_client.is_connected:
+                                for tok in accepted_tokens:
+                                    await stream_client.send(TensorMessage(
+                                        msg_type=MessageType.STREAM_TOKEN,
+                                        session_id=msg.session_id,
+                                        token_id=tok,
+                                        is_eos=False,
+                                    ))
+                                await stream_client.send(TensorMessage(
+                                    msg_type=MessageType.STREAM_TOKEN,
+                                    session_id=msg.session_id,
+                                    token_id=next_token,
+                                    is_eos=False,
+                                ))
+                        except Exception as e:
+                            logger.debug("Stream-back failed: %s", e)
+
+                    return TensorMessage(
+                        msg_type=MessageType.TOKEN_ID,
+                        session_id=msg.session_id,
+                        token_id=next_token,
+                        accepted_count=accepted_count,
+                    )
+                else:
+                    logits = output[0, -1, :]
+                    token_id = sample_next_token(
+                        logits,
+                        temperature=msg.temperature,
+                        top_k=msg.top_k,
+                        top_p=msg.top_p,
+                    )
+
+                    # Direct stream-back to Gateway over dedicated TCP channel
+                    if msg.stream_back_host and msg.stream_back_port:
+                        try:
+                            stream_client = await self._get_stream_client(msg.stream_back_host, msg.stream_back_port)
+                            if stream_client and stream_client.is_connected:
+                                stream_msg = TensorMessage(
+                                    msg_type=MessageType.STREAM_TOKEN,
+                                    session_id=msg.session_id,
+                                    token_id=token_id,
+                                    is_eos=False,
+                                )
+                                await stream_client.send(stream_msg)
+                        except Exception as e:
+                            logger.debug("Stream-back to %s:%d failed: %s", msg.stream_back_host, msg.stream_back_port, e)
+
+                    return TensorMessage(
+                        msg_type=MessageType.TOKEN_ID,
+                        session_id=msg.session_id,
+                        token_id=token_id,
+                    )
             else:
                 return TensorMessage(
                     msg_type=MessageType.ACTIVATION,
                     session_id=msg.session_id,
-                    tensor=output.cpu(),
+                    tensor=output.to("cpu", non_blocking=True),
                     temperature=msg.temperature,
                     top_k=msg.top_k,
                     top_p=msg.top_p,
                     sample_on_node=False,
+                    draft_tokens=msg.draft_tokens,
                 )
         else:
             if self._next_client is None or not self._next_client.is_connected:
@@ -306,16 +399,33 @@ class PipelineNode:
             forward_msg = TensorMessage(
                 msg_type=MessageType.ACTIVATION,
                 session_id=msg.session_id,
-                tensor=output.cpu(),
+                tensor=output.to("cpu", non_blocking=True),
                 temperature=msg.temperature,
                 top_k=msg.top_k,
                 top_p=msg.top_p,
                 sample_on_node=msg.sample_on_node,
                 stream_back_host=msg.stream_back_host,
                 stream_back_port=msg.stream_back_port,
+                draft_tokens=msg.draft_tokens,
             )
             try:
                 response = await self._next_client.send_recv(forward_msg, timeout=20.0)
+                # Rewind intermediate node KV cache on speculative verification mismatch
+                if msg.draft_tokens and response.msg_type == MessageType.TOKEN_ID:
+                    cache = self.kv_store.get(msg.session_id)
+                    if cache is not None:
+                        past_seq = 0
+                        try:
+                            past_seq = cache.get_seq_length(self.model_slice.layer_start)
+                        except Exception:
+                            try:
+                                past_seq = cache.get_seq_length()
+                            except Exception:
+                                past_seq = 0
+                        if isinstance(past_seq, torch.Tensor):
+                            past_seq = past_seq.item()
+                        accepted_count = response.accepted_count or 1
+                        rewind_kv_cache(cache, int(past_seq or 0) - len(msg.draft_tokens) + accepted_count)
                 return response
             except (asyncio.TimeoutError, ConnectionError, OSError, Exception) as err:
                 logger.error(
@@ -344,8 +454,8 @@ class PipelineNode:
         stream_port = msg.stream_back_port
 
         logger.info(
-            "Starting v2 data-plane generation: session=%s, prompt_len=%d, max_tokens=%d",
-            session_id, len(prompt_tokens), max_tokens,
+            "Starting v2 data-plane generation: session=%s, prompt_len=%d, max_tokens=%d (speculative=%s)",
+            session_id, len(prompt_tokens), max_tokens, self.draft_sampler is not None,
         )
 
         try:
@@ -390,7 +500,7 @@ class PipelineNode:
                     forward_msg = TensorMessage(
                         msg_type=MessageType.ACTIVATION,
                         session_id=session_id,
-                        tensor=output.cpu(),
+                        tensor=output.to("cpu", non_blocking=True),
                         temperature=temperature,
                         top_k=top_k,
                         top_p=top_p,
@@ -405,53 +515,151 @@ class PipelineNode:
             if next_token is None:
                 raise RuntimeError("No token returned from prefill phase")
 
-            # 2. Peer-to-Peer Decode Loop
-            for step in range(1, max_tokens):
+            # 2. Peer-to-Peer Decode Loop (with speculative acceleration when DraftSampler is present)
+            step = 1
+            while step < max_tokens:
                 if eos_id is not None and next_token == eos_id:
                     logger.info("Session %s reached EOS at step %d", session_id, step)
                     break
 
-                token_tensor = torch.tensor([[next_token]], dtype=torch.long, device=self.model_slice.device)
-                if self.model_slice.embed_tokens is not None:
-                    hidden_states = self.model_slice.embed_tokens(token_tensor)
-                else:
-                    hidden_states = token_tensor
-
-                output = self._forward(
-                    hidden_states,
-                    session_id=session_id,
-                    compute_head=self.is_last_node,
-                )
-
-                if self.is_last_node:
-                    logits = output[0, -1, :]
-                    next_token = sample_next_token(logits, temperature=temperature, top_k=top_k, top_p=top_p)
-                    if stream_host and stream_port:
-                        stream_client = await self._get_stream_client(stream_host, stream_port)
-                        if stream_client and stream_client.is_connected:
-                            await stream_client.send(TensorMessage(
-                                msg_type=MessageType.STREAM_TOKEN,
-                                session_id=session_id,
-                                token_id=next_token,
-                                is_eos=False,
-                            ))
-                else:
-                    forward_msg = TensorMessage(
-                        msg_type=MessageType.ACTIVATION,
-                        session_id=session_id,
-                        tensor=output.cpu(),
+                if self.draft_sampler is not None:
+                    # Speculative decode: generate K draft tokens locally on Node 0 GPU
+                    drafts = self.draft_sampler.generate_drafts(
+                        next_token,
+                        k=self.spec_k,
                         temperature=temperature,
                         top_k=top_k,
                         top_p=top_p,
-                        sample_on_node=True,
-                        stream_back_host=stream_host,
-                        stream_back_port=stream_port,
                     )
-                    resp = await self._next_client.send_recv(forward_msg, timeout=15.0)
-                    if resp.msg_type == MessageType.TOKEN_ID:
-                        next_token = resp.token_id
+                    draft_tensor = torch.tensor([drafts], dtype=torch.long, device=self.model_slice.device)
+                    if self.model_slice.embed_tokens is not None:
+                        hidden_states = self.model_slice.embed_tokens(draft_tensor)
                     else:
-                        raise RuntimeError(f"Unexpected response in decode loop: {resp.msg_type}")
+                        hidden_states = draft_tensor
+
+                    cache = self.kv_store.get(session_id)
+                    past_seq_len = 0
+                    if cache is not None:
+                        try:
+                            past_seq_len = cache.get_seq_length(self.model_slice.layer_start)
+                        except Exception:
+                            try:
+                                past_seq_len = cache.get_seq_length()
+                            except Exception:
+                                past_seq_len = 0
+                    if isinstance(past_seq_len, torch.Tensor):
+                        past_seq_len = past_seq_len.item()
+                    past_seq_len = int(past_seq_len or 0)
+
+                    output = self._forward(
+                        hidden_states,
+                        session_id=session_id,
+                        compute_head=self.is_last_node,
+                    )
+
+                    if self.is_last_node:
+                        # Single-node mode with speculative decoding
+                        accepted_tokens = []
+                        corrected = None
+                        for i in range(len(drafts)):
+                            cand = sample_next_token(output[0, i, :], temperature=temperature, top_k=top_k, top_p=top_p)
+                            if cand == drafts[i]:
+                                accepted_tokens.append(drafts[i])
+                            else:
+                                corrected = cand
+                                break
+                        next_token = corrected if corrected is not None else sample_next_token(output[0, -1, :], temperature=temperature, top_k=top_k, top_p=top_p)
+                        accepted_count = len(accepted_tokens) + 1
+                        if cache is not None:
+                            rewind_kv_cache(cache, past_seq_len + accepted_count)
+                        if self.draft_sampler:
+                            self.draft_sampler.rewind(past_seq_len + accepted_count)
+
+                        if stream_host and stream_port:
+                            stream_client = await self._get_stream_client(stream_host, stream_port)
+                            if stream_client and stream_client.is_connected:
+                                for tok in accepted_tokens:
+                                    await stream_client.send(TensorMessage(
+                                        msg_type=MessageType.STREAM_TOKEN,
+                                        session_id=session_id,
+                                        token_id=tok,
+                                        is_eos=False,
+                                    ))
+                                await stream_client.send(TensorMessage(
+                                    msg_type=MessageType.STREAM_TOKEN,
+                                    session_id=session_id,
+                                    token_id=next_token,
+                                    is_eos=False,
+                                ))
+                        step += accepted_count
+                    else:
+                        forward_msg = TensorMessage(
+                            msg_type=MessageType.ACTIVATION,
+                            session_id=session_id,
+                            tensor=output.to("cpu", non_blocking=True),
+                            temperature=temperature,
+                            top_k=top_k,
+                            top_p=top_p,
+                            sample_on_node=True,
+                            stream_back_host=stream_host,
+                            stream_back_port=stream_port,
+                            draft_tokens=drafts,
+                        )
+                        resp = await self._next_client.send_recv(forward_msg, timeout=15.0)
+                        if resp.msg_type == MessageType.TOKEN_ID:
+                            next_token = resp.token_id
+                            accepted_count = resp.accepted_count or 1
+                            if cache is not None:
+                                rewind_kv_cache(cache, past_seq_len + accepted_count)
+                            if self.draft_sampler:
+                                self.draft_sampler.rewind(past_seq_len + accepted_count)
+                            step += accepted_count
+                        else:
+                            raise RuntimeError(f"Unexpected response in speculative decode loop: {resp.msg_type}")
+                else:
+                    # Standard 1-token decode loop (lock-free & non-blocking)
+                    token_tensor = torch.tensor([[next_token]], dtype=torch.long, device=self.model_slice.device)
+                    if self.model_slice.embed_tokens is not None:
+                        hidden_states = self.model_slice.embed_tokens(token_tensor)
+                    else:
+                        hidden_states = token_tensor
+
+                    output = self._forward(
+                        hidden_states,
+                        session_id=session_id,
+                        compute_head=self.is_last_node,
+                    )
+
+                    if self.is_last_node:
+                        logits = output[0, -1, :]
+                        next_token = sample_next_token(logits, temperature=temperature, top_k=top_k, top_p=top_p)
+                        if stream_host and stream_port:
+                            stream_client = await self._get_stream_client(stream_host, stream_port)
+                            if stream_client and stream_client.is_connected:
+                                await stream_client.send(TensorMessage(
+                                    msg_type=MessageType.STREAM_TOKEN,
+                                    session_id=session_id,
+                                    token_id=next_token,
+                                    is_eos=False,
+                                ))
+                    else:
+                        forward_msg = TensorMessage(
+                            msg_type=MessageType.ACTIVATION,
+                            session_id=session_id,
+                            tensor=output.to("cpu", non_blocking=True),
+                            temperature=temperature,
+                            top_k=top_k,
+                            top_p=top_p,
+                            sample_on_node=True,
+                            stream_back_host=stream_host,
+                            stream_back_port=stream_port,
+                        )
+                        resp = await self._next_client.send_recv(forward_msg, timeout=15.0)
+                        if resp.msg_type == MessageType.TOKEN_ID:
+                            next_token = resp.token_id
+                        else:
+                            raise RuntimeError(f"Unexpected response in decode loop: {resp.msg_type}")
+                    step += 1
 
         finally:
             # Cleanup: evict KV cache across cluster
@@ -529,9 +737,12 @@ class PipelineNode:
             past_seq_len = past_seq_len.item()
         past_seq_len = int(past_seq_len or 0)
 
-        # Fast path: CUDA Graph replay for single-token autoregressive decoding
+        # Fast path: CUDA Graph replay for single-token autoregressive decoding and speculative verify
         if seq_len == 1 and self.graph_runner.can_use_graph(seq_len):
             hidden_states = self.graph_runner.replay_decode(hidden_states, past_seq_len)
+        elif seq_len == self.graph_runner.spec_k and self.graph_runner.can_use_graph(seq_len):
+            # ponytail: fast CUDA Graph replay for speculative verification of K candidate tokens
+            hidden_states = self.graph_runner.replay_verify(hidden_states, past_seq_len)
         else:
             # Eager execution for prefill / multi-token sequences
             position_ids = torch.arange(past_seq_len, past_seq_len + seq_len, device=device).unsqueeze(0)
@@ -647,6 +858,8 @@ def main():
     parser.add_argument("--public-host", default=None, help="Public address accessible by other nodes")
     parser.add_argument("--public-port", type=int, default=None, help="Public port accessible by other nodes")
     parser.add_argument("--node-id", default=None, help="Unique node identifier")
+    parser.add_argument("--draft-model", default=None, help="Draft model path or ID for speculative decoding on Node 0")
+    parser.add_argument("--spec-k", type=int, default=4, help="Number of speculative draft tokens per verification step (default: 4)")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -750,6 +963,8 @@ def main():
         next_node_port=next_port,
         listen_host=args.host,
         listen_port=args.port,
+        draft_model=args.draft_model,
+        spec_k=args.spec_k,
     )
 
     asyncio.run(node.serve_forever())

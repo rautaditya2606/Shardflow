@@ -220,9 +220,11 @@ def encode_message(msg: TensorMessage) -> bytes:
         # ponytail: view(uint8).cpu().numpy().tobytes() is 700x faster than bytes(tensor.untyped_storage())
         tensor_bytes = tensor.view(torch.uint8).cpu().numpy().tobytes()
 
+        draft_tokens = msg.draft_tokens or []
+        draft_meta_len = 2 + (8 * len(draft_tokens))
         host_bytes = (msg.stream_back_host or "").encode("utf-8")
         stream_port = int(msg.stream_back_port or 0)
-        stream_meta_len = 4 + len(host_bytes)
+        stream_meta_len = 6 + len(host_bytes) + draft_meta_len
 
         payload_len = HEADER_SIZE + SAMPLING_SIZE + stream_meta_len + len(tensor_meta) + len(tensor_bytes)
         buf = bytearray(LENGTH_PREFIX_SIZE + payload_len)
@@ -244,12 +246,16 @@ def encode_message(msg: TensorMessage) -> bytes:
         )
         offset += SAMPLING_SIZE
 
-        struct.pack_into("<HH", buf, offset, stream_port, len(host_bytes))
-        offset += 4
+        struct.pack_into("<HHH", buf, offset, stream_port, len(host_bytes), len(draft_tokens))
+        offset += 6
 
         if host_bytes:
             buf[offset:offset + len(host_bytes)] = host_bytes
             offset += len(host_bytes)
+
+        for d_tok in draft_tokens:
+            struct.pack_into("<q", buf, offset, int(d_tok))
+            offset += 8
 
         buf[offset:offset + len(tensor_meta)] = tensor_meta
         offset += len(tensor_meta)
@@ -343,13 +349,21 @@ def decode_message(data: bytes) -> TensorMessage:
     temp, top_k, top_p, sample_flag = struct.unpack_from(SAMPLING_FMT, data, offset)
     offset += SAMPLING_SIZE
 
-    stream_port, host_len = struct.unpack_from("<HH", data, offset)
-    offset += 4
+    stream_port, host_len, num_drafts = struct.unpack_from("<HHH", data, offset)
+    offset += 6
 
     stream_host = ""
     if host_len > 0:
         stream_host = data[offset:offset + host_len].decode("utf-8")
         offset += host_len
+
+    draft_tokens = None
+    if num_drafts > 0:
+        draft_tokens = []
+        for _ in range(num_drafts):
+            d_tok = struct.unpack_from("<q", data, offset)[0]
+            draft_tokens.append(d_tok)
+            offset += 8
 
     # Parse tensor metadata
     shape, dtype, offset = _decode_tensor_meta(data, offset)
@@ -372,6 +386,7 @@ def decode_message(data: bytes) -> TensorMessage:
         sample_on_node=bool(sample_flag),
         stream_back_host=stream_host if stream_host else None,
         stream_back_port=stream_port if stream_port > 0 else None,
+        draft_tokens=draft_tokens,
     )
 
 

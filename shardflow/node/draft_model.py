@@ -16,7 +16,10 @@ logger = logging.getLogger(__name__)
 
 def rewind_dynamic_cache(cache: DynamicCache, target_seq_len: int) -> None:
     """Rewind DynamicCache to target_seq_len by slicing key/value tensors in place."""
-    if hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
+    # ponytail: native cache.crop() truncates dynamic cache in a single standard call
+    if hasattr(cache, "crop"):
+        cache.crop(target_seq_len)
+    elif hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
         for layer_idx in range(len(cache.key_cache)):
             if cache.key_cache[layer_idx] is not None:
                 cache.key_cache[layer_idx] = cache.key_cache[layer_idx][:, :, :target_seq_len, :]

@@ -170,7 +170,8 @@ class Orchestrator:
 
     async def _ensure_node0_connected(self) -> None:
         """Ensure orchestrator is connected to current Node 0 target from topology."""
-        nodes = await self.fetch_topology_async(force=True)
+        # ponytail: respect topology TTL cache instead of polling registry on every single token/request
+        nodes = await self.fetch_topology_async(force=False)
         if not nodes:
             raise RuntimeError("No active nodes available in topology")
         node0_host, node0_port = nodes[0]
