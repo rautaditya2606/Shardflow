@@ -350,6 +350,12 @@ def load_layer_slice(
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(config, dtype=target_dtype)
 
+    logger.info(
+        "AFTER MODEL SHELL: allocated=%.2f GB | reserved=%.2f GB",
+        torch.cuda.memory_allocated(target_device) / 1024**3 if target_device.type == "cuda" else 0.0,
+        torch.cuda.memory_reserved(target_device) / 1024**3 if target_device.type == "cuda" else 0.0,
+    )
+
     # 2. Extract requested layers on meta device
     extracted_layers = nn.ModuleList([
         model.model.layers[i] for i in range(layer_start, layer_end)
@@ -395,6 +401,12 @@ def load_layer_slice(
             lm_head = lm_head.to_empty(device=target_device)
         if embed_tokens is not None:
             embed_tokens = embed_tokens.to_empty(device=target_device)
+
+    logger.info(
+        "AFTER DEVICE PLACEMENT: allocated=%.2f GB | reserved=%.2f GB",
+        torch.cuda.memory_allocated(target_device) / 1024**3 if target_device.type == "cuda" else 0.0,
+        torch.cuda.memory_reserved(target_device) / 1024**3 if target_device.type == "cuda" else 0.0,
+    )
 
     # 4. Resolve targeted safetensors shards
     from safetensors.torch import load_file
