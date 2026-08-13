@@ -127,6 +127,11 @@ def main():
     # -------------------------------------------------------------
     # CASE 1: DUAL-GPU LOCAL PIPELINE (2x T4 on the same Kaggle VM)
     # -------------------------------------------------------------
+    model_target = args.model if os.path.exists(args.model) else reg_model_id
+    draft_model_target = args.draft_model
+    if args.draft_model and not os.path.exists(args.draft_model) and os.path.isabs(args.draft_model):
+        draft_model_target = get_registry_model_id(args.draft_model)
+
     if num_gpus >= 2 and not args.force_single_gpu and args.layer_start is None and args.layer_end is None:
         logger.info("=================================================================")
         logger.info("🚀 INITIALIZING DUAL-GPU PIPELINE ON 2x T4 (cuda:0 & cuda:1)")
@@ -134,7 +139,7 @@ def main():
         logger.info("   Inter-GPU link: 127.0.0.1 (0.05ms local loopback latency)")
         logger.info("=================================================================")
 
-        config = AutoConfig.from_pretrained(args.model)
+        config = AutoConfig.from_pretrained(model_target)
         total_layers = config.num_hidden_layers
         mid_layer = total_layers // 2
 
@@ -144,7 +149,7 @@ def main():
         node1_env["CUDA_VISIBLE_DEVICES"] = "1"
         node1_cmd = [
             sys.executable, "-m", "shardflow.node.node",
-            "--model", args.model,
+            "--model", model_target,
             "--layer-start", str(mid_layer),
             "--layer-end", str(total_layers),
             "--host", "127.0.0.1",
@@ -190,7 +195,7 @@ def main():
         node0_env["CUDA_VISIBLE_DEVICES"] = "0"
         node0_cmd = [
             sys.executable, "-m", "shardflow.node.node",
-            "--model", args.model,
+            "--model", model_target,
             "--layer-start", "0",
             "--layer-end", str(mid_layer),
             "--next-host", "127.0.0.1",
@@ -206,8 +211,8 @@ def main():
             "--hf-model-id", reg_model_id,
             "--device", "cuda",
         ]
-        if args.draft_model:
-            node0_cmd.extend(["--draft-model", args.draft_model, "--spec-k", str(args.spec_k)])
+        if draft_model_target:
+            node0_cmd.extend(["--draft-model", draft_model_target, "--spec-k", str(args.spec_k)])
         if args.no_cuda_graphs:
             node0_cmd.append("--no-cuda-graphs")
 
