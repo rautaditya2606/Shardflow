@@ -169,3 +169,62 @@ Response: "Quantum entanglement is a phenomenon in physics where two or more par
 2. **Explicit Layer Bounds**: Always pass `--layer-start` and `--layer-end` when running multi-notebook setups to guarantee strict 7.11 GB slice isolation regardless of registry timing.
 3. **Execution Order**: Always start **Node 1 (Notebook 2)** first so its public tunnel is live when Node 0 registers and connects.
 4. **Standalone Process**: Launch runners with `!python scripts/kaggle_runner.py` (or Python `subprocess`) to avoid holding Jupyter kernel variable references that duplicate VRAM.
+
+---
+
+## 6. Forensic Diagnostic & Binary Split Suite
+
+If Node 1 or Node 0 encounters an unexpected disconnect or silent crash on Kaggle, use `scripts/diagnose_kaggle_p100.py` to systematically isolate the failure boundary in seconds:
+
+### Step 1: Pure CUDA Forward Pass (No Server, No Network)
+Verify whether PyTorch on Pascal `sm_60` executes the transformer decoder layers, RMSNorm, and LM head without CUDA kernel errors:
+```bash
+!python scripts/diagnose_kaggle_p100.py \
+    --model /kaggle/working/models/Qwen2.5-7B-Instruct \
+    --layer-start 14 \
+    --layer-end 28 \
+    --test forward \
+    --device cuda
+```
+- **If this passes**: PyTorch SDPA (Math backend), RoPE embeddings, RMSNorm, Linear, and greedy sampling are 100% functional on the P100.
+
+### Step 2: Isolated Server Idle Longevity (10+ Minutes)
+Verify whether `PipelineNode` server, asyncio loop, and local socket bindings survive without dying when no external network traffic or tunnels are present:
+```bash
+!python scripts/diagnose_kaggle_p100.py \
+    --model /kaggle/working/models/Qwen2.5-7B-Instruct \
+    --layer-start 14 \
+    --layer-end 28 \
+    --test idle \
+    --idle-seconds 600 \
+    --device cuda
+```
+- **If this survives**: The Python runtime, asyncio event loop, and socket listener are stable. `serve_forever()` emits periodic 10-second heartbeats to prevent Jupyter kernel timeout.
+
+### Step 3: Localhost Loopback Inference (Client → Server)
+Verify the complete serialization → TCP wire transfer → deserialization → GPU inference → response pipeline over `127.0.0.1` without third-party tunnels:
+```bash
+!python scripts/diagnose_kaggle_p100.py \
+    --model /kaggle/working/models/Qwen2.5-7B-Instruct \
+    --layer-start 14 \
+    --layer-end 28 \
+    --test loopback \
+    --device cuda
+```
+- **If this passes**: The entire ShardFlow data-plane protocol, tensor serialization, socket buffer handlers, and GPU execution are bug-free.
+
+### Step 4: Bore Tunnel Diagnostic
+Test the stability of the public `bore.pub` proxy and drain thread independently:
+```bash
+!python scripts/diagnose_kaggle_p100.py --test bore
+```
+
+### Forensic Decision Matrix
+
+| Test 1 (CUDA) | Test 2 (Idle) | Test 3 (Loopback) | Test 4 (Bore) | Root Cause & Actionable Fix |
+|---|---|---|---|---|
+| ❌ Fails | - | - | - | **PyTorch sm_60 incompatibility**: Install sm_60-enabled PyTorch build or use T4 GPU. |
+| ✅ Passes | ❌ Dies | - | - | **Kaggle container memory/watchdog**: Check host RAM limit or run via standalone python process. |
+| ✅ Passes | ✅ Survives | ❌ Fails | - | **Tensor deserialization / dtype mismatch**: Check FP16 tensor framing and protocol version. |
+| ✅ Passes | ✅ Survives | ✅ Passes | ❌ Drops | **Bore tunnel / Kaggle network policy**: Third-party TCP proxy connection dropped or reset. |
+

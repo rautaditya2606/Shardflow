@@ -46,6 +46,21 @@ def install_cloudflared() -> str:
             fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
 
+import threading
+
+
+def _drain_stdout(proc: subprocess.Popen, name: str) -> None:
+    """Continuously drain subprocess stdout in background to prevent pipe deadlock."""
+    try:
+        if proc.stdout is None:
+            return
+        for line in iter(proc.stdout.readline, ""):
+            if line:
+                logger.debug("[%s] %s", name, line.rstrip())
+    except Exception as e:
+        logger.debug("[%s] stdout drain exception: %s", name, e)
+
+
 def start_cloudflare_tcp_tunnel(local_port: int) -> Tuple[subprocess.Popen, str, int]:
     """
     Start cloudflared tunnel for TCP on local_port.
@@ -81,6 +96,10 @@ def start_cloudflare_tcp_tunnel(local_port: int) -> Tuple[subprocess.Popen, str,
     if not public_url:
         proc.terminate()
         raise RuntimeError("Failed to obtain Cloudflare tunnel URL within timeout")
+
+    # Start background drain thread to prevent pipe buffer from filling and freezing cloudflared
+    drain_t = threading.Thread(target=_drain_stdout, args=(proc, "cloudflared"), daemon=True)
+    drain_t.start()
 
     return proc, public_url, 443
 
@@ -162,6 +181,10 @@ def start_bore_tunnel(local_port: int, server: str = "bore.pub", remote_port: Op
     if not pub_port:
         proc.terminate()
         raise RuntimeError("Failed to obtain bore tunnel port within timeout")
+
+    # Start background drain thread to prevent pipe buffer from filling and freezing bore
+    drain_t = threading.Thread(target=_drain_stdout, args=(proc, "bore"), daemon=True)
+    drain_t.start()
 
     return proc, server, pub_port
 

@@ -852,11 +852,27 @@ class PipelineNode:
         return hidden_states
 
     async def serve_forever(self) -> None:
-        """Run the node until cancelled."""
+        """Run the node until cancelled, logging periodic health telemetry every 10 seconds."""
         await self.start()
-        # Keep running
         try:
-            await asyncio.Event().wait()
+            while True:
+                await asyncio.sleep(10.0)
+                vram_str = "N/A"
+                if self.model_slice.device.type == "cuda" and torch.cuda.is_available():
+                    alloc_gb = torch.cuda.memory_allocated(self.model_slice.device) / 1024**3
+                    res_gb = torch.cuda.memory_reserved(self.model_slice.device) / 1024**3
+                    vram_str = f"{alloc_gb:.2f} GB (reserved: {res_gb:.2f} GB)"
+
+                logger.info(
+                    "Pipeline node live & healthy — listening on %s:%d | layers [%d, %d) | active sessions: %d | VRAM=%s",
+                    self.listen_host,
+                    self.listen_port,
+                    self.model_slice.layer_start,
+                    self.model_slice.layer_end,
+                    self.kv_store.active_sessions,
+                    vram_str,
+                )
+                sys.stdout.flush()
         except asyncio.CancelledError:
             await self.stop()
 
