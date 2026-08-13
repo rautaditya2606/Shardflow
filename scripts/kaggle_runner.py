@@ -339,11 +339,13 @@ def main():
         logger.info("Waiting for final cluster assignment before loading model weights...")
         assignment = poll_for_assignment(args.registry_url, node_id, timeout=180.0)
 
+    config = AutoConfig.from_pretrained(args.model)
+    total_layers = config.num_hidden_layers
+
     layer_start = args.layer_start if args.layer_start is not None else assignment["layer_start"]
     layer_end = args.layer_end if args.layer_end is not None else assignment["layer_end"]
-    total_layers = assignment.get("total_model_layers")
     is_first = (layer_start == 0)
-    is_last = getattr(args, "is_last", False) or assignment.get("is_last_node", False)
+    is_last = (layer_end >= total_layers) or getattr(args, "is_last", False)
     next_host = getattr(args, "next_host", None) or assignment.get("next_node_host")
     next_port = getattr(args, "next_port", None) or assignment.get("next_node_port")
     topology_version = assignment.get("topology_version", 0)

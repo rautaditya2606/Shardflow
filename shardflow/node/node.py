@@ -988,6 +988,11 @@ def main():
         logger.error("Must specify --layer-start/--layer-end or provide a valid --registry-url.")
         sys.exit(1)
 
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained(args.model)
+    total_layers = config.num_hidden_layers
+    is_last = (layer_end >= total_layers)
+
     # Load model slice
     model_slice = load_layer_slice(
         model_path=args.model,
