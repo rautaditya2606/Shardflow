@@ -140,14 +140,28 @@ def main():
         if args.no_cuda_graphs:
             node1_cmd.append("--no-cuda-graphs")
 
-        logger.info("Spawning Node 1 isolated subprocess on GPU 1 (port %d)...", local_port + 1)
-        node1_proc = subprocess.Popen(node1_cmd, env=node1_env)
+        node1_log_path = "/tmp/node1.log"
+        node1_write_file = open(node1_log_path, "w")
+        node1_read_file = open(node1_log_path, "r")
+        logger.info("Spawning Node 1 isolated subprocess on GPU 1 (port %d, log=%s)...", local_port + 1, node1_log_path)
+        node1_proc = subprocess.Popen(node1_cmd, env=node1_env, stdout=node1_write_file, stderr=subprocess.STDOUT)
 
         # 2. Wait until Node 1 is listening on 127.0.0.1:9501
         logger.info("Waiting for Node 1 to initialize and listen on 127.0.0.1:%d...", local_port + 1)
         for _ in range(120):
+            line = node1_read_file.readline()
+            while line:
+                print(f"[Node 1] {line.rstrip()}", flush=True)
+                line = node1_read_file.readline()
+
             if node1_proc.poll() is not None:
-                raise RuntimeError(f"Node 1 process exited unexpectedly with code {node1_proc.returncode}")
+                # Flush remaining output
+                line = node1_read_file.readline()
+                while line:
+                    print(f"[Node 1] {line.rstrip()}", flush=True)
+                    line = node1_read_file.readline()
+                logger.error("Node 1 exited: returncode=%s", node1_proc.returncode)
+                raise RuntimeError(f"Node 1 process exited unexpectedly with returncode {node1_proc.returncode}")
             try:
                 with socket.create_connection(("127.0.0.1", local_port + 1), timeout=1.0):
                     logger.info("✅ Node 1 is online and listening!")
@@ -183,17 +197,41 @@ def main():
         if args.no_cuda_graphs:
             node0_cmd.append("--no-cuda-graphs")
 
-        logger.info("Spawning Node 0 isolated subprocess on GPU 0 (port %d)...", local_port)
-        node0_proc = subprocess.Popen(node0_cmd, env=node0_env)
+        node0_log_path = "/tmp/node0.log"
+        node0_write_file = open(node0_log_path, "w")
+        node0_read_file = open(node0_log_path, "r")
+        logger.info("Spawning Node 0 isolated subprocess on GPU 0 (port %d, log=%s)...", local_port, node0_log_path)
+        node0_proc = subprocess.Popen(node0_cmd, env=node0_env, stdout=node0_write_file, stderr=subprocess.STDOUT)
 
         try:
             logger.info("🚀 Dual-GPU pipeline is live and ready for inference!")
-            node0_proc.wait()
+            while True:
+                line0 = node0_read_file.readline()
+                while line0:
+                    print(f"[Node 0] {line0.rstrip()}", flush=True)
+                    line0 = node0_read_file.readline()
+
+                line1 = node1_read_file.readline()
+                while line1:
+                    print(f"[Node 1] {line1.rstrip()}", flush=True)
+                    line1 = node1_read_file.readline()
+
+                if node0_proc.poll() is not None:
+                    logger.error("Node 0 exited: returncode=%s", node0_proc.returncode)
+                    break
+                if node1_proc.poll() is not None:
+                    logger.error("Node 1 exited: returncode=%s", node1_proc.returncode)
+                    break
+                time.sleep(0.5)
         except KeyboardInterrupt:
             logger.info("Shutting down dual-GPU pipeline...")
         finally:
             node1_proc.terminate()
             node0_proc.terminate()
+            node1_write_file.close()
+            node1_read_file.close()
+            node0_write_file.close()
+            node0_read_file.close()
         return
 
     # -------------------------------------------------------------

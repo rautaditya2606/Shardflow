@@ -438,17 +438,7 @@ def load_layer_slice(
                     if not any(key.startswith(p) for p in target_prefixes):
                         continue
 
-                    rss = proc.memory_info().rss / 1024**3
-                    avail = psutil.virtual_memory().available / 1024**3
-                    gpu_alloc = torch.cuda.memory_allocated(target_device) / 1024**3 if target_device.type == "cuda" else 0.0
-                    gpu_res = torch.cuda.memory_reserved(target_device) / 1024**3 if target_device.type == "cuda" else 0.0
-                    logger.info(
-                        "MEM key=%s | RSS=%.2f GB | available=%.2f GB | GPU alloc=%.2f GB | GPU reserved=%.2f GB",
-                        key, rss, avail, gpu_alloc, gpu_res,
-                    )
-
                     tensor = f.get_tensor(key)
-                    logger.info("GOT tensor=%s | shape=%s | dtype=%s", key, list(tensor.shape), tensor.dtype)
 
                     if load_in_4bit:
                         _load_state_dict_into_4bit_slice(
