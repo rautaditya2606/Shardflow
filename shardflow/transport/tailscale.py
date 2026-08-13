@@ -59,19 +59,17 @@ def get_tailscale_hostname() -> Optional[str]:
 def setup_tailscale_colab(authkey: str, hostname: str = "shardflow-colab") -> Tuple[str, str]:
     """
     Configure and authenticate Tailscale in Google Colab environment.
-    Attempts kernel TUN mode first (direct WireGuard UDP) with userspace fallback.
+    Aggressively attempts kernel TUN mode (direct WireGuard UDP) with userspace SOCKS5 fallback.
     Returns: (tailscale_ip, magicdns_hostname)
     """
     logger.info("Setting up Tailscale P2P Mesh for Colab (%s)...", hostname)
 
-    # 1. Install Tailscale if not present (registers tailscaled.service via systemd)
+    # 1. Install Tailscale if not present
     if not shutil.which("tailscale"):
         logger.info("Installing Tailscale...")
         subprocess.run(
             "curl -fsSL https://tailscale.com/install.sh | sh",
-            shell=True,
-            check=True,
-            timeout=60.0,
+            shell=True, check=True, timeout=60.0,
         )
 
     tailscale_bin = shutil.which("tailscale") or "/usr/bin/tailscale"
@@ -81,64 +79,64 @@ def setup_tailscale_colab(authkey: str, hostname: str = "shardflow-colab") -> Tu
     os.makedirs("/var/lib/tailscale", exist_ok=True)
 
     # 2. Start tailscaled if not already running
-    already_running = subprocess.run(["pgrep", "tailscaled"], capture_output=True).returncode == 0
+    already_running = subprocess.run(["pgrep", "-x", "tailscaled"], capture_output=True).returncode == 0
     if not already_running:
         started_kernel = False
 
-        # Try systemctl (Colab VMs have systemd; install.sh registers tailscaled.service)
-        if shutil.which("systemctl"):
-            r = subprocess.run(["systemctl", "start", "tailscaled"], capture_output=True)
-            if r.returncode == 0:
-                time.sleep(2.0)
-                started_kernel = subprocess.run(["pgrep", "tailscaled"], capture_output=True).returncode == 0
-                if started_kernel:
-                    logger.info("tailscaled started via systemctl (kernel TUN — direct WireGuard UDP)")
+        # ponytail: skip systemctl — Colab doesn't register tailscaled as a proper systemd service.
+        # Force-create /dev/net/tun (Colab VMs run as root and support this) then launch directly.
+        subprocess.run(
+            "mkdir -p /dev/net && mknod /dev/net/tun c 10 200 2>/dev/null; chmod 600 /dev/net/tun 2>/dev/null || true",
+            shell=True, timeout=5.0,
+        )
 
-        # Try direct kernel TUN Popen (no --tun=userspace-networking)
-        if not started_kernel:
-            os.makedirs("/dev/net", exist_ok=True)
-            if not os.path.exists("/dev/net/tun"):
-                subprocess.run("mknod /dev/net/tun c 10 200 && chmod 600 /dev/net/tun", shell=True, timeout=5.0)
-            log_f = open("/tmp/tailscaled.log", "a")
-            proc = subprocess.Popen(
-                [tailscaled_bin,
-                 "--state=/var/lib/tailscale/tailscaled.state",
-                 f"--socket={socket_path}"],
-                stdout=log_f, stderr=subprocess.STDOUT,
+        log_f = open("/tmp/tailscaled.log", "a")
+        proc = subprocess.Popen(
+            [tailscaled_bin,
+             "--state=/var/lib/tailscale/tailscaled.state",
+             f"--socket={socket_path}"],
+            stdout=log_f, stderr=subprocess.STDOUT,
+        )
+
+        # Wait up to 10s for socket to appear and process to stay alive
+        for _ in range(20):
+            time.sleep(0.5)
+            if os.path.exists(socket_path) and proc.poll() is None:
+                started_kernel = True
+                break
+
+        if started_kernel:
+            logger.info("tailscaled started in kernel TUN mode (direct WireGuard UDP, ~5ms RTT)")
+        else:
+            # Log why kernel TUN failed
+            try:
+                with open("/tmp/tailscaled.log") as f:
+                    last_lines = f.read()[-800:]
+                logger.warning("Kernel TUN failed. Last tailscaled log:\n%s", last_lines)
+            except Exception:
+                pass
+
+            # Fallback: userspace SOCKS5
+            logger.warning(
+                "Colab kernel TUN unavailable — falling back to SOCKS5 userspace mode (~200ms RTT). "
+                "To get ~5ms RTT, run Colab as a Docker container with --cap-add=NET_ADMIN."
             )
-            # Wait up to 5s for socket — if it never appears, the process crashed
-            for _ in range(10):
-                if os.path.exists(socket_path) and proc.poll() is None:
-                    started_kernel = True
-                    break
-                time.sleep(0.5)
-            if started_kernel:
-                logger.info("tailscaled started via Popen (kernel TUN mode)")
-
-        # Fallback: userspace mode (TCP-over-proxy, but guaranteed to work)
-        if not started_kernel:
-            if not os.getenv("TAILSCALE_FORCE_USERSPACE"):
-                logger.warning(
-                    "Tailscale kernel TUN unavailable — falling back to SOCKS5. "
-                    "Expect degraded latency (~200ms RTT vs ~5ms). "
-                    "Set TAILSCALE_FORCE_USERSPACE=1 to suppress this warning."
-                )
-            log_f = open("/tmp/tailscaled.log", "a")
-            subprocess.Popen(
+            log_f2 = open("/tmp/tailscaled.log", "a")
+            proc = subprocess.Popen(
                 [tailscaled_bin,
                  "--tun=userspace-networking",
                  "--socks5-server=localhost:1055",
                  "--state=/var/lib/tailscale/tailscaled.state",
                  f"--socket={socket_path}"],
-                stdout=log_f, stderr=subprocess.STDOUT,
+                stdout=log_f2, stderr=subprocess.STDOUT,
             )
             for _ in range(20):
                 if os.path.exists(socket_path):
                     break
                 time.sleep(0.5)
-            logger.info("tailscaled started in userspace mode")
+            logger.info("tailscaled started in userspace SOCKS5 mode")
 
-    # 3. Authenticate — always pass explicit socket so we find the right daemon instance
+    # 3. Authenticate
     logger.info("Authenticating with Tailscale network...")
     subprocess.run(
         [tailscale_bin,
@@ -146,9 +144,9 @@ def setup_tailscale_colab(authkey: str, hostname: str = "shardflow-colab") -> Tu
          "up",
          f"--authkey={authkey}",
          f"--hostname={hostname}",
-         "--accept-routes"],
-        check=True,
-        timeout=30.0,
+         "--accept-routes",
+         "--accept-dns=false"],
+        check=True, timeout=30.0,
     )
 
     # 4. Read assigned IP
