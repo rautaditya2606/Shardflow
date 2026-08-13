@@ -432,75 +432,76 @@ def load_layer_slice(
             gpu_res = torch.cuda.memory_reserved(target_device) / 1024**3 if target_device.type == "cuda" else 0.0
             logger.info("SHARD START %s | RSS=%.2f GB | available=%.2f GB | GPU alloc=%.2f GB | GPU reserved=%.2f GB", shard_name, rss, avail, gpu_alloc, gpu_res)
 
-            from safetensors import safe_open
-            with safe_open(shard_path, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    if not any(key.startswith(p) for p in target_prefixes):
-                        continue
+            from safetensors.torch import load_file
+            shard_dict = load_file(shard_path, device="cpu")
+            for key, tensor in shard_dict.items():
+                if not any(key.startswith(p) for p in target_prefixes):
+                    continue
 
-                    tensor = f.get_tensor(key)
-
-                    if load_in_4bit:
-                        _load_state_dict_into_4bit_slice(
-                            extracted_layers=extracted_layers,
-                            state_dict={key: tensor},
-                            layer_start=layer_start,
-                            layer_end=layer_end,
-                            device=target_device,
-                            compute_dtype=target_dtype,
-                            norm=norm,
-                            lm_head=lm_head,
-                            embed_tokens=embed_tokens,
-                        )
-                    else:
-                        # Direct in-place FP16/BF16 loading to avoid doubling VRAM allocation
-                        if key.startswith("model.layers."):
-                            parts = key.split(".")
-                            orig_idx = int(parts[2])
-                            if layer_start <= orig_idx < layer_end:
-                                local_idx = orig_idx - layer_start
-                                subpath = ".".join(parts[3:])
-                                submod = extracted_layers[local_idx]
-                                path_parts = subpath.split(".")
-                                for part in path_parts[:-1]:
-                                    submod = getattr(submod, part)
-                                param_name = path_parts[-1]
-                                current_param = getattr(submod, param_name, None)
-                                if current_param is not None and current_param.device == target_device:
-                                    current_param.data.copy_(tensor)
-                                else:
-                                    param = nn.Parameter(
-                                        tensor.to(device=target_device, dtype=target_dtype, non_blocking=True),
-                                        requires_grad=False,
-                                    )
-                                    setattr(submod, param_name, param)
-
-                        elif key.startswith("model.norm.") and norm is not None:
-                            if hasattr(norm, "weight") and norm.weight is not None and norm.weight.device == target_device:
-                                norm.weight.data.copy_(tensor)
+                if load_in_4bit:
+                    _load_state_dict_into_4bit_slice(
+                        extracted_layers=extracted_layers,
+                        state_dict={key: tensor},
+                        layer_start=layer_start,
+                        layer_end=layer_end,
+                        device=target_device,
+                        compute_dtype=target_dtype,
+                        norm=norm,
+                        lm_head=lm_head,
+                        embed_tokens=embed_tokens,
+                    )
+                else:
+                    # Direct in-place FP16/BF16 loading to avoid doubling VRAM allocation
+                    if key.startswith("model.layers."):
+                        parts = key.split(".")
+                        orig_idx = int(parts[2])
+                        if layer_start <= orig_idx < layer_end:
+                            local_idx = orig_idx - layer_start
+                            subpath = ".".join(parts[3:])
+                            submod = extracted_layers[local_idx]
+                            path_parts = subpath.split(".")
+                            for part in path_parts[:-1]:
+                                submod = getattr(submod, part)
+                            param_name = path_parts[-1]
+                            current_param = getattr(submod, param_name, None)
+                            if current_param is not None and current_param.device == target_device:
+                                current_param.data.copy_(tensor, non_blocking=False)
                             else:
-                                norm.weight = nn.Parameter(
-                                    tensor.to(device=target_device, dtype=target_dtype, non_blocking=True),
+                                param = nn.Parameter(
+                                    tensor.to(device=target_device, dtype=target_dtype, non_blocking=False),
                                     requires_grad=False,
                                 )
-                        elif key.startswith("lm_head.") and lm_head is not None:
-                            if hasattr(lm_head, "weight") and lm_head.weight is not None and lm_head.weight.device == target_device:
-                                lm_head.weight.data.copy_(tensor)
-                            else:
-                                lm_head.weight = nn.Parameter(
-                                    tensor.to(device=target_device, dtype=target_dtype, non_blocking=True),
-                                    requires_grad=False,
-                                )
-                        elif key.startswith("model.embed_tokens.") and embed_tokens is not None:
-                            if hasattr(embed_tokens, "weight") and embed_tokens.weight is not None and embed_tokens.weight.device == target_device:
-                                embed_tokens.weight.data.copy_(tensor)
-                            else:
-                                embed_tokens.weight = nn.Parameter(
-                                    tensor.to(device=target_device, dtype=target_dtype, non_blocking=True),
-                                    requires_grad=False,
-                                )
+                                setattr(submod, param_name, param)
 
-                    del tensor
+                    elif key.startswith("model.norm.") and norm is not None:
+                        if hasattr(norm, "weight") and norm.weight is not None and norm.weight.device == target_device:
+                            norm.weight.data.copy_(tensor, non_blocking=False)
+                        else:
+                            norm.weight = nn.Parameter(
+                                tensor.to(device=target_device, dtype=target_dtype, non_blocking=False),
+                                requires_grad=False,
+                            )
+                    elif key.startswith("lm_head.") and lm_head is not None:
+                        if hasattr(lm_head, "weight") and lm_head.weight is not None and lm_head.weight.device == target_device:
+                            lm_head.weight.data.copy_(tensor, non_blocking=False)
+                        else:
+                            lm_head.weight = nn.Parameter(
+                                tensor.to(device=target_device, dtype=target_dtype, non_blocking=False),
+                                requires_grad=False,
+                            )
+                    elif key.startswith("model.embed_tokens.") and embed_tokens is not None:
+                        if hasattr(embed_tokens, "weight") and embed_tokens.weight is not None and embed_tokens.weight.device == target_device:
+                            embed_tokens.weight.data.copy_(tensor, non_blocking=False)
+                        else:
+                            embed_tokens.weight = nn.Parameter(
+                                tensor.to(device=target_device, dtype=target_dtype, non_blocking=False),
+                                requires_grad=False,
+                            )
+
+            del shard_dict
+            if target_device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize(target_device)
+                torch.cuda.empty_cache()
 
             rss = proc.memory_info().rss / 1024**3
             avail = psutil.virtual_memory().available / 1024**3
@@ -508,8 +509,6 @@ def load_layer_slice(
             gpu_res = torch.cuda.memory_reserved(target_device) / 1024**3 if target_device.type == "cuda" else 0.0
             logger.info("SHARD END %s | RSS=%.2f GB | available=%.2f GB | GPU alloc=%.2f GB | GPU reserved=%.2f GB", shard_name, rss, avail, gpu_alloc, gpu_res)
             gc.collect()
-            if target_device.type == "cuda" and torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
     else:
         # Single safetensors file or local directory
