@@ -50,6 +50,7 @@ def main():
     parser.add_argument("--no-cuda-graphs", action="store_true", help="Disable CUDA Graphs and run in pure eager mode")
     parser.add_argument("--tailscale-authkey", default=None, help="Tailscale ephemeral auth key for direct P2P mesh WireGuard networking (<5ms latency)")
     parser.add_argument("--draft-model", default=None, help="Small draft model for speculative decoding on Node 0 (e.g. Qwen/Qwen2.5-0.5B-Instruct)")
+    parser.add_argument("--spec-k", type=int, default=4, help="Number of speculative candidate draft tokens per verification step (default: 4)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -214,6 +215,7 @@ def main():
         listen_port=local_port,
         enable_cuda_graphs=args.enable_cuda_graphs and not args.no_cuda_graphs,
         draft_model=args.draft_model,
+        spec_k=args.spec_k,
     )
     current_node = node
     current_node_loop = None
