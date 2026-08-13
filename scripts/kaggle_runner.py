@@ -66,6 +66,7 @@ def main():
     parser.add_argument("--hf-model-id", default=None, help="Hugging Face repo ID if --model is a local path (e.g. Qwen/Qwen2.5-7B-Instruct)")
     parser.add_argument("--next-host", default=None, help="Next node public host (optional, for manual static topology)")
     parser.add_argument("--next-port", type=int, default=None, help="Next node public port (optional, for manual static topology)")
+    parser.add_argument("--is-last", action="store_true", help="Explicitly mark this node as the final/terminal node")
     parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"], help="Model and KV cache precision (default: float16 for maximum compatibility across P100/T4)")
     parser.add_argument("--force-single-gpu", action="store_true", help="Force single-GPU mode even if multiple GPUs are detected")
     args = parser.parse_args()
@@ -324,27 +325,27 @@ def main():
     hb_thread.start()
     logger.info("Persistent background heartbeat thread started (5s ping interval)")
 
-    if args.layer_start is not None and args.layer_end is not None and (args.is_last or args.next_host is not None):
+    if args.layer_start is not None and args.layer_end is not None and (getattr(args, "is_last", False) or getattr(args, "next_host", None) is not None):
         assignment = {
             "layer_start": args.layer_start,
             "layer_end": args.layer_end,
             "is_first_node": args.layer_start == 0,
-            "is_last_node": args.is_last,
-            "next_node_host": args.next_host,
-            "next_node_port": args.next_port,
+            "is_last_node": getattr(args, "is_last", False),
+            "next_node_host": getattr(args, "next_host", None),
+            "next_node_port": getattr(args, "next_port", None),
             "topology_version": 0,
         }
     else:
         logger.info("Waiting for final cluster assignment before loading model weights...")
         assignment = poll_for_assignment(args.registry_url, node_id, timeout=180.0)
 
-    layer_start = assignment["layer_start"]
-    layer_end = assignment["layer_end"]
+    layer_start = args.layer_start if args.layer_start is not None else assignment["layer_start"]
+    layer_end = args.layer_end if args.layer_end is not None else assignment["layer_end"]
     total_layers = assignment.get("total_model_layers")
-    is_first = assignment.get("is_first_node", layer_start == 0)
-    is_last = assignment.get("is_last_node", False)
-    next_host = assignment.get("next_node_host")
-    next_port = assignment.get("next_node_port")
+    is_first = (layer_start == 0)
+    is_last = getattr(args, "is_last", False) or assignment.get("is_last_node", False)
+    next_host = getattr(args, "next_host", None) or assignment.get("next_node_host")
+    next_port = getattr(args, "next_port", None) or assignment.get("next_node_port")
     topology_version = assignment.get("topology_version", 0)
     seen_topology_version = topology_version
 
