@@ -246,11 +246,46 @@ Ensure the following are set on all reader/writer sockets:
 
 ---
 
+## Benchmark Progression Log
+
+### Run 1: v1 Control-Plane (Gateway-Driven WAN Loop)
+- **Architecture**: v1 Gateway-driven token loop (Laptop in India $\leftrightarrow$ Colab US nodes)
+- **Model**: `Qwen/Qwen2.5-7B-Instruct` (FP16, 2 nodes)
+- **Avg Decode TPS**: **1.89 tok/s**
+- **Avg TTFT**: **6.21s**
+- **Avg Total Time**: **32.11s** (50 tokens)
+- **Bottleneck**: Every token required a full cross-continent WAN round-trip (~500ms RTT) between local laptop and cloud nodes.
+
+### Run 2: v2 Peer-to-Peer Data-Plane (Direct P2P Token Loop) ⚡
+- **Architecture**: v2 Data-Plane (`START_SESSION` — token loop runs directly between GPU nodes; streaming tokens back asynchronously)
+- **Model**: `Qwen/Qwen2.5-7B-Instruct` (FP16, 2 nodes)
+- **Avg Decode TPS**: **4.59 tok/s** (Max: **4.61 tok/s**) — **2.44x Speedup** over v1!
+- **Avg TTFT**: **7.40s** (Min: **3.859s**)
+- **Avg Total Time**: **18.08s** (50 tokens)
+- **Raw Run Output**:
+```text
+--- Benchmark Run 3/3 ---
+Pipeline processing, often discussed in the V-riberglass composite form- -working through processes, operations, and network contexts-fashion or, more specifically, in the-depth, is crucial for the seamless and efficient processing, especially in the- ldings;
+  ➜ Tokens: 50 | TTFT: 3.859s | Decode Time: 10.625s | TPS: 4.61 tok/s
+=================================================================
+📊 BENCHMARK SUMMARY
+=================================================================
+  Transport:          v2 P2P Data-Plane (Gateway Local)
+  Avg Decode TPS:     4.59 tok/s (Max: 4.61 tok/s)
+  Avg TTFT (Prefill): 7.404s (Min: 3.859s)
+  Avg Total Time:     18.082s
+=================================================================
+```
+- **Key Takeaway**: Eliminating per-token gateway round-trips produced a 2.44x throughput jump. The remaining ceiling is inter-node transport latency (SOCKS5 proxy vs direct kernel WireGuard / local PCIe loopback).
+
+---
+
 ## Action Plan & Benchmark Summary
 
 | Action | Latency Reduction | Implementation Effort |
 | :--- | :--- | :--- |
-| **Switch to Tailscale P2P** | **~200 ms $\to$ 10 ms** | 10 minutes |
+| **Switch to Tailscale P2P / Direct Kernel TUN** | **~200 ms $\to$ 10 ms** | 10 minutes |
 | **Disable bitsandbytes (Run pure FP16)** | **~180 ms $\to$ 20 ms** | 1 minute (remove `--load-in-4bit`) |
 | **Enable Speculative Verification ($K=4$)** | **Amortize RTT by $4\times$** | Architectural upgrade |
 | **Combined Target Performance** | **$\mathbf{500\text{ ms/token} \to 30\text{ ms/token}}$** | **$\mathbf{\approx 30 - 35\text{ TPS}}$** |
+
