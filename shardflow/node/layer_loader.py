@@ -330,6 +330,12 @@ def load_layer_slice(
 
     target_device = torch.device(device)
 
+    # Force float16 if bfloat16 is requested but target GPU does not support hardware BF16 (e.g. Tesla P100 sm_60)
+    if target_dtype == torch.bfloat16 and target_device.type == "cuda":
+        if not torch.cuda.is_bf16_supported():
+            logger.info("Target GPU %s does not support native BF16 — converting model and KV cache to torch.float16", target_device)
+            target_dtype = torch.float16
+
     try:
         from accelerate import init_empty_weights
         has_accelerate = True

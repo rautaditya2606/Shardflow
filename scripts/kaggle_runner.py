@@ -66,7 +66,7 @@ def main():
     parser.add_argument("--hf-model-id", default=None, help="Hugging Face repo ID if --model is a local path (e.g. Qwen/Qwen2.5-7B-Instruct)")
     parser.add_argument("--next-host", default=None, help="Next node public host (optional, for manual static topology)")
     parser.add_argument("--next-port", type=int, default=None, help="Next node public port (optional, for manual static topology)")
-    parser.add_argument("--is-last", action="store_true", help="Explicitly mark this node as the final/terminal node")
+    parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"], help="Model and KV cache precision (default: float16 for maximum compatibility across P100/T4)")
     parser.add_argument("--force-single-gpu", action="store_true", help="Force single-GPU mode even if multiple GPUs are detected")
     args = parser.parse_args()
 
@@ -369,6 +369,7 @@ def main():
         layer_end=layer_end,
         include_norm=is_last,
         include_lm_head=is_last,
+        dtype=getattr(torch, args.dtype) if args.dtype else torch.float16,
         device=device,
         load_in_4bit=args.load_in_4bit,
     )
