@@ -740,9 +740,17 @@ class PipelineNode:
         # Fast path: CUDA Graph replay for single-token autoregressive decoding and speculative verify
         if seq_len == 1 and self.graph_runner.can_use_graph(seq_len):
             hidden_states = self.graph_runner.replay_decode(hidden_states, past_seq_len)
+            # ponytail: CUDA Graph only replays GPU kernels — Python-side _seen_tokens is NOT
+            # updated by graph.replay(). Manually advance it so the next get_seq_length() call
+            # returns the correct position. Without this, every decode step reads past_seq_len=N
+            # (frozen at prefill end) and all KV writes land on the same slot → gibberish.
+            if cache is not None and hasattr(cache, "_seen_tokens"):
+                cache._seen_tokens = past_seq_len + 1
         elif seq_len == self.graph_runner.spec_k and self.graph_runner.can_use_graph(seq_len):
             # ponytail: fast CUDA Graph replay for speculative verification of K candidate tokens
             hidden_states = self.graph_runner.replay_verify(hidden_states, past_seq_len)
+            if cache is not None and hasattr(cache, "_seen_tokens"):
+                cache._seen_tokens = past_seq_len + seq_len
         else:
             # Eager execution for prefill / multi-token sequences
             position_ids = torch.arange(past_seq_len, past_seq_len + seq_len, device=device).unsqueeze(0)
