@@ -69,10 +69,13 @@ class DraftSampler:
         self.cache = DynamicCache()
 
         logger.info("Loading draft model %s on %s (dtype=%s, K=%d)...", model_path, device, dtype, spec_k)
+        import os
+        target_cache = "/kaggle/working/hf_home" if os.path.exists("/kaggle") else None
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=dtype,
             device_map=str(device),
+            cache_dir=target_cache,
         )
         self.model.eval()
 

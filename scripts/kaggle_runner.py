@@ -107,7 +107,14 @@ def main():
         total_layers = config.num_hidden_layers
         mid_layer = total_layers // 2
 
-        logger.info("Partitioning %d layers: [0, %d) on cuda:0, [%d, %d) on cuda:1", total_layers, mid_layer, mid_layer, total_layers)
+        # Diagnostics: inspect RAM consumption before model load
+        try:
+            import psutil
+            proc = psutil.Process(os.getpid())
+            print(f"RAM before load: {proc.memory_info().rss / 1e9:.2f} GB")
+            print(f"System available: {psutil.virtual_memory().available / 1e9:.2f} GB")
+        except Exception as e:
+            logger.debug("psutil error: %s", e)
 
         # 1. Load Node 1 slice (cuda:1, layers mid_layer..total_layers + norm + lm_head)
         logger.info("Loading Node 1 layers [%d, %d) onto device cuda:1...", mid_layer, total_layers)
