@@ -341,7 +341,7 @@ class PipelineNode:
             return None
 
         # Process activation / token IDs
-        tensor = msg.tensor.to(self.model_slice.device, non_blocking=True)
+        tensor = msg.tensor.to(self.model_slice.device, non_blocking=False)
         if self.is_first_node and tensor.dtype in (torch.long, torch.int64, torch.int32):
             if self.model_slice.embed_tokens is not None:
                 hidden_states = self.model_slice.embed_tokens(tensor)
@@ -577,10 +577,12 @@ class PipelineNode:
                 else:
                     if self._next_client is None or not self._next_client.is_connected:
                         await self.update_next_node(self.next_node_host, self.next_node_port)
+                    if output.is_cuda:
+                        torch.cuda.synchronize(output.device)
                     forward_msg = TensorMessage(
                         msg_type=MessageType.ACTIVATION,
                         session_id=session_id,
-                        tensor=output.to("cpu", non_blocking=True),
+                        tensor=output.to("cpu", non_blocking=False),
                         temperature=temperature,
                         top_k=top_k,
                         top_p=top_p,
@@ -681,10 +683,12 @@ class PipelineNode:
                                 ))
                         step += accepted_count
                     else:
+                        if output.is_cuda:
+                            torch.cuda.synchronize(output.device)
                         forward_msg = TensorMessage(
                             msg_type=MessageType.ACTIVATION,
                             session_id=session_id,
-                            tensor=output.to("cpu", non_blocking=True),
+                            tensor=output.to("cpu", non_blocking=False),
                             temperature=temperature,
                             top_k=top_k,
                             top_p=top_p,
@@ -753,10 +757,12 @@ class PipelineNode:
                                     is_eos=False,
                                 ))
                     else:
+                        if output.is_cuda:
+                            torch.cuda.synchronize(output.device)
                         forward_msg = TensorMessage(
                             msg_type=MessageType.ACTIVATION,
                             session_id=session_id,
-                            tensor=output.to("cpu", non_blocking=True),
+                            tensor=output.to("cpu", non_blocking=False),
                             temperature=temperature,
                             top_k=top_k,
                             top_p=top_p,
