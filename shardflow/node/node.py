@@ -394,6 +394,11 @@ class PipelineNode:
                         )
 
                     accepted_count = len(accepted_tokens) + 1
+                    verified_tokens = [sample_next_token(output[0, i, :], temperature=msg.temperature, top_k=msg.top_k, top_p=msg.top_p) for i in range(len(drafts))]
+                    logger.info(
+                        "Speculative verify: drafts=%s, target_eval=%s, accepted_count=%d, next_token=%d",
+                        drafts, verified_tokens, accepted_count, next_token,
+                    )
 
                     # Rewind terminal KV cache to exact accepted sequence length
                     cache = self.kv_store.get(msg.session_id)
@@ -692,6 +697,10 @@ class PipelineNode:
                                 ))
                         step += accepted_count
                     else:
+                        logger.info(
+                            "Sending speculative: drafts=%s temperature=%.1f norm=%.4f (session=%s)",
+                            drafts, temperature, output.float().norm().item(), session_id[:8] if session_id else "None",
+                        )
                         forward_msg = TensorMessage(
                             msg_type=MessageType.ACTIVATION,
                             session_id=session_id,
