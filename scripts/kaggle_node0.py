@@ -66,9 +66,10 @@ def main():
     parser = argparse.ArgumentParser(description="ShardFlow Node 0 + Gateway (Kaggle A Remote Runner)")
     parser.add_argument("--node1-url", required=True, help="Cloudflare tunnel URL of Node 1 on Kaggle B (e.g. https://*.trycloudflare.com)")
     parser.add_argument("--model", default="/kaggle/working/models/Qwen2.5-7B-Instruct", help="Model path or HF ID")
-    parser.add_argument("--draft-model", default="/kaggle/working/models/Qwen2.5-0.5B-Instruct", help="Draft model path")
-    parser.add_argument("--spec-k", type=int, default=4, help="Speculative candidate tokens (default: 4)")
-    parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens per generation")
+    parser.add_argument("--draft-model", default=None, help="Draft model path (only used if spec_k > 0)")
+    parser.add_argument("--spec-k", type=int, default=4, help="Speculative candidate tokens (default: 4, set 0 to disable)")
+    parser.add_argument("--prompt", default=None, help="Single prompt to benchmark (optional)")
+    parser.add_argument("--max-tokens", type=int, default=50, help="Max tokens per generation")
     parser.add_argument("--port", type=int, default=8000, help="Gateway port")
     parser.add_argument("--stream-port", type=int, default=8001, help="P2P stream receiver port")
     parser.add_argument("--no-cuda-graphs", action="store_true", default=True, help="Disable CUDA Graphs in eager mode")
@@ -78,12 +79,22 @@ def main():
     kill_ports([args.port, args.stream_port, 9500])
 
     model_path = args.model if os.path.exists(args.model) else "Qwen/Qwen2.5-7B-Instruct"
-    draft_path = args.draft_model if (args.draft_model and os.path.exists(args.draft_model)) else "Qwen/Qwen2.5-0.5B-Instruct"
+    
+    draft_path = None
+    if args.spec_k > 0:
+        if args.draft_model and os.path.exists(args.draft_model):
+            draft_path = args.draft_model
+        elif args.draft_model:
+            draft_path = args.draft_model
+        elif os.path.exists("/kaggle/working/models/Qwen2.5-0.5B-Instruct"):
+            draft_path = "/kaggle/working/models/Qwen2.5-0.5B-Instruct"
+        else:
+            draft_path = "Qwen/Qwen2.5-0.5B-Instruct"
 
     print("=" * 70, flush=True)
     print("🚀 SHARDFLOW REMOTE DISTRIBUTED INFERENCE PIPELINE (KAGGLE A)", flush=True)
     print(f"Base Model:    {model_path} (Layers 0..14 on Kaggle A, Layers 14..28 on Kaggle B)")
-    print(f"Draft Model:   {draft_path} (Speculative K={args.spec_k})")
+    print(f"Draft Model:   {draft_path or 'DISABLED (spec_k=0)'} (Speculative K={args.spec_k})")
     print(f"Remote Node 1: {args.node1_url}")
     print(f"Gateway:       http://127.0.0.1:{args.port}")
     print("=" * 70, flush=True)
@@ -183,11 +194,14 @@ def main():
     print("⚡ [3/3] RUNNING LIVE DISTRIBUTED INFERENCE BENCHMARK (CROSS-KAGGLE)", flush=True)
     print("=" * 70, flush=True)
 
-    prompts = [
-        "Explain the concept of quantum entanglement in simple terms.",
-        "Write a Python function to compute Fibonacci numbers using dynamic programming with memoization.",
-        "What are the key advantages of pipeline parallelism for distributed LLM inference?",
-    ]
+    if args.prompt:
+        prompts = [args.prompt]
+    else:
+        prompts = [
+            "Explain the concept of quantum entanglement in simple terms.",
+            "Write a Python function to compute Fibonacci numbers using dynamic programming with memoization.",
+            "What are the key advantages of pipeline parallelism for distributed LLM inference?",
+        ]
 
     chat_url = f"http://127.0.0.1:{args.port}/v1/chat/completions"
     tps_list = []

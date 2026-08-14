@@ -133,8 +133,8 @@ class PipelineNode:
         self._http_server: Optional[HTTPNodeServer] = None
         # Stream clients cache for terminal node stream-back: (host, port) -> NodeClient
         self._stream_clients: dict[tuple[str, int], NodeClient] = {}
-        # Active session tasks for immediate cancellation on disconnect/new session
-        self._active_session_tasks: dict[str, asyncio.Task] = {}
+        # Active session tasks for immediate cancellation on disconnect/new session: session_id -> (Task, cancelled_flag)
+        self._active_session_tasks: dict[str, tuple[asyncio.Task, list[bool]]] = {}
 
     async def start(self) -> None:
         """Start the node: connect to next node, start listening, start eviction loop, capture CUDA graphs."""
@@ -269,7 +269,8 @@ class PipelineNode:
         """
         if msg.msg_type == MessageType.CLEAR:
             if msg.session_id in self._active_session_tasks:
-                task = self._active_session_tasks.pop(msg.session_id)
+                task, flag = self._active_session_tasks.pop(msg.session_id)
+                flag[0] = True
                 task.cancel()
                 logger.info("Cancelled active session task %s on CLEAR", msg.session_id)
             self.kv_store.evict(msg.session_id)
@@ -281,22 +282,17 @@ class PipelineNode:
             return None
 
         if msg.msg_type == MessageType.START_SESSION:
-            # Cancel any existing active session task for this session ID
-            if msg.session_id in self._active_session_tasks:
-                old_task = self._active_session_tasks.pop(msg.session_id)
-                old_task.cancel()
-                self.kv_store.evict(msg.session_id)
-                logger.warning("Evicted zombie session %s", msg.session_id)
-
-            # Cancel any prior running generation tasks to prevent concurrent GPU execution
-            for active_sid, active_task in list(self._active_session_tasks.items()):
+            # Cancel any prior running generation tasks immediately via flag + task.cancel()
+            for active_sid, (active_task, active_flag) in list(self._active_session_tasks.items()):
+                active_flag[0] = True
                 active_task.cancel()
                 self.kv_store.evict(active_sid)
                 self._active_session_tasks.pop(active_sid, None)
-                logger.warning("Cancelled prior running session %s for incoming session %s", active_sid, msg.session_id)
+                logger.info("Cancelled prior running session %s for incoming session %s", active_sid, msg.session_id)
 
-            task = asyncio.ensure_future(self._handle_start_session(msg))
-            self._active_session_tasks[msg.session_id] = task
+            cancelled_flag = [False]
+            task = asyncio.ensure_future(self._handle_start_session(msg, cancelled_flag))
+            self._active_session_tasks[msg.session_id] = (task, cancelled_flag)
             try:
                 return await task
             except asyncio.CancelledError:
@@ -494,7 +490,7 @@ class PipelineNode:
                     f"Forward to next node ({self.next_node_host}:{self.next_node_port}) failed: {err}"
                 ) from err
 
-    async def _handle_start_session(self, msg: TensorMessage) -> TensorMessage:
+    async def _handle_start_session(self, msg: TensorMessage, cancelled_flag: Optional[list[bool]] = None) -> TensorMessage:
         """
         v2 Data-Plane Controller on Node 0.
 
@@ -594,9 +590,9 @@ class PipelineNode:
             # 2. Peer-to-Peer Decode Loop (with speculative acceleration when DraftSampler is present)
             step = 1
             while step < max_tokens:
-                # Cancellation check — exits immediately if session was evicted or cancelled
-                if session_id not in self._active_session_tasks or asyncio.current_task().cancelled():
-                    logger.info("Session %s cancelled mid-decode, stopping", session_id)
+                # Direct cancellation check via mutable flag — guaranteed to abort immediately
+                if cancelled_flag and cancelled_flag[0]:
+                    logger.info("Session %s aborted via cancelled_flag", session_id)
                     break
 
                 if eos_id is not None and next_token == eos_id:
