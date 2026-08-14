@@ -341,12 +341,6 @@ class PipelineNode:
             return None
 
         # Process activation / token IDs
-        if msg.tensor is not None:
-            logger.info(
-                "Received tensor: shape=%s dtype=%s norm=%.4f (session=%s)",
-                msg.tensor.shape, msg.tensor.dtype, msg.tensor.float().norm().item(),
-                msg.session_id[:8] if msg.session_id else "None",
-            )
         tensor = msg.tensor.to(self.model_slice.device, non_blocking=True)
         if self.is_first_node and tensor.dtype in (torch.long, torch.int64, torch.int32):
             if self.model_slice.embed_tokens is not None:
@@ -394,11 +388,6 @@ class PipelineNode:
                         )
 
                     accepted_count = len(accepted_tokens) + 1
-                    verified_tokens = [sample_next_token(output[0, i, :], temperature=msg.temperature, top_k=msg.top_k, top_p=msg.top_p) for i in range(len(drafts))]
-                    logger.info(
-                        "Speculative verify: drafts=%s, target_eval=%s, accepted_count=%d, next_token=%d",
-                        drafts, verified_tokens, accepted_count, next_token,
-                    )
 
                     # Rewind terminal KV cache to exact accepted sequence length
                     cache = self.kv_store.get(msg.session_id)
@@ -588,11 +577,6 @@ class PipelineNode:
                 else:
                     if self._next_client is None or not self._next_client.is_connected:
                         await self.update_next_node(self.next_node_host, self.next_node_port)
-                    logger.info(
-                        "Sending tensor (prefill): shape=%s dtype=%s norm=%.4f (session=%s)",
-                        output.shape, output.dtype, output.float().norm().item(),
-                        session_id[:8] if session_id else "None",
-                    )
                     forward_msg = TensorMessage(
                         msg_type=MessageType.ACTIVATION,
                         session_id=session_id,
@@ -697,10 +681,6 @@ class PipelineNode:
                                 ))
                         step += accepted_count
                     else:
-                        logger.info(
-                            "Sending speculative: drafts=%s temperature=%.1f norm=%.4f (session=%s)",
-                            drafts, temperature, output.float().norm().item(), session_id[:8] if session_id else "None",
-                        )
                         forward_msg = TensorMessage(
                             msg_type=MessageType.ACTIVATION,
                             session_id=session_id,
@@ -773,11 +753,6 @@ class PipelineNode:
                                     is_eos=False,
                                 ))
                     else:
-                        logger.info(
-                            "Sending tensor (decode): shape=%s dtype=%s norm=%.4f (session=%s)",
-                            output.shape, output.dtype, output.float().norm().item(),
-                            session_id[:8] if session_id else "None",
-                        )
                         forward_msg = TensorMessage(
                             msg_type=MessageType.ACTIVATION,
                             session_id=session_id,
@@ -870,10 +845,6 @@ class PipelineNode:
         )
 
         past_seq_len = self._get_cache_seq_len(cache)
-        logger.info(
-            "Node [%d..%d] _forward: past_seq_len=%d seq_len=%d (session=%s)",
-            self.model_slice.layer_start, self.model_slice.layer_end, past_seq_len, seq_len, session_id[:8] if session_id else "None",
-        )
 
         # Fast path: CUDA Graph replay for single-token autoregressive decoding and speculative verify
         if seq_len == 1 and self.graph_runner.can_use_graph(seq_len):
