@@ -203,7 +203,7 @@ def main():
                 "model": model_path,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": args.max_tokens,
-                "temperature": 0.7,
+                "temperature": 0.0,
                 "stream": True,
             }
 
