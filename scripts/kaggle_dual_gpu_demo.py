@@ -30,8 +30,10 @@ if os.path.exists("/kaggle"):
     os.environ["HF_HUB_CACHE"] = "/kaggle/working/hf_home"
 
 
-def run_gateway_server(port: int = 8000):
-    """Run Gateway + Embedded Registry FastAPI server."""
+def run_gateway_server(port: int = 8000, stream_port: int = 8001):
+    """Run Gateway + Embedded Registry FastAPI server with v2 Data-Plane streaming."""
+    os.environ["SHARDFLOW_STREAM_HOST"] = "127.0.0.1"
+    os.environ["SHARDFLOW_STREAM_PORT"] = str(stream_port)
     import uvicorn
     from shardflow.gateway.app import app as gateway_app
     uvicorn.run(gateway_app, host="127.0.0.1", port=port, log_level="warning")
@@ -45,22 +47,26 @@ def main():
     parser.add_argument("--spec-k", type=int, default=4, help="Speculative candidate tokens (default: 4)")
     parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens per generation")
     parser.add_argument("--port", type=int, default=8000, help="Gateway port")
+    parser.add_argument("--stream-port", type=int, default=8001, help="P2P stream receiver port")
+    parser.add_argument("--no-cuda-graphs", action="store_true", help="Disable CUDA Graphs and run in eager mode")
     args = parser.parse_args()
 
     model_path = args.model if os.path.exists(args.model) else "Qwen/Qwen2.5-7B-Instruct"
     draft_path = args.draft_model if (args.draft_model and os.path.exists(args.draft_model)) else "Qwen/Qwen2.5-0.5B-Instruct"
+    use_cuda_graphs = not args.no_cuda_graphs
 
     print("=" * 70, flush=True)
-    print("🚀 SHARDFLOW DUAL-GPU (2x T4) LOCAL INFERENCE PIPELINE", flush=True)
-    print(f"Base Model:  {model_path} (FP16 partitioned across cuda:0 & cuda:1)")
-    print(f"Draft Model: {draft_path} (Speculative K={args.spec_k})")
-    print(f"Gateway:     http://127.0.0.1:{args.port}")
-    print("Inter-GPU:   127.0.0.1 loopback IPC (0.05ms latency — ZERO tunnels)", flush=True)
+    print("🚀 SHARDFLOW DUAL-GPU (2x T4) ACCELERATED INFERENCE PIPELINE", flush=True)
+    print(f"Base Model:    {model_path} (FP16 partitioned across cuda:0 & cuda:1)")
+    print(f"Draft Model:   {draft_path} (Speculative K={args.spec_k})")
+    print(f"CUDA Graphs:   {'✅ ENABLED (Zero kernel launch latency)' if use_cuda_graphs else '❌ DISABLED'}")
+    print(f"Data-Plane:    ✅ v2 P2P Streaming Direct Link")
+    print(f"Gateway:       http://127.0.0.1:{args.port}")
     print("=" * 70, flush=True)
 
     # 1. Start Local Gateway & Registry
-    print("\n[1/4] Starting local Gateway & Registry on http://127.0.0.1:%d..." % args.port, flush=True)
-    gateway_proc = multiprocessing.Process(target=run_gateway_server, args=(args.port,), daemon=True)
+    print("\n[1/4] Starting local Gateway & Registry with v2 Data Plane...", flush=True)
+    gateway_proc = multiprocessing.Process(target=run_gateway_server, args=(args.port, args.stream_port), daemon=True)
     gateway_proc.start()
 
     # Wait for Gateway to be ready
@@ -87,13 +93,16 @@ def main():
         "--host", "127.0.0.1",
         "--port", "9501",
         "--device", "cuda",
-        "--no-cuda-graphs",
+        "--spec-k", str(args.spec_k),
     ]
+    if not use_cuda_graphs:
+        node1_cmd.append("--no-cuda-graphs")
+
     node1_log = open("/tmp/node1_local.log", "w")
     node1_proc = subprocess.Popen(node1_cmd, env=node1_env, stdout=node1_log, stderr=subprocess.STDOUT)
 
     # Wait for Node 1 to listen
-    print("Waiting for Node 1 weights to load into GPU 1 VRAM...", flush=True)
+    print("Waiting for Node 1 weights & CUDA Graphs to initialize on GPU 1...", flush=True)
     for _ in range(120):
         if node1_proc.poll() is not None:
             raise RuntimeError(f"Node 1 failed to start (exit code {node1_proc.returncode}). Check /tmp/node1_local.log")
@@ -126,10 +135,12 @@ def main():
         "--reg-layer-end", "28",
         "--expected-nodes", "1",
         "--device", "cuda",
-        "--no-cuda-graphs",
+        "--spec-k", str(args.spec_k),
     ]
     if draft_path:
-        node0_cmd.extend(["--draft-model", draft_path, "--spec-k", str(args.spec_k)])
+        node0_cmd.extend(["--draft-model", draft_path])
+    if not use_cuda_graphs:
+        node0_cmd.append("--no-cuda-graphs")
 
     node0_log = open("/tmp/node0_local.log", "w")
     node0_proc = subprocess.Popen(node0_cmd, env=node0_env, stdout=node0_log, stderr=subprocess.STDOUT)
