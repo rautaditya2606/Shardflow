@@ -29,6 +29,29 @@ if os.path.exists("/kaggle"):
     os.environ["HF_HUB_CACHE"] = "/kaggle/working/hf_home"
 
 
+def kill_ports(ports: list[int]):
+    """Kill any zombie processes from prior runs occupying our ports."""
+    import signal
+    for port in ports:
+        try:
+            subprocess.run(["fuser", "-k", "-n", "tcp", str(port)], capture_output=True, timeout=1.0)
+        except Exception:
+            pass
+        try:
+            res = subprocess.run(["lsof", "-t", f"-i:{port}"], capture_output=True, text=True, timeout=1.0)
+            if res.returncode == 0 and res.stdout.strip():
+                for pid_str in res.stdout.strip().split():
+                    try:
+                        pid = int(pid_str)
+                        if pid != os.getpid():
+                            os.kill(pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    time.sleep(0.5)
+
+
 def run_gateway_server(port: int = 8000, stream_port: int = 8001):
     """Run Gateway + Embedded Registry FastAPI server."""
     os.environ["SHARDFLOW_STREAM_HOST"] = "127.0.0.1"
@@ -50,6 +73,9 @@ def main():
     parser.add_argument("--stream-port", type=int, default=8001, help="P2P stream receiver port")
     parser.add_argument("--no-cuda-graphs", action="store_true", default=True, help="Disable CUDA Graphs in eager mode")
     args = parser.parse_args()
+
+    # Clean up any lingering processes from previous notebook runs
+    kill_ports([args.port, args.stream_port, 9500])
 
     model_path = args.model if os.path.exists(args.model) else "Qwen/Qwen2.5-7B-Instruct"
     draft_path = args.draft_model if (args.draft_model and os.path.exists(args.draft_model)) else "Qwen/Qwen2.5-0.5B-Instruct"

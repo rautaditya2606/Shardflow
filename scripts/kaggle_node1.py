@@ -47,7 +47,27 @@ def ensure_cloudflared() -> str:
                 f.write(chunk)
     os.chmod(local_cf, 0o755)
     print("✅ cloudflared downloaded.", flush=True)
-    return str(local_cf)
+def kill_ports(ports: list[int]):
+    """Kill any zombie processes from prior runs occupying our ports."""
+    import signal
+    for port in ports:
+        try:
+            subprocess.run(["fuser", "-k", "-n", "tcp", str(port)], capture_output=True, timeout=1.0)
+        except Exception:
+            pass
+        try:
+            res = subprocess.run(["lsof", "-t", f"-i:{port}"], capture_output=True, text=True, timeout=1.0)
+            if res.returncode == 0 and res.stdout.strip():
+                for pid_str in res.stdout.strip().split():
+                    try:
+                        pid = int(pid_str)
+                        if pid != os.getpid():
+                            os.kill(pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    time.sleep(0.5)
 
 
 def main():
@@ -63,6 +83,9 @@ def main():
     parser.add_argument("--no-cuda-graphs", action="store_true", default=True, help="Disable CUDA Graphs in eager mode")
     parser.add_argument("--no-cloudflared", action="store_true", help="Skip cloudflared tunnel (for local loopback testing)")
     args = parser.parse_args()
+
+    # Clean up any lingering processes from previous notebook runs
+    kill_ports([args.port, args.http_port])
 
     model_path = args.model if os.path.exists(args.model) else "Qwen/Qwen2.5-7B-Instruct"
 
