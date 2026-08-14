@@ -77,12 +77,12 @@ class PipelineNode:
         self.enable_cuda_graphs = enable_cuda_graphs
         self.spec_k = spec_k
 
-        # KV Cache Store with static slot leasing
+        # KV Cache Store (DynamicCache in eager mode, StaticCache in CUDA Graph mode)
         self.kv_store = KVCacheStore(
             eviction_timeout=kv_timeout,
             max_sessions=max_sessions,
             max_seq_len=2048,
-            enable_static_cache=True,
+            enable_static_cache=self.enable_cuda_graphs,
         )
 
         # Determine and cache node dtype safely (ponytail: cached once on init)

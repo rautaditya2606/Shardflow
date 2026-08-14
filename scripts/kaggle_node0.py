@@ -284,7 +284,6 @@ def main():
         print("\nCleaning up processes...", flush=True)
         node0_proc.terminate()
         gateway_proc.terminate()
-        node0_log.close()
         print("Shutdown complete.")
 
 
