@@ -19,21 +19,21 @@ ShardFlow combines **v2 peer-to-peer data-plane execution**, **causal speculativ
 
 ---
 
-## ⚡ Key Highlights & Innovations
+## Key Highlights & Innovations
 
-- **🚀 v2 Peer-to-Peer Data Plane (`START_SESSION`)**: The Gateway sends session metadata *once* to Node 0. Node 0 drives the entire decode loop peer-to-peer across GPU worker nodes without Gateway chattiness, cutting WAN round-trip hops in half.
-- **⚡ Causal Speculative Decoding ($K=12$)**: Runs a lightweight draft model (e.g. `Qwen2.5-0.5B`) locally on Node 0 to propose $K$ candidate tokens simultaneously. The full target model (e.g. `Qwen2.5-7B`) verifies all $K$ candidates in a single WAN network roundtrip, achieving multi-token acceptance and amortizing network latency.
-- **🌐 Transport Agnostic Networking**:
+- **v2 Peer-to-Peer Data Plane (`START_SESSION`)**: The Gateway sends session metadata *once* to Node 0. Node 0 drives the entire decode loop peer-to-peer across GPU worker nodes without Gateway chattiness, cutting WAN round-trip hops in half.
+- **Causal Speculative Decoding ($K=12$)**: Runs a lightweight draft model (e.g. `Qwen2.5-0.5B`) locally on Node 0 to propose $K$ candidate tokens simultaneously. The full target model (e.g. `Qwen2.5-7B`) verifies all $K$ candidates in a single WAN network roundtrip, achieving multi-token acceptance and amortizing network latency.
+- **Transport Agnostic Networking**:
   - **Raw TCP (Framed Binary Protocol)**: Zero-copy binary tensor serialization with length-prefixed framing for local and rented GPU clouds.
   - **HTTP WAN Tunneling (`HTTPNodeClient` / `HTTPNodeServer`)**: Built-in HTTP `/activate` endpoints that pass binary tensors directly through Cloudflare Quick Tunnels (`trycloudflare.com`) without raw TCP blocking.
   - **Tailscale WireGuard Mesh**: Native P2P WireGuard mesh networking for encrypted, direct intra-cloud UDP communication (<5ms RTT).
-- **💾 Zero-RAM Meta-Device Model Slicing**: Instantiates model skeletons on the PyTorch `meta` device in 0.00s with **0 MB CPU RAM overhead**, streaming only assigned safetensors layer shards directly into target GPU VRAM.
-- **🧠 Hybrid KV Cache Management**: Uses standard `DynamicCache` with dynamic tensor cropping during eager execution to eliminate float16 attention mask overflow, and pre-allocated `StaticCache` slots for CUDA Graph capture.
-- **🎯 Dynamic VRAM-Weighted Auto-Partitioning**: `AutoPartitionEngine` dynamically calculates layer boundaries based on real-time VRAM availability and accounts for LM Head / RMSNorm overhead on terminal nodes.
+- **Zero-RAM Meta-Device Model Slicing**: Instantiates model skeletons on the PyTorch `meta` device in 0.00s with **0 MB CPU RAM overhead**, streaming only assigned safetensors layer shards directly into target GPU VRAM.
+- **Hybrid KV Cache Management**: Uses standard `DynamicCache` with dynamic tensor cropping during eager execution to eliminate float16 attention mask overflow, and pre-allocated `StaticCache` slots for CUDA Graph capture.
+- **Dynamic VRAM-Weighted Auto-Partitioning**: `AutoPartitionEngine` dynamically calculates layer boundaries based on real-time VRAM availability and accounts for LM Head / RMSNorm overhead on terminal nodes.
 
 ---
 
-## 🏗️ System Architecture
+## System Architecture
 
 ```mermaid
 graph TD
@@ -93,13 +93,13 @@ graph TD
 
 ---
 
-## 🚀 Quickstart Guides
+## Quickstart Guides
 
 ### Scenario 1: Distributed Inference across 2 Free Kaggle Instances
 
 Run a 7B parameter model in native FP16 across two separate Kaggle notebook instances using Cloudflare Quick Tunnels:
 
-#### **Step 1: On Kaggle Instance B (Terminal Node 1)**
+#### Step 1: On Kaggle Instance B (Terminal Node 1)
 ```python
 %cd /kaggle/working
 !git clone https://github.com/rautaditya2606/Shardflow.git
@@ -117,9 +117,9 @@ os.environ["HF_HOME"] = "/kaggle/working/hf_home"
     --spec-k 12 \
     --no-cuda-graphs
 ```
-*(Wait until `🌟 NODE 1 IS READY` appears and copy your public `--node1-url`)*
+*(Wait until Node 1 is ready and copy your public `--node1-url`)*
 
-#### **Step 2: On Kaggle Instance A (Node 0 + Gateway)**
+#### Step 2: On Kaggle Instance A (Node 0 + Gateway)
 ```python
 %cd /kaggle/working
 !git clone https://github.com/rautaditya2606/Shardflow.git
@@ -171,7 +171,7 @@ python scripts/runpod_runner.py \
 
 ---
 
-## 📡 OpenAI-Compatible API Usage
+## OpenAI-Compatible API Usage
 
 Once the pipeline is online, hit `POST /v1/chat/completions` using standard client SDKs:
 
@@ -213,7 +213,7 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 
 ---
 
-## 📊 Benchmark Results
+## Benchmark Results
 
 ### 1. Cross-Kaggle 2× T4 GPUs over Cloudflare Quick Tunnel (Qwen2.5-7B)
 
@@ -237,7 +237,7 @@ Live benchmarks across **two distinct Kaggle notebook instances** communicating 
 | **$K=2$** | **4.19 tok/s** | 1-2 tokens per round-trip | Suboptimal: fixed RTT overhead dominates |
 | **$K=4$** | **5.12 tok/s** | 2-3 tokens per round-trip | Increasing tokens-per-roundtrip |
 | **$K=8$** | **7.19 tok/s** | 4-6 tokens per round-trip | Significant amortization of WAN RTT |
-| **$K=12$** | **9.25 tok/s** 🚀 | **6-9 tokens per round-trip** | **Optimal Sweet Spot** (Max Net WAN Throughput) |
+| **$K=12$** | **9.25 tok/s** | **6-9 tokens per round-trip** | **Optimal Sweet Spot** (Max Net WAN Throughput) |
 | **$K=16$** | **7.87 tok/s** | 7-10 tokens per round-trip | Diminishing returns: draft divergence outpaces trip gain |
 
 ---
@@ -263,7 +263,7 @@ Live benchmarks across **two distinct Kaggle notebook instances** communicating 
 
 ---
 
-## 🛠️ Local Development & Testing
+## Local Development & Testing
 
 ### Installation
 
@@ -287,6 +287,6 @@ python -m pytest -p no:opik
 
 ---
 
-## 📜 License
+## License
 
 Distributed under the [MIT License](LICENSE).
