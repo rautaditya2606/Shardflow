@@ -29,6 +29,7 @@ from shardflow.node.cuda_graph import CUDAGraphRunner
 from shardflow.node.draft_model import DraftSampler, rewind_kv_cache
 from shardflow.orchestrator.sampler import sample_next_token
 from shardflow.transport.connection import NodeServer, NodeClient
+from shardflow.transport.http_node import HTTPNodeClient, HTTPNodeServer
 from shardflow.transport.protocol import (
     MessageType,
     TensorMessage,
@@ -61,12 +62,16 @@ class PipelineNode:
         enable_cuda_graphs: bool = True,
         draft_model: Optional[str] = None,
         spec_k: int = 4,
+        next_node_url: Optional[str] = None,
+        http_port: Optional[int] = None,
     ):
         self.model_slice = model_slice
         self.is_first_node = is_first_node
         self.is_last_node = is_last_node
         self.next_node_host = next_node_host
         self.next_node_port = next_node_port
+        self.next_node_url = next_node_url
+        self.http_port = http_port
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.enable_cuda_graphs = enable_cuda_graphs
@@ -123,8 +128,9 @@ class PipelineNode:
                 self.draft_sampler = None
 
         # Connection to next node (if not the last)
-        self._next_client: Optional[NodeClient] = None
+        self._next_client: Optional[object] = None
         self._server: Optional[NodeServer] = None
+        self._http_server: Optional[HTTPNodeServer] = None
         # Stream clients cache for terminal node stream-back: (host, port) -> NodeClient
         self._stream_clients: dict[tuple[str, int], NodeClient] = {}
 
@@ -155,23 +161,36 @@ class PipelineNode:
         )
         await self._server.start()
 
-        # 2. Connect to the next node in the chain (if not last)
-        if not self.is_last_node and self.next_node_host:
-            self._next_client = NodeClient(
-                self.next_node_host,
-                self.next_node_port,
+        # 1b. Start HTTP server if http_port is configured (for remote tunnel/WAN transport)
+        if self.http_port is not None:
+            self._http_server = HTTPNodeServer(
+                host=self.listen_host,
+                port=self.http_port,
+                handler=self._handle_message,
             )
-            try:
-                await self._next_client.connect(max_retries=5, retry_delay=1.0)
-                logger.info(
-                    "Connected to next node at %s:%d",
-                    self.next_node_host, self.next_node_port
+            await self._http_server.start()
+
+        # 2. Connect to the next node in the chain (if not last)
+        if not self.is_last_node:
+            if self.next_node_url:
+                self._next_client = HTTPNodeClient(self.next_node_url)
+                logger.info("Configured HTTP client to next node at %s", self.next_node_url)
+            elif self.next_node_host:
+                self._next_client = NodeClient(
+                    self.next_node_host,
+                    self.next_node_port,
                 )
-            except Exception as e:
-                logger.info(
-                    "Next node at %s:%d is still booting — will connect on first request: %s",
-                    self.next_node_host, self.next_node_port, e
-                )
+                try:
+                    await self._next_client.connect(max_retries=5, retry_delay=1.0)
+                    logger.info(
+                        "Connected to next node at %s:%d",
+                        self.next_node_host, self.next_node_port
+                    )
+                except Exception as e:
+                    logger.info(
+                        "Next node at %s:%d is still booting — will connect on first request: %s",
+                        self.next_node_host, self.next_node_port, e
+                    )
 
         logger.info(
             "Node ready — layers [%d, %d), %s, listening on %s:%d (CUDA Graphs: %s)",
@@ -524,6 +543,16 @@ class PipelineNode:
                     resp = await self._next_client.send_recv(forward_msg, timeout=30.0)
                     if is_final_chunk and resp.msg_type == MessageType.TOKEN_ID:
                         next_token = resp.token_id
+                        # HTTP transport: stream prefill token from Node 0 locally to Gateway
+                        if isinstance(self._next_client, HTTPNodeClient) and stream_host and stream_port:
+                            stream_client = await self._get_stream_client(stream_host, stream_port)
+                            if stream_client and stream_client.is_connected:
+                                await stream_client.send(TensorMessage(
+                                    msg_type=MessageType.STREAM_TOKEN,
+                                    session_id=session_id,
+                                    token_id=next_token,
+                                    is_eos=False,
+                                ))
 
             if next_token is None:
                 raise RuntimeError("No token returned from prefill phase")
@@ -632,6 +661,26 @@ class PipelineNode:
                                 # Rewind draft model using its own seq_len, not the target model's
                                 draft_target = self.draft_sampler.seq_len - len(drafts) + accepted_count
                                 self.draft_sampler.rewind(draft_target)
+
+                            # HTTP transport: stream accepted tokens from Node 0 locally to Gateway
+                            if isinstance(self._next_client, HTTPNodeClient) and stream_host and stream_port:
+                                stream_client = await self._get_stream_client(stream_host, stream_port)
+                                if stream_client and stream_client.is_connected:
+                                    if drafts and accepted_count > 1:
+                                        for d_idx in range(accepted_count - 1):
+                                            await stream_client.send(TensorMessage(
+                                                msg_type=MessageType.STREAM_TOKEN,
+                                                session_id=session_id,
+                                                token_id=drafts[d_idx],
+                                                is_eos=False,
+                                            ))
+                                    await stream_client.send(TensorMessage(
+                                        msg_type=MessageType.STREAM_TOKEN,
+                                        session_id=session_id,
+                                        token_id=next_token,
+                                        is_eos=False,
+                                    ))
+
                             step += accepted_count
                         else:
                             raise RuntimeError(f"Unexpected response in speculative decode loop: {resp.msg_type}")
@@ -676,6 +725,16 @@ class PipelineNode:
                         resp = await self._next_client.send_recv(forward_msg, timeout=15.0)
                         if resp.msg_type == MessageType.TOKEN_ID:
                             next_token = resp.token_id
+                            # HTTP transport: stream token from Node 0 locally to Gateway
+                            if isinstance(self._next_client, HTTPNodeClient) and stream_host and stream_port:
+                                stream_client = await self._get_stream_client(stream_host, stream_port)
+                                if stream_client and stream_client.is_connected:
+                                    await stream_client.send(TensorMessage(
+                                        msg_type=MessageType.STREAM_TOKEN,
+                                        session_id=session_id,
+                                        token_id=next_token,
+                                        is_eos=False,
+                                    ))
                         else:
                             raise RuntimeError(f"Unexpected response in decode loop: {resp.msg_type}")
                     step += 1
@@ -893,6 +952,8 @@ class PipelineNode:
         self.kv_store.clear_all()
         if self._server:
             await self._server.stop()
+        if self._http_server:
+            await self._http_server.stop()
         if self._next_client:
             await self._next_client.close()
         logger.info("Node stopped")
@@ -908,6 +969,8 @@ def main():
     parser.add_argument("--port", type=int, default=9000, help="Listen port")
     parser.add_argument("--next-host", default=None, help="Next node host (omit for last node)")
     parser.add_argument("--next-port", type=int, default=None, help="Next node port")
+    parser.add_argument("--next-node-url", default=None, help="Next node HTTP/HTTPS URL (e.g. Cloudflare tunnel URL)")
+    parser.add_argument("--http-port", type=int, default=None, help="HTTP server port for incoming activations (default: None)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--registry-url", default=None, help="Topology Registry URL for auto-registration")
     parser.add_argument("--public-host", default=None, help="Public address accessible by other nodes")
@@ -1037,6 +1100,8 @@ def main():
         is_last_node=is_last,
         next_node_host=next_host,
         next_node_port=next_port,
+        next_node_url=args.next_node_url,
+        http_port=args.http_port,
         listen_host=args.host,
         listen_port=args.port,
         enable_cuda_graphs=args.enable_cuda_graphs and not args.no_cuda_graphs,
