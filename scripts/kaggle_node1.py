@@ -47,6 +47,9 @@ def ensure_cloudflared() -> str:
                 f.write(chunk)
     os.chmod(local_cf, 0o755)
     print("✅ cloudflared downloaded.", flush=True)
+    return str(local_cf)
+
+
 def kill_ports(ports: list[int]):
     """Kill any zombie processes from prior runs occupying our ports."""
     import signal
