@@ -67,6 +67,7 @@ def main():
     parser.add_argument("--node1-url", required=True, help="Cloudflare tunnel URL of Node 1 on Kaggle B (e.g. https://*.trycloudflare.com)")
     parser.add_argument("--model", default="/kaggle/working/models/Qwen2.5-7B-Instruct", help="Model path or HF ID")
     parser.add_argument("--draft-model", default=None, help="Draft model path (only used if spec_k > 0)")
+    parser.add_argument("--spec-k", type=int, default=12, help="Speculative candidate tokens (default: 12, set 0 to disable)")
     parser.add_argument("--layer-start", type=int, default=None, help="Starting layer index for Node 0 (default: 0)")
     parser.add_argument("--layer-end", type=int, default=None, help="Ending layer index for Node 0 (default: half of total layers)")
     parser.add_argument("--4bit", action="store_true", help="Enable 4-bit NF4 loading")
