@@ -266,7 +266,7 @@ class PipelineNode:
                 seq = cache.layers[l_idx].get_seq_length()
                 if isinstance(seq, torch.Tensor):
                     return int(seq.item())
-                if seq is not None and int(seq) > 0:
+                if seq is not None:
                     return int(seq)
             except Exception:
                 pass
@@ -275,18 +275,19 @@ class PipelineNode:
                 seq = cache.get_seq_length(l_idx)
                 if isinstance(seq, torch.Tensor):
                     return int(seq.item())
-                if seq is not None and int(seq) > 0:
+                if seq is not None:
                     return int(seq)
             except Exception:
                 pass
-            try:
-                seq = cache.get_seq_length()
-                if isinstance(seq, torch.Tensor):
-                    return int(seq.item())
-                if seq is not None and int(seq) > 0:
-                    return int(seq)
-            except Exception:
-                pass
+            if l_idx == 0:
+                try:
+                    seq = cache.get_seq_length()
+                    if isinstance(seq, torch.Tensor):
+                        return int(seq.item())
+                    if seq is not None:
+                        return int(seq)
+                except Exception:
+                    pass
         if hasattr(cache, "_seen_tokens") and cache._seen_tokens is not None:
             return int(cache._seen_tokens)
         return 0
@@ -844,6 +845,10 @@ class PipelineNode:
         )
 
         past_seq_len = self._get_cache_seq_len(cache)
+        logger.info(
+            "Node [%d..%d] _forward: past_seq_len=%d seq_len=%d (session=%s)",
+            self.model_slice.layer_start, self.model_slice.layer_end, past_seq_len, seq_len, session_id[:8] if session_id else "None",
+        )
 
         # Fast path: CUDA Graph replay for single-token autoregressive decoding and speculative verify
         if seq_len == 1 and self.graph_runner.can_use_graph(seq_len):
