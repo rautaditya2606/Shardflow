@@ -588,7 +588,9 @@ class PipelineNode:
                         if cache is not None:
                             rewind_kv_cache(cache, past_seq_len + accepted_count)
                         if self.draft_sampler:
-                            self.draft_sampler.rewind(past_seq_len + accepted_count)
+                            # Rewind draft model to its own position (independent of target model)
+                            draft_target = self.draft_sampler.seq_len - len(drafts) + accepted_count
+                            self.draft_sampler.rewind(draft_target)
 
                         if stream_host and stream_port:
                             stream_client = await self._get_stream_client(stream_host, stream_port)
@@ -627,7 +629,9 @@ class PipelineNode:
                             if cache is not None:
                                 rewind_kv_cache(cache, past_seq_len + accepted_count)
                             if self.draft_sampler:
-                                self.draft_sampler.rewind(past_seq_len + accepted_count)
+                                # Rewind draft model using its own seq_len, not the target model's
+                                draft_target = self.draft_sampler.seq_len - len(drafts) + accepted_count
+                                self.draft_sampler.rewind(draft_target)
                             step += accepted_count
                         else:
                             raise RuntimeError(f"Unexpected response in speculative decode loop: {resp.msg_type}")
@@ -841,6 +845,13 @@ class PipelineNode:
                     hidden_states = layer_output[0]
                 else:
                     hidden_states = layer_output
+
+            # Eager path: StaticCache._seen_tokens is not updated by layer.forward();
+            # manually advance it so get_seq_length() returns the correct next position
+            # on the next decode step. Without this, every step reads past_seq_len=N
+            # (frozen at prefill end) and all KV writes land on the same slot → gibberish.
+            if cache is not None and hasattr(cache, "_seen_tokens"):
+                cache._seen_tokens = past_seq_len + seq_len
 
         # If last node and compute_head requested, apply final norm and LM head
         if self.is_last_node and compute_head:

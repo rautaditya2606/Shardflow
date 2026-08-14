@@ -73,6 +73,10 @@ class DraftSampler:
         self.dtype = dtype
         self.spec_k = spec_k
         self.cache = DynamicCache()
+        # Independent position counter for the draft model's KV cache.
+        # Tracked separately from the target model so rewind() receives the
+        # correct absolute draft position rather than the target's seq_len.
+        self._seq_len: int = 0
 
         logger.info("Loading draft model %s on %s (dtype=%s, K=%d)...", model_path, device, dtype, spec_k)
         import os
@@ -85,9 +89,15 @@ class DraftSampler:
         )
         self.model.eval()
 
+    @property
+    def seq_len(self) -> int:
+        """Current absolute sequence length of the draft model's KV cache."""
+        return self._seq_len
+
     def reset(self) -> None:
         """Reset draft model KV cache for a new session."""
         self.cache = DynamicCache()
+        self._seq_len = 0
 
     @torch.inference_mode()
     def prefill(self, prompt_tokens: List[int]) -> None:
@@ -104,10 +114,12 @@ class DraftSampler:
             past_key_values=self.cache,
             use_cache=True,
         )
+        self._seq_len = len(prompt_tokens)
 
     def rewind(self, target_seq_len: int) -> None:
         """Rewind draft model KV cache after speculative rejection."""
         rewind_dynamic_cache(self.cache, target_seq_len)
+        self._seq_len = target_seq_len
 
     @torch.inference_mode()
     def generate_drafts(
@@ -142,5 +154,6 @@ class DraftSampler:
             )
             draft_tokens.append(sampled_id)
             next_tok = sampled_id
+            self._seq_len += 1
 
         return draft_tokens
