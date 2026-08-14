@@ -972,9 +972,9 @@ def main():
                     layer_start = data.get("layer_start")
                 if layer_end is None or layer_end == 0:
                     layer_end = data.get("layer_end")
-                is_last = data.get("is_last_node", is_last)
-                next_host = data.get("next_node_host", next_host)
-                next_port = data.get("next_node_port", next_port)
+                is_last = data.get("is_last_node") if data.get("is_last_node") is not None else is_last
+                next_host = data.get("next_node_host") or next_host
+                next_port = data.get("next_node_port") or next_port
                 logger.info(
                     "Registered node %s with registry -> assigned layers [%s, %s)",
                     node_id, layer_start, layer_end
@@ -990,8 +990,8 @@ def main():
                 layer_start = assignment["layer_start"]
                 layer_end = assignment["layer_end"]
                 is_last = assignment["is_last_node"]
-                next_host = assignment.get("next_node_host")
-                next_port = assignment.get("next_node_port")
+                next_host = assignment.get("next_node_host") or next_host
+                next_port = assignment.get("next_node_port") or next_port
                 logger.info(
                     "Auto-assigned layers [%d, %d) (is_last=%s)",
                     layer_start, layer_end, is_last,

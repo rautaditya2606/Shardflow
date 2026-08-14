@@ -210,12 +210,25 @@ def main():
             decode_time = (t_end - t_first_tok) if t_first_tok else total_time
             tps = (tok_count - 1) / decode_time if decode_time > 0 and tok_count > 1 else (tok_count / decode_time if decode_time > 0 else 0)
 
+            if tok_count == 0:
+                print("\n⚠️ No tokens generated. Checking Node 0 and Node 1 logs...", flush=True)
+                try:
+                    with open("/tmp/node0_local.log", "r") as f0:
+                        lines0 = f0.readlines()[-15:]
+                        print(f"[Node 0 Log Tail]:\n{''.join(lines0)}", flush=True)
+                    with open("/tmp/node1_local.log", "r") as f1:
+                        lines1 = f1.readlines()[-15:]
+                        print(f"[Node 1 Log Tail]:\n{''.join(lines1)}", flush=True)
+                except Exception as ex:
+                    print(f"Could not read logs: {ex}", flush=True)
+
             print("\n" + "-" * 50, flush=True)
             print(f"📊 Tokens: {tok_count} | TTFT: {ttft*1000:.1f} ms | Decode Time: {decode_time:.2f} s | Throughput: {tps:.2f} TPS 🚀", flush=True)
             print("-" * 50, flush=True)
 
-            tps_list.append(tps)
-            ttft_list.append(ttft)
+            if tok_count > 0:
+                tps_list.append(tps)
+                ttft_list.append(ttft)
 
         if tps_list:
             import statistics
