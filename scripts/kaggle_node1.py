@@ -112,8 +112,7 @@ def main():
     if args.no_cuda_graphs:
         node1_cmd.append("--no-cuda-graphs")
 
-    node1_log = open("/tmp/node1_remote.log", "w")
-    node1_proc = subprocess.Popen(node1_cmd, stdout=node1_log, stderr=subprocess.STDOUT)
+    node1_proc = subprocess.Popen(node1_cmd)
 
     # Wait for Node 1 HTTP server /health to be ready
     health_url = f"http://127.0.0.1:{args.http_port}/health"

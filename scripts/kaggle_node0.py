@@ -154,9 +154,7 @@ def main():
         node0_cmd.extend(["--draft-model", draft_path])
     if args.no_cuda_graphs:
         node0_cmd.append("--no-cuda-graphs")
-
-    node0_log = open("/tmp/node0_remote.log", "w")
-    node0_proc = subprocess.Popen(node0_cmd, env=node0_env, stdout=node0_log, stderr=subprocess.STDOUT)
+    node0_proc = subprocess.Popen(node0_cmd, env=node0_env)
 
     print("Waiting for Node 0 weights + Draft Model to load...", flush=True)
     for _ in range(120):
