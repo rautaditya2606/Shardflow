@@ -100,8 +100,8 @@ def _load_state_dict_into_4bit_slice(
     embed_tokens: Optional[nn.Module] = None,
 ) -> None:
     """
-    Quantizes and loads FP16/BF16 state_dict tensors directly into 4-bit module slice in-place.
-    Peak memory per tensor is strictly bounded to a single weight matrix.
+    Loads state_dict tensors directly into 4-bit module slice in-place.
+    Handles both pre-quantized bitsandbytes NF4 checkpoints and on-the-fly quantization of FP16 weights.
     """
     try:
         import bitsandbytes as bnb
@@ -109,7 +109,34 @@ def _load_state_dict_into_4bit_slice(
     except ImportError:
         raise ImportError("bitsandbytes required for 4-bit loading.")
 
+    # Group tensors per target module
+    grouped_modules: Dict[Any, Dict[str, torch.Tensor]] = {}
+
     for key, tensor in list(state_dict.items()):
+        # Final RMSNorm
+        if key.startswith("model.norm.") and norm is not None:
+            norm.weight = nn.Parameter(
+                tensor.to(device=device, dtype=compute_dtype),
+                requires_grad=False,
+            )
+            continue
+
+        # Token Embedding
+        if key.startswith("model.embed_tokens.") and embed_tokens is not None:
+            embed_tokens.weight = nn.Parameter(
+                tensor.to(device=device, dtype=compute_dtype),
+                requires_grad=False,
+            )
+            continue
+
+        # LM Head
+        if key.startswith("lm_head.") and lm_head is not None:
+            subpath = key[len("lm_head."):]
+            if lm_head not in grouped_modules:
+                grouped_modules[lm_head] = {}
+            grouped_modules[lm_head][subpath] = tensor
+            continue
+
         # Transformer layers
         if key.startswith("model.layers."):
             parts = key.split(".")
@@ -119,16 +146,57 @@ def _load_state_dict_into_4bit_slice(
 
             local_idx = orig_idx - layer_start
             layer = extracted_layers[local_idx]
-            subpath = ".".join(parts[3:])
 
+            subpath_parts = parts[3:]
             submod = layer
-            path_parts = subpath.split(".")
-            for part in path_parts[:-1]:
-                submod = getattr(submod, part)
-            param_name = path_parts[-1]
+            param_parts = []
 
-            if isinstance(submod, bnb.nn.Linear4bit) and param_name == "weight":
-                raw_weight = tensor.to(device=device, dtype=compute_dtype, non_blocking=True)
+            for idx, part in enumerate(subpath_parts):
+                if hasattr(submod, part) and isinstance(getattr(submod, part), nn.Module):
+                    submod = getattr(submod, part)
+                else:
+                    param_parts = subpath_parts[idx:]
+                    break
+
+            param_key = ".".join(param_parts) if param_parts else "weight"
+            if submod not in grouped_modules:
+                grouped_modules[submod] = {}
+            grouped_modules[submod][param_key] = tensor
+
+    # Assign parameters to each submodule
+    for submod, tensors in grouped_modules.items():
+        if isinstance(submod, bnb.nn.Linear4bit):
+            # Check if pre-quantized (uint8/int8) or raw FP16/BF16
+            weight_tensor = tensors.get("weight")
+            if weight_tensor is None:
+                for k, v in tensors.items():
+                    if k.startswith("weight") and v.dtype in (torch.uint8, torch.int8):
+                        weight_tensor = v
+                        break
+
+            if weight_tensor is not None and weight_tensor.dtype in (torch.uint8, torch.int8):
+                # Pre-quantized safetensors
+                quant_stats = {}
+                for k, v in tensors.items():
+                    clean_k = k[7:] if k.startswith("weight.") else k
+                    if clean_k not in ("weight", "bias"):
+                        quant_stats[clean_k] = v.to(device=device) if hasattr(v, "to") else v
+                try:
+                    param = bnb.nn.Params4bit.from_prequantized(
+                        data=weight_tensor,
+                        quantized_stats=quant_stats,
+                        requires_grad=False,
+                        device=device,
+                    )
+                    submod.weight = param
+                except Exception as e:
+                    logger.debug("from_prequantized fallback for %s: %s", submod, e)
+                    param = bnb.nn.Params4bit(weight_tensor.to(device=device), requires_grad=False, quant_type=quant_type)
+                    submod.weight = param
+
+            elif weight_tensor is not None:
+                # Raw unquantized FP16/BF16 -> quantize in-place
+                raw_weight = weight_tensor.to(device=device, dtype=compute_dtype, non_blocking=True)
                 q_weight, q_state = bnb_F.quantize_4bit(
                     raw_weight,
                     quant_type=quant_type,
@@ -141,60 +209,28 @@ def _load_state_dict_into_4bit_slice(
                     quant_type=quant_type,
                 )
                 param.quant_state = q_state
-                setattr(submod, "weight", param)
+                submod.weight = param
                 del raw_weight
 
-            elif isinstance(submod, bnb.nn.Linear4bit) and param_name == "bias":
-                bias_param = nn.Parameter(
-                    tensor.to(device=device, dtype=compute_dtype),
-                    requires_grad=False,
-                )
-                setattr(submod, "bias", bias_param)
-
-            else:
-                norm_param = nn.Parameter(
-                    tensor.to(device=device, dtype=compute_dtype),
-                    requires_grad=False,
-                )
-                setattr(submod, param_name, norm_param)
-
-        # Final RMSNorm
-        elif key.startswith("model.norm.") and norm is not None:
-            norm.weight = nn.Parameter(
-                tensor.to(device=device, dtype=compute_dtype),
-                requires_grad=False,
-            )
-
-        # LM Head
-        elif key.startswith("lm_head.") and lm_head is not None:
-            if isinstance(lm_head, bnb.nn.Linear4bit):
-                raw_weight = tensor.to(device=device, dtype=compute_dtype, non_blocking=True)
-                q_weight, q_state = bnb_F.quantize_4bit(
-                    raw_weight,
-                    quant_type=quant_type,
-                    blocksize=64,
-                    compress_statistics=use_double_quant,
-                )
-                param = bnb.nn.Params4bit(
-                    data=q_weight,
-                    requires_grad=False,
-                    quant_type=quant_type,
-                )
-                param.quant_state = q_state
-                lm_head.weight = param
-                del raw_weight
-            else:
-                lm_head.weight = nn.Parameter(
-                    tensor.to(device=device, dtype=compute_dtype),
+            # Bias if present
+            if "bias" in tensors and tensors["bias"] is not None:
+                submod.bias = nn.Parameter(
+                    tensors["bias"].to(device=device, dtype=compute_dtype),
                     requires_grad=False,
                 )
 
-        # Token Embedding
-        elif key.startswith("model.embed_tokens.") and embed_tokens is not None:
-            embed_tokens.weight = nn.Parameter(
-                tensor.to(device=device, dtype=compute_dtype),
-                requires_grad=False,
-            )
+        else:
+            # Regular LayerNorm, RMSNorm, Linear, or embedding parameter
+            for p_name, p_tensor in tensors.items():
+                clean_name = p_name.split(".")[-1]
+                param = nn.Parameter(
+                    p_tensor.to(device=device, dtype=compute_dtype),
+                    requires_grad=False,
+                )
+                try:
+                    setattr(submod, clean_name, param)
+                except Exception as e:
+                    logger.debug("Parameter set on %s.%s: %s", submod, clean_name, e)
 
     gc.collect()
     if device.type == "cuda" and torch.cuda.is_available():

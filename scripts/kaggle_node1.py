@@ -129,9 +129,7 @@ def main():
     print("Waiting for weights to load and HTTP /health to respond...", flush=True)
     for _ in range(120):
         if node1_proc.poll() is not None:
-            with open("/tmp/node1_remote.log", "r") as f:
-                logs = f.read()
-            raise RuntimeError(f"Node 1 failed to start (exit code {node1_proc.returncode}). Log:\n{logs}")
+            raise RuntimeError(f"Node 1 failed to start (exit code {node1_proc.returncode}). Check terminal logs above.")
         try:
             r = requests.get(health_url, timeout=1.0)
             if r.status_code == 200:
