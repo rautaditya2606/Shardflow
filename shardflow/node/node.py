@@ -256,6 +256,41 @@ class PipelineNode:
             logger.debug("Could not establish stream-back connection to %s:%d: %s", host, port, e)
             return None
 
+    def _get_cache_seq_len(self, cache) -> int:
+        """Get sequence length for this node's slice layer_start."""
+        if cache is None:
+            return 0
+        l_idx = self.model_slice.layer_start
+        if hasattr(cache, "layers") and l_idx < len(cache.layers):
+            try:
+                seq = cache.layers[l_idx].get_seq_length()
+                if isinstance(seq, torch.Tensor):
+                    return int(seq.item())
+                if seq is not None and int(seq) > 0:
+                    return int(seq)
+            except Exception:
+                pass
+        if hasattr(cache, "get_seq_length"):
+            try:
+                seq = cache.get_seq_length(l_idx)
+                if isinstance(seq, torch.Tensor):
+                    return int(seq.item())
+                if seq is not None and int(seq) > 0:
+                    return int(seq)
+            except Exception:
+                pass
+            try:
+                seq = cache.get_seq_length()
+                if isinstance(seq, torch.Tensor):
+                    return int(seq.item())
+                if seq is not None and int(seq) > 0:
+                    return int(seq)
+            except Exception:
+                pass
+        if hasattr(cache, "_seen_tokens") and cache._seen_tokens is not None:
+            return int(cache._seen_tokens)
+        return 0
+
     async def _handle_message(self, msg: TensorMessage) -> Optional[TensorMessage]:
         """
         Process an incoming message.
@@ -356,16 +391,7 @@ class PipelineNode:
                     # Rewind terminal KV cache to exact accepted sequence length
                     cache = self.kv_store.get(msg.session_id)
                     if cache is not None:
-                        past_seq = 0
-                        try:
-                            past_seq = cache.get_seq_length(self.model_slice.layer_start)
-                        except Exception:
-                            try:
-                                past_seq = cache.get_seq_length()
-                            except Exception:
-                                past_seq = 0
-                        if isinstance(past_seq, torch.Tensor):
-                            past_seq = past_seq.item()
+                        past_seq = self._get_cache_seq_len(cache)
                         past_seq_before = int(past_seq or 0) - (len(drafts) + 1)
                         rewind_kv_cache(cache, past_seq_before + accepted_count)
 
@@ -467,16 +493,7 @@ class PipelineNode:
                 if msg.draft_tokens and response.msg_type == MessageType.TOKEN_ID:
                     cache = self.kv_store.get(msg.session_id)
                     if cache is not None:
-                        past_seq = 0
-                        try:
-                            past_seq = cache.get_seq_length(self.model_slice.layer_start)
-                        except Exception:
-                            try:
-                                past_seq = cache.get_seq_length()
-                            except Exception:
-                                past_seq = 0
-                        if isinstance(past_seq, torch.Tensor):
-                            past_seq = past_seq.item()
+                        past_seq = self._get_cache_seq_len(cache)
                         past_seq_before = int(past_seq or 0) - (len(msg.draft_tokens) + 1)
                         accepted_count = response.accepted_count or 1
                         rewind_kv_cache(cache, past_seq_before + accepted_count)
@@ -617,18 +634,7 @@ class PipelineNode:
                         hidden_states = cand_tensor
 
                     cache = self.kv_store.get(session_id)
-                    past_seq_len = 0
-                    if cache is not None:
-                        try:
-                            past_seq_len = cache.get_seq_length(self.model_slice.layer_start)
-                        except Exception:
-                            try:
-                                past_seq_len = cache.get_seq_length()
-                            except Exception:
-                                past_seq_len = 0
-                    if isinstance(past_seq_len, torch.Tensor):
-                        past_seq_len = past_seq_len.item()
-                    past_seq_len = int(past_seq_len or 0)
+                    past_seq_len = self._get_cache_seq_len(cache)
 
                     output = self._forward(
                         hidden_states,
@@ -837,18 +843,7 @@ class PipelineNode:
             dtype=getattr(self, "_node_dtype", torch.float16),
         )
 
-        past_seq_len = 0
-        if cache is not None:
-            try:
-                past_seq_len = cache.get_seq_length(self.model_slice.layer_start)
-            except (TypeError, IndexError, KeyError):
-                try:
-                    past_seq_len = cache.get_seq_length()
-                except Exception:
-                    past_seq_len = 0
-        if isinstance(past_seq_len, torch.Tensor):
-            past_seq_len = past_seq_len.item()
-        past_seq_len = int(past_seq_len or 0)
+        past_seq_len = self._get_cache_seq_len(cache)
 
         # Fast path: CUDA Graph replay for single-token autoregressive decoding and speculative verify
         if seq_len == 1 and self.graph_runner.can_use_graph(seq_len):
