@@ -67,7 +67,9 @@ def main():
     parser.add_argument("--node1-url", required=True, help="Cloudflare tunnel URL of Node 1 on Kaggle B (e.g. https://*.trycloudflare.com)")
     parser.add_argument("--model", default="/kaggle/working/models/Qwen2.5-7B-Instruct", help="Model path or HF ID")
     parser.add_argument("--draft-model", default=None, help="Draft model path (only used if spec_k > 0)")
-    parser.add_argument("--spec-k", type=int, default=12, help="Speculative candidate tokens (default: 12, set 0 to disable)")
+    parser.add_argument("--layer-start", type=int, default=None, help="Starting layer index for Node 0 (default: 0)")
+    parser.add_argument("--layer-end", type=int, default=None, help="Ending layer index for Node 0 (default: half of total layers)")
+    parser.add_argument("--4bit", action="store_true", help="Enable 4-bit NF4 loading")
     parser.add_argument("--prompt", default=None, help="Single prompt to benchmark (optional)")
     parser.add_argument("--max-tokens", type=int, default=50, help="Max tokens per generation")
     parser.add_argument("--port", type=int, default=8000, help="Gateway port")
@@ -80,6 +82,13 @@ def main():
 
     model_path = args.model if os.path.exists(args.model) else "Qwen/Qwen2.5-7B-Instruct"
     
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained(model_path)
+    total_layers = getattr(config, "num_hidden_layers", 28)
+    
+    node0_start = args.layer_start if args.layer_start is not None else 0
+    node0_end = args.layer_end if args.layer_end is not None else (total_layers // 2)
+
     draft_path = None
     if args.spec_k > 0:
         if args.draft_model and os.path.exists(args.draft_model):
@@ -93,7 +102,7 @@ def main():
 
     print("=" * 70, flush=True)
     print("🚀 SHARDFLOW REMOTE DISTRIBUTED INFERENCE PIPELINE (KAGGLE A)", flush=True)
-    print(f"Base Model:    {model_path} (Layers 0..14 on Kaggle A, Layers 14..28 on Kaggle B)")
+    print(f"Base Model:    {model_path} (Layers {node0_start}..{node0_end} on Kaggle A, Layers {node0_end}..{total_layers} on Kaggle B)")
     print(f"Draft Model:   {draft_path or 'DISABLED (spec_k=0)'} (Speculative K={args.spec_k})")
     print(f"Remote Node 1: {args.node1_url}")
     print(f"Gateway:       http://127.0.0.1:{args.port}")
@@ -130,26 +139,28 @@ def main():
         raise RuntimeError("Gateway failed to boot within 15 seconds")
 
     # 2. Start Node 0
-    print("\n[2/3] Spawning Node 0 on cuda:0 (Layers 0..14 + Draft Model)...", flush=True)
+    print(f"\n[2/3] Spawning Node 0 on cuda:0 (Layers {node0_start}..{node0_end} + Draft Model)...", flush=True)
     node0_env = os.environ.copy()
     node0_env["CUDA_VISIBLE_DEVICES"] = "0"
     node0_cmd = [
         sys.executable, "-m", "shardflow.node.node",
         "--model", model_path,
-        "--layer-start", "0",
-        "--layer-end", "14",
+        "--layer-start", str(node0_start),
+        "--layer-end", str(node0_end),
         "--next-node-url", args.node1_url.rstrip("/"),
         "--host", "127.0.0.1",
         "--port", "9500",
         "--public-host", "127.0.0.1",
         "--public-port", "9500",
         "--registry-url", f"http://127.0.0.1:{args.port}",
-        "--reg-layer-start", "0",
-        "--reg-layer-end", "28",
+        "--reg-layer-start", str(node0_start),
+        "--reg-layer-end", str(total_layers),
         "--expected-nodes", "1",
         "--device", "cuda",
         "--spec-k", str(args.spec_k),
     ]
+    if getattr(args, "4bit", False) or "nf4" in model_path.lower() or "4bit" in model_path.lower():
+        node0_cmd.append("--4bit")
     if draft_path:
         node0_cmd.extend(["--draft-model", draft_path])
     if args.no_cuda_graphs:

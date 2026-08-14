@@ -1021,6 +1021,7 @@ def main():
     parser.add_argument("--hf-model-id", default=None, help="Explicit HF repo ID for registry reporting")
     parser.add_argument("--enable-cuda-graphs", action="store_true", default=True, help="Enable CUDA Graphs (default: True)")
     parser.add_argument("--no-cuda-graphs", action="store_true", help="Disable CUDA Graphs and run in pure eager mode")
+    parser.add_argument("--4bit", "--load-in-4bit", dest="load_in_4bit", action="store_true", help="Load weights in 4-bit NF4 via bitsandbytes")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -1120,6 +1121,9 @@ def main():
     total_layers = config.num_hidden_layers
     is_last = (layer_end >= total_layers)
 
+    # Auto-detect 4-bit NF4 from model path or flag
+    use_4bit = bool(args.load_in_4bit or ("nf4" in str(args.model).lower() or "4bit" in str(args.model).lower()))
+
     # Load model slice
     model_slice = load_layer_slice(
         model_path=args.model,
@@ -1127,6 +1131,7 @@ def main():
         layer_end=layer_end,
         include_norm=is_last,
         include_lm_head=is_last,
+        load_in_4bit=use_4bit,
         device=args.device,
     )
 

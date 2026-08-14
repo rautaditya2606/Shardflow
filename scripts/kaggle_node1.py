@@ -73,9 +73,9 @@ def kill_ports(ports: list[int]):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="ShardFlow Node 1 (Kaggle B Remote Runner)")
-    parser.add_argument("--model", default="/kaggle/working/models/Qwen2.5-7B-Instruct", help="Model path or HF ID")
-    parser.add_argument("--layer-start", type=int, default=14, help="Starting layer index (default: 14)")
-    parser.add_argument("--layer-end", type=int, default=28, help="Ending layer index (default: 28)")
+    parser.add_argument("--layer-start", type=int, default=None, help="Starting layer index (default: half of total layers)")
+    parser.add_argument("--layer-end", type=int, default=None, help="Ending layer index (default: total layers)")
+    parser.add_argument("--4bit", action="store_true", help="Enable 4-bit NF4 loading")
     parser.add_argument("--port", type=int, default=9501, help="TCP port (default: 9501)")
     parser.add_argument("--http-port", type=int, default=9502, help="HTTP server port for tunnel (default: 9502)")
     parser.add_argument("--device", default="cuda", help="Target device (cuda or cpu)")
@@ -89,9 +89,16 @@ def main():
 
     model_path = args.model if os.path.exists(args.model) else "Qwen/Qwen2.5-7B-Instruct"
 
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained(model_path)
+    total_layers = getattr(config, "num_hidden_layers", 28)
+
+    layer_start = args.layer_start if args.layer_start is not None else (total_layers // 2)
+    layer_end = args.layer_end if args.layer_end is not None else total_layers
+
     print("=" * 70, flush=True)
     print("🚀 SHARDFLOW REMOTE NODE 1 (KAGGLE INSTANCE B)", flush=True)
-    print(f"Model Shard:   {model_path} (Layers {args.layer_start}..{args.layer_end} + LM Head)")
+    print(f"Model Shard:   {model_path} (Layers {layer_start}..{layer_end} + LM Head)")
     print(f"HTTP Port:     {args.http_port}")
     print(f"Device:        {args.device}")
     print("=" * 70, flush=True)
@@ -101,14 +108,16 @@ def main():
     node1_cmd = [
         sys.executable, "-m", "shardflow.node.node",
         "--model", model_path,
-        "--layer-start", str(args.layer_start),
-        "--layer-end", str(args.layer_end),
+        "--layer-start", str(layer_start),
+        "--layer-end", str(layer_end),
         "--host", "0.0.0.0",
         "--port", str(args.port),
         "--http-port", str(args.http_port),
         "--device", args.device,
         "--spec-k", str(args.spec_k),
     ]
+    if getattr(args, "4bit", False) or "nf4" in model_path.lower() or "4bit" in model_path.lower():
+        node1_cmd.append("--4bit")
     if args.no_cuda_graphs:
         node1_cmd.append("--no-cuda-graphs")
 
