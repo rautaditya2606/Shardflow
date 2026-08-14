@@ -15,6 +15,7 @@ Message types:
     0x01 ACTIVATION  — hidden states for a session
     0x02 CLEAR       — evict KV cache for a session
     0x03 LOGITS      — final logits from last node back to orchestrator
+    
 """
 
 import asyncio
