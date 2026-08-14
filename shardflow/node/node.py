@@ -114,7 +114,7 @@ class PipelineNode:
 
         # Speculative Decoding Draft Sampler on Node 0 (ponytail: lazy local draft generation)
         self.draft_sampler: Optional[DraftSampler] = None
-        if self.is_first_node and draft_model:
+        if self.is_first_node and draft_model and self.spec_k > 0:
             try:
                 self.draft_sampler = DraftSampler(
                     model_path=draft_model,
@@ -511,14 +511,18 @@ class PipelineNode:
         stream_host = msg.stream_back_host
         stream_port = msg.stream_back_port
 
+        # When using HTTP transport, Node 0 streams locally to Gateway; do not instruct Node 1 to stream back over TCP
+        next_stream_host = None if isinstance(self._next_client, HTTPNodeClient) else stream_host
+        next_stream_port = None if isinstance(self._next_client, HTTPNodeClient) else stream_port
+
         logger.info(
             "Starting v2 data-plane generation: session=%s, prompt_len=%d, max_tokens=%d (speculative=%s)",
-            session_id, len(prompt_tokens), max_tokens, self.draft_sampler is not None,
+            session_id, len(prompt_tokens), max_tokens, (self.draft_sampler is not None and self.spec_k > 0),
         )
 
         try:
             # Prefill draft sampler with prompt context for aligned speculative proposals
-            if self.draft_sampler is not None:
+            if self.draft_sampler is not None and self.spec_k > 0:
                 self.draft_sampler.prefill(prompt_tokens)
 
             # 1. Chunked Prefill Phase (windows of 512 tokens)
@@ -567,8 +571,8 @@ class PipelineNode:
                         top_k=top_k,
                         top_p=top_p,
                         sample_on_node=is_final_chunk,
-                        stream_back_host=stream_host,
-                        stream_back_port=stream_port,
+                        stream_back_host=next_stream_host,
+                        stream_back_port=next_stream_port,
                     )
                     resp = await self._next_client.send_recv(forward_msg, timeout=30.0)
                     if is_final_chunk and resp.msg_type == MessageType.TOKEN_ID:
@@ -599,7 +603,7 @@ class PipelineNode:
                     logger.info("Session %s reached EOS at step %d", session_id, step)
                     break
 
-                if self.draft_sampler is not None:
+                if self.draft_sampler is not None and self.spec_k > 0:
                     # Speculative decode: generate K draft tokens locally on Node 0 GPU
                     drafts = self.draft_sampler.generate_drafts(
                         next_token,
@@ -682,8 +686,8 @@ class PipelineNode:
                             top_k=top_k,
                             top_p=top_p,
                             sample_on_node=True,
-                            stream_back_host=stream_host,
-                            stream_back_port=stream_port,
+                            stream_back_host=next_stream_host,
+                            stream_back_port=next_stream_port,
                             draft_tokens=drafts,
                         )
                         resp = await self._next_client.send_recv(forward_msg, timeout=20.0)
@@ -754,8 +758,8 @@ class PipelineNode:
                             top_k=top_k,
                             top_p=top_p,
                             sample_on_node=True,
-                            stream_back_host=stream_host,
-                            stream_back_port=stream_port,
+                            stream_back_host=next_stream_host,
+                            stream_back_port=next_stream_port,
                         )
                         resp = await self._next_client.send_recv(forward_msg, timeout=15.0)
                         if resp.msg_type == MessageType.TOKEN_ID:
