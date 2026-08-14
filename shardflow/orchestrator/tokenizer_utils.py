@@ -44,8 +44,14 @@ def load_tokenizer(model_path: str) -> Any:
 
     logger.info("Loading tokenizer from %s (lightweight path, no model weights)...", model_path)
 
-    # Import ONLY AutoTokenizer — this is ~5x lighter than importing AutoModelForCausalLM
-    from transformers import AutoTokenizer  # noqa: PLC0415
+    # Import AutoTokenizer with robust fallbacks for Python 3.12 / lazy-loading environments
+    try:
+        from transformers import AutoTokenizer  # noqa: PLC0415
+    except (ImportError, AttributeError):
+        try:
+            from transformers.models.auto import AutoTokenizer  # noqa: PLC0415
+        except (ImportError, AttributeError):
+            from transformers.models.auto.tokenization_auto import AutoTokenizer  # noqa: PLC0415
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
