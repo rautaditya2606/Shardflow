@@ -73,6 +73,7 @@ def kill_ports(ports: list[int]):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="ShardFlow Node 1 (Kaggle B Remote Runner)")
+    parser.add_argument("--model", default="/kaggle/working/models/Qwen2.5-7B-Instruct", help="Model path or HF ID")
     parser.add_argument("--layer-start", type=int, default=None, help="Starting layer index (default: half of total layers)")
     parser.add_argument("--layer-end", type=int, default=None, help="Ending layer index (default: total layers)")
     parser.add_argument("--4bit", action="store_true", help="Enable 4-bit NF4 loading")
