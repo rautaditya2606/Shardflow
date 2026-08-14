@@ -61,8 +61,10 @@ class HTTPNodeClient:
 
     @property
     def is_connected(self) -> bool:
-        """Return True if session is initialized and open."""
-        return self._session is not None and not self._session.closed
+        """Return True if target URL is configured and session is not closed."""
+        if self._session is not None and self._session.closed:
+            return False
+        return bool(self.base_url)
 
     async def check_health(self, timeout: float = 5.0) -> bool:
         """Ping /health on remote node to verify reachability."""

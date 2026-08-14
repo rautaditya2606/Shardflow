@@ -129,12 +129,28 @@ def main():
             raise RuntimeError(f"Node 0 failed to start (exit code {node0_proc.returncode}). Log:\n{logs}")
         try:
             with socket.create_connection(("127.0.0.1", 9500), timeout=1.0):
-                print("✅ Node 0 is online and registered with local Gateway!", flush=True)
+                print("✅ Node 0 is online!", flush=True)
                 break
         except Exception:
             time.sleep(1.5)
     else:
         raise TimeoutError("Node 0 startup timed out after 120s")
+
+    # Wait for Node 0 to be registered in Gateway topology
+    print("Waiting for Node 0 to register in Gateway topology...", flush=True)
+    for _ in range(30):
+        try:
+            r = requests.get(f"http://127.0.0.1:{args.port}/topology", timeout=1.0)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("cluster_ready") and len(data.get("nodes", [])) > 0:
+                    print("✅ Node 0 registered and cluster topology is ready!", flush=True)
+                    break
+        except Exception:
+            pass
+        time.sleep(1.0)
+    else:
+        print("⚠️ Topology wait timed out — proceeding with benchmark attempt...", flush=True)
 
     # 3. Run Live Remote Inference Benchmark
     print("\n" + "=" * 70, flush=True)

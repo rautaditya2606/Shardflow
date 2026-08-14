@@ -207,7 +207,10 @@ class PipelineNode:
         Dynamically update next-node routing target.
         Handles None (disconnect/eviction), unchanged targets (no-op), and new targets (reconnect).
         """
-        if host == self.next_node_host and port == self.next_node_port and self._next_client is not None and self._next_client.is_connected:
+        if self.next_node_url and self._next_client is not None:
+            return
+
+        if host == self.next_node_host and port == self.next_node_port and self._next_client is not None and getattr(self._next_client, "is_connected", False):
             return
 
         # Close old client if active
