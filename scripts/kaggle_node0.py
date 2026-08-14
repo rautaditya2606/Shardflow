@@ -67,7 +67,7 @@ def main():
     parser.add_argument("--node1-url", required=True, help="Cloudflare tunnel URL of Node 1 on Kaggle B (e.g. https://*.trycloudflare.com)")
     parser.add_argument("--model", default="/kaggle/working/models/Qwen2.5-7B-Instruct", help="Model path or HF ID")
     parser.add_argument("--draft-model", default=None, help="Draft model path (only used if spec_k > 0)")
-    parser.add_argument("--spec-k", type=int, default=4, help="Speculative candidate tokens (default: 4, set 0 to disable)")
+    parser.add_argument("--spec-k", type=int, default=12, help="Speculative candidate tokens (default: 12, set 0 to disable)")
     parser.add_argument("--prompt", default=None, help="Single prompt to benchmark (optional)")
     parser.add_argument("--max-tokens", type=int, default=50, help="Max tokens per generation")
     parser.add_argument("--port", type=int, default=8000, help="Gateway port")

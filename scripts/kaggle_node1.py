@@ -79,7 +79,7 @@ def main():
     parser.add_argument("--port", type=int, default=9501, help="TCP port (default: 9501)")
     parser.add_argument("--http-port", type=int, default=9502, help="HTTP server port for tunnel (default: 9502)")
     parser.add_argument("--device", default="cuda", help="Target device (cuda or cpu)")
-    parser.add_argument("--spec-k", type=int, default=4, help="Speculative candidate tokens (default: 4)")
+    parser.add_argument("--spec-k", type=int, default=12, help="Speculative candidate tokens (default: 12)")
     parser.add_argument("--no-cuda-graphs", action="store_true", default=True, help="Disable CUDA Graphs in eager mode")
     parser.add_argument("--no-cloudflared", action="store_true", help="Skip cloudflared tunnel (for local loopback testing)")
     args = parser.parse_args()

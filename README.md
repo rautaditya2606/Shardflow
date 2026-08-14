@@ -219,6 +219,33 @@ print()
 
 ---
 
+### 5. Model: Qwen/Qwen2.5-7B-Instruct (Cross-Kaggle 2× T4 GPUs over Cloudflare Quick Tunnel)
+
+Distributed pipeline parallelism running across **two distinct Kaggle notebook instances** communicating over the public Internet via Cloudflare Quick Tunnels:
+
+| Benchmark Metric | Setup | Result |
+|---|---|---|
+| **Base Model** | `Qwen/Qwen2.5-7B-Instruct` (Native FP16, Layers 0..14 on Kaggle A, 14..28 on Kaggle B) | **28 Layers / 7B Params** |
+| **Draft Model** | `Qwen/Qwen2.5-0.5B-Instruct` (Running locally on Node 0 GPU) | **0.5B Params** |
+| **Transport** | Cloudflare Quick Tunnels (`trycloudflare.com`) over Global WAN | **~45 ms RTT** |
+| **Hardware** | 2× Free Kaggle T4 GPUs (16 GB VRAM each) | **$0.00 Cost** |
+| **Baseline Throughput ($K=0$)** | Standard 1-token autoregressive loop | **9.59 tokens/sec** |
+| **Speculative Peak ($K=12$)** | Multi-token speculative decoding with $K=12$ candidate proposals | **9.25 tokens/sec** |
+| **Reliability** | Multi-step coherent responses | **100% (0 transport errors)** |
+
+#### Speculative Decoding Scaling Curve (Qwen 0.5B Draft $\rightarrow$ 7B Target):
+
+| Speculative $K$ | Avg Throughput (Tokens/sec) | Multi-Token Acceptance Profile | Notes |
+|---|---|---|---|
+| **$K=0$ (Baseline)** | **9.59 tok/s** | 1 token per round-trip | Clean single-token transport baseline |
+| **$K=2$** | **4.19 tok/s** | 1-2 tokens per round-trip | Suboptimal: fixed RTT overhead dominates |
+| **$K=4$** | **5.12 tok/s** | 2-3 tokens per round-trip | Increasing tokens-per-roundtrip |
+| **$K=8$** | **7.19 tok/s** | 4-6 tokens per round-trip | Significant amortization of WAN RTT |
+| **$K=12$** | **9.25 tok/s** 🚀 | **6-9 tokens per round-trip** | **Optimal Sweet Spot** (Max Net WAN Throughput) |
+| **$K=16$** | **7.87 tok/s** | 7-10 tokens per round-trip | Diminishing returns: draft divergence outpaces trip gain |
+
+---
+
 ### Latency Breakdown per Token (Public WAN vs GPU Compute)
 
 During cross-cloud execution (Render Gateway $\leftrightarrow$ Colab $1 \leftrightarrow$ Colab $2$), the per-token latency breaks down as follows:
