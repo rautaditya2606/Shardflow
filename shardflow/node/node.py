@@ -341,6 +341,12 @@ class PipelineNode:
             return None
 
         # Process activation / token IDs
+        if msg.tensor is not None:
+            logger.info(
+                "Received tensor: shape=%s dtype=%s norm=%.4f (session=%s)",
+                msg.tensor.shape, msg.tensor.dtype, msg.tensor.float().norm().item(),
+                msg.session_id[:8] if msg.session_id else "None",
+            )
         tensor = msg.tensor.to(self.model_slice.device, non_blocking=True)
         if self.is_first_node and tensor.dtype in (torch.long, torch.int64, torch.int32):
             if self.model_slice.embed_tokens is not None:
@@ -577,6 +583,11 @@ class PipelineNode:
                 else:
                     if self._next_client is None or not self._next_client.is_connected:
                         await self.update_next_node(self.next_node_host, self.next_node_port)
+                    logger.info(
+                        "Sending tensor (prefill): shape=%s dtype=%s norm=%.4f (session=%s)",
+                        output.shape, output.dtype, output.float().norm().item(),
+                        session_id[:8] if session_id else "None",
+                    )
                     forward_msg = TensorMessage(
                         msg_type=MessageType.ACTIVATION,
                         session_id=session_id,
@@ -753,6 +764,11 @@ class PipelineNode:
                                     is_eos=False,
                                 ))
                     else:
+                        logger.info(
+                            "Sending tensor (decode): shape=%s dtype=%s norm=%.4f (session=%s)",
+                            output.shape, output.dtype, output.float().norm().item(),
+                            session_id[:8] if session_id else "None",
+                        )
                         forward_msg = TensorMessage(
                             msg_type=MessageType.ACTIVATION,
                             session_id=session_id,

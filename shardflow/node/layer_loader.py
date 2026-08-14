@@ -434,7 +434,7 @@ def load_layer_slice(
                 from huggingface_hub import hf_hub_download, try_to_load_from_cache
                 target_cache_dir = "/kaggle/working/hf_home" if os.path.exists("/kaggle") else None
                 hf_tok = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
-                cached = try_to_load_from_cache(repo_id=model_path, filename=shard_name, cache_dir=target_cache_dir, token=hf_tok)
+                cached = try_to_load_from_cache(repo_id=model_path, filename=shard_name, cache_dir=target_cache_dir)
                 if isinstance(cached, (str, Path)) and os.path.exists(cached):
                     shard_path = str(cached)
                 else:
