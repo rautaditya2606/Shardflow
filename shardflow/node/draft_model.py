@@ -31,14 +31,20 @@ def rewind_static_cache(cache: StaticCache, target_seq_len: int) -> None:
     """Rewind StaticCache to target_seq_len by zeroing out rejected key/value slots."""
     if hasattr(cache, "_seen_tokens"):
         cache._seen_tokens = target_seq_len
-    # ponytail: zero out all rejected slots from target_seq_len onwards so SDPA
-    # does not attend to rejected phantom key/values
-    if hasattr(cache, "layers"):
-        for layer in cache.layers:
-            if hasattr(layer, "keys") and layer.keys is not None:
-                layer.keys[:, :, target_seq_len:, :] = 0.0
-            if hasattr(layer, "values") and layer.values is not None:
-                layer.values[:, :, target_seq_len:, :] = 0.0
+    # ponytail: safely zero out all rejected slots under inference_mode
+    with torch.inference_mode():
+        if hasattr(cache, "layers"):
+            for layer in cache.layers:
+                if hasattr(layer, "keys") and layer.keys is not None:
+                    try:
+                        layer.keys[:, :, target_seq_len:, :].zero_()
+                    except Exception:
+                        pass
+                if hasattr(layer, "values") and layer.values is not None:
+                    try:
+                        layer.values[:, :, target_seq_len:, :].zero_()
+                    except Exception:
+                        pass
 
 
 def rewind_kv_cache(cache: Cache, target_seq_len: int) -> None:
