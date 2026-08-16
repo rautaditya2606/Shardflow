@@ -44,6 +44,8 @@ def run_window_sweep(
     model_path: str,
     window_list: List[int],
     spec_k: int = 4,
+    draft_model: Optional[str] = None,
+    draft_device: Optional[str] = None,
     layer_start: int = 0,
     layer_end: Optional[int] = None,
     relay_host: str = RELAY_HOST,
@@ -65,7 +67,10 @@ def run_window_sweep(
     print("=" * 75)
     print("🔬 SHARDFLOW IN-FLIGHT SPECULATIVE WINDOW SWEEP BENCHMARK")
     print(f"Base Model:        {model_path} (Layers {layer_start}..{layer_end}) on {device}")
-    print(f"Draft Model:       N-gram Prompt Lookup (K={spec_k})")
+    if draft_model:
+        print(f"Draft Model:       {draft_model} (Neural Draft, K={spec_k})")
+    else:
+        print(f"Draft Model:       N-gram Prompt Lookup (K={spec_k})")
     print(f"Window Sweep (W):  {window_list}")
     print(f"Relay:             {relay_host}:{relay_port}")
     print("=" * 75)
@@ -90,8 +95,13 @@ def run_window_sweep(
         model_slice=model_slice,
         is_first_node=True,
         is_last_node=False,
+        draft_model=draft_model if draft_model else None,
+        draft_device=draft_device,
         spec_k=spec_k,
     )
+
+    if draft_model and node.draft_sampler is None:
+        raise RuntimeError(f"Draft model '{draft_model}' failed to load on Node 0. Please check path.")
 
     prompts = [
         "Explain quantum entanglement in simple terms.",
@@ -108,7 +118,9 @@ def run_window_sweep(
         handshake(sock)
         print("🌟 Handshake successful! Beginning Window-sweep iterations...\n")
 
-        ngram_sampler = NGramDraftSampler(max_ngram_size=3, min_ngram_size=1, spec_k=spec_k)
+        ngram_sampler = None
+        if spec_k > 0 and not draft_model:
+            ngram_sampler = NGramDraftSampler(max_ngram_size=3, min_ngram_size=1, spec_k=spec_k)
 
         for w in window_list:
             print("=" * 75)
@@ -226,6 +238,8 @@ def run_window_sweep(
 def main():
     parser = argparse.ArgumentParser(description="ShardFlow In-Flight Speculative Window Sweep Benchmark")
     parser.add_argument("--model", default="/kaggle/working/models/Qwen2.5-7B-Instruct", help="Model path or HF ID")
+    parser.add_argument("--draft-model", default=None, help="Neural draft model path or HF ID (default: None, uses N-gram)")
+    parser.add_argument("--draft-device", default=None, help="Device for draft model (default: cuda:1 if available, else cuda:0)")
     parser.add_argument("--spec-k", type=int, default=4, help="Speculative K (default: 4)")
     parser.add_argument("--windows", default="1,2,3", help="Comma-separated speculative window depths to test (default: 1,2,3)")
     parser.add_argument("--relay-host", default=RELAY_HOST, help="Relay IP")
@@ -242,6 +256,8 @@ def main():
         model_path=args.model,
         window_list=windows,
         spec_k=args.spec_k,
+        draft_model=args.draft_model,
+        draft_device=args.draft_device,
         layer_start=args.layer_start,
         layer_end=args.layer_end,
         relay_host=args.relay_host,

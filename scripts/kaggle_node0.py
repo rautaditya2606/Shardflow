@@ -468,24 +468,29 @@ def generate(
                             rewind_kv_cache(cache, committed_len)
                         if child_round_id > 0:
                             invalidated_rounds.add(child_round_id)
+                        draft_rewind_len = past_seq_len + accepted_count - 1
                         if async_drafter:
-                            async_drafter.rewind(committed_len)
+                            async_drafter.rewind(draft_rewind_len)
                             pending_draft_job = async_drafter.submit(next_token, k=spec_k, temperature=temperature, top_k=top_k, top_p=top_p)
                         elif draft_sampler:
-                            draft_target = draft_sampler.seq_len - len(drafts) - len(spec_pending["drafts"]) + (accepted_count - 1)
-                            draft_sampler.rewind(draft_target)
+                            draft_sampler.rewind(draft_rewind_len)
                         spec_pending = None
                 else:
                     committed_len = past_seq_len + accepted_count
                     if cache is not None:
                         rewind_kv_cache(cache, committed_len)
+                    draft_rewind_len = past_seq_len + accepted_count - 1
                     if not is_full_hit:
                         if async_drafter:
-                            async_drafter.rewind(committed_len)
+                            async_drafter.rewind(draft_rewind_len)
                             pending_draft_job = async_drafter.submit(next_token, k=spec_k, temperature=temperature, top_k=top_k, top_p=top_p)
                         elif draft_sampler:
-                            draft_target = draft_sampler.seq_len - len(drafts) + (accepted_count - 1)
-                            draft_sampler.rewind(draft_target)
+                            draft_sampler.rewind(draft_rewind_len)
+                    else:
+                        if async_drafter:
+                            async_drafter.rewind(draft_rewind_len)
+                        elif draft_sampler:
+                            draft_sampler.rewind(draft_rewind_len)
 
                 if accepted_count > 1:
                     for d_idx in range(accepted_count - 1):
