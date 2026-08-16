@@ -98,6 +98,9 @@ def run_k_sweep(
         spec_k=max_k,
     )
 
+    if draft_model and node.draft_sampler is None:
+        raise RuntimeError(f"Draft model '{draft_model}' failed to load on Node 0 GPU. Please check path or HF model ID.")
+
     prompts = [
         "Explain quantum entanglement in simple terms.",
         "Write a Python function to compute Fibonacci numbers using dynamic programming.",

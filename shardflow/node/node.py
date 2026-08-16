@@ -124,7 +124,8 @@ class PipelineNode:
                 )
                 logger.info("DraftSampler initialized on Node 0 (draft_model=%s, K=%d)", draft_model, spec_k)
             except Exception as e:
-                logger.warning("Could not initialize DraftSampler (%s) — falling back to standard autoregression", e)
+                logger.error("❌ FAILED to initialize DraftSampler for '%s': %s", draft_model, e)
+                print(f"\n❌ [ERROR] Could not load draft model '{draft_model}': {e}\n", flush=True)
                 self.draft_sampler = None
 
         # Connection to next node (if not the last)

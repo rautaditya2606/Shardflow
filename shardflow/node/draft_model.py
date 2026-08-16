@@ -84,9 +84,8 @@ class DraftSampler:
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=dtype,
-            device_map=str(device),
             cache_dir=target_cache,
-        )
+        ).to(device)
         self.model.eval()
 
     @property
