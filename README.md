@@ -14,7 +14,7 @@ A high-performance, general-purpose distributed LLM inference framework that par
 
 ShardFlow combines **neural speculative decoding ($K=8$ on dual-GPU nodes)**, **zero-copy binary tensor serialization**, and **high-throughput TCP relay transport** to overcome wide-area network latency (WAN) and deliver interactive LLM inference speeds across separate cloud data centers.
 
-> **Live Verified Benchmark (Trans-Continental WAN):** **14.31 TPS** peak (**11.91 TPS** average, **4.36 tokens/round**, **58.0% acceptance rate**) running `Qwen2.5-7B-Instruct` in native FP16 across two geographically separated Kaggle notebook instances (Iowa <-> Oregon) communicating through an AWS EC2 TCP Relay (Ohio) over an **~86 ms public Internet RTT**.
+> **Live Verified Benchmark (Trans-Continental WAN):** **14.31 TPS** peak (**11.91 TPS** average, **4.36 tokens/round**, **58.0% acceptance rate**) running `Qwen2.5-7B-Instruct` in native FP16 across two geographically separated Kaggle notebook instances (Iowa <-> Oregon) communicating through an AWS EC2 `t3.micro` instance (us-east-2, Ohio) running our zero-copy Rust TCP Relay over an **~86 ms public Internet RTT**.
 
 ---
 
@@ -79,8 +79,8 @@ graph TD
         end
     end
 
-    subgraph RelayServer["AWS EC2 Rust TCP Relay (Ohio)"]
-        RELAY["Zero-Copy TCP Relay Bridge<br/>Length-Prefixed Framing (>Q)<br/>TCP_NODELAY • 8-Byte Magic Handshake"]:::relay
+    subgraph RelayServer["AWS EC2 t3.micro Relay (us-east-2, Ohio)"]
+        RELAY["Zero-Copy Rust TCP Relay Bridge<br/>AWS EC2 t3.micro (us-east-2, Ohio)<br/>Length-Prefixed Framing (>Q)<br/>TCP_NODELAY • 8-Byte Magic Handshake"]:::relay
     end
 
     subgraph Node1Instance["Kaggle Node 1 (Oregon, GCP)"]
@@ -128,9 +128,9 @@ Speculative decoding requires the draft model and the target model to maintain i
   ```
   This eliminates draft context drift and guarantees up to **58% draft acceptance**.
 
-### 3. AWS EC2 TCP Relay Transport
+### 3. AWS EC2 TCP Relay Transport (t3.micro, us-east-2 Ohio)
 Cloud notebooks (Kaggle/Colab) do not expose public IP addresses or open inbound ports.
-- **Zero-Tunnel TCP Bridging**: Both nodes connect outbound to an AWS EC2 instance running a low-latency Rust TCP relay (`3.23.174.207:9500`).
+- **Zero-Tunnel TCP Bridging**: Both nodes connect outbound to an AWS EC2 `t3.micro` instance running in `us-east-2` (Ohio) hosting our low-latency Rust TCP relay (`3.23.174.207:9500`).
 - **Framed Binary Protocol**: Binary activations are serialized as raw float16 buffers with 8-byte big-endian length prefixing (`>Q`), minimizing CPU serialization time to $<1.5\text{ ms}$.
 - **Initiator-Listener Magic Handshake**: Nodes exchange an exact 8-byte handshake token (`b"SF_READY"`) using an initiator/listener protocol that prevents socket buffer pollution and race conditions upon startup.
 

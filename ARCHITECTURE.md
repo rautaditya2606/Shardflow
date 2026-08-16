@@ -79,58 +79,50 @@ graph TD
     classDef reg fill:#181825,stroke:#f9e2af,stroke-width:2px,color:#cdd6f4
     classDef node0 fill:#11111b,stroke:#a6e3a1,stroke-width:2px,color:#cdd6f4
     classDef node1 fill:#11111b,stroke:#fab387,stroke-width:2px,color:#cdd6f4
-    classDef nodeN fill:#11111b,stroke:#f38ba8,stroke-width:2px,color:#cdd6f4
+    classDef relay fill:#181825,stroke:#89b4fa,stroke-width:2px,color:#cdd6f4
 
     subgraph ClientLayer["1. Client Layer"]
         C["Client Application / OpenAI SDK / curl"]:::client
     end
 
-    subgraph ControlPlane["2. Control Plane (Render / FastAPI Gateway)"]
-        GW["API Gateway<br/><code>/v1/chat/completions</code>"]:::control
-        SCHED["Request Scheduler & Queue<br/><code>asyncio.Queue</code> (Max Concurrency)"]:::control
-        REG["Dynamic Topology Registry<br/><code>AutoPartitionEngine</code> & Barriers"]:::reg
-        SRV["StreamReceiverServer<br/>TCP Port 9600 (Token Dispatch)"]:::control
-        ORCH["Zero-Weight Orchestrator<br/>Tokenizer & Session Handoff"]:::control
-    end
-
-    subgraph DataPlane["3. Distributed GPU Data Plane (TCP / bore.pub Tunnels)"]
-        subgraph Node0["Pipeline Node 0 (Worker 1)"]
-            N0_PROC["Node 0 Processor<br/>Layers 0 -> L1 | Embeddings"]:::node0
-            N0_KV["DynamicCache Store<br/>(60s TTL Eviction)"]:::node0
-            N0_DRIVER["v2 Data-Plane Driver<br/>(P2P Decode Loop)"]:::node0
+    subgraph Node0Instance["2. Kaggle Node 0 (Iowa, GCP)"]
+        subgraph GPU0["cuda:0 — Target Slice"]
+            N0_EMB["Embedding Layer"]:::node0
+            N0_LAYERS["Qwen2.5-7B (Layers 0..14)<br/>FP16 • 7.64 GB VRAM"]:::node0
+            N0_KV["Per-Session DynamicCache"]:::node0
         end
-
-        subgraph Node1["Pipeline Node 1 (Worker 2)"]
-            N1_PROC["Node 1 Processor<br/>Layers L1 -> L2"]:::node1
-            N1_KV["DynamicCache Store<br/>(60s TTL Eviction)"]:::node1
-        end
-
-        subgraph NodeN["Pipeline Terminal Node N (Worker N)"]
-            NN_PROC["Terminal Node Processor<br/>Layers L2 -> LN | RMSNorm | LM Head"]:::nodeN
-            NN_KV["DynamicCache Store<br/>(60s TTL Eviction)"]:::nodeN
-            NN_SAMP["GPU Sampler<br/>Top-K / Top-P / Temp"]:::nodeN
+        subgraph GPU1["cuda:1 — Neural Drafter"]
+            DRAFT["DraftSampler (Qwen2.5-0.5B)<br/>FP16 • 0.98 GB VRAM • K=8 Drafts"]:::node0
+            DRAFT_KV["Draft DynamicCache & Position Alignment"]:::node0
         end
     end
 
-    C -->|"1. POST /v1/chat/completions"| GW
-    GW -->|"2. Enqueue Session"| SCHED
-    SCHED -->|"3. Dispatch Request"| ORCH
-    
-    N0_PROC -.-|"Auto-Register VRAM"| REG
-    N1_PROC -.-|"Auto-Register VRAM"| REG
-    NN_PROC -.-|"Auto-Register VRAM"| REG
-    REG -.-|"VRAM-Weighted Slices"| N0_PROC
-    REG -.-|"VRAM-Weighted Slices"| N1_PROC
-    REG -.-|"VRAM-Weighted Slices"| NN_PROC
+    subgraph RelayServer["3. AWS EC2 t3.micro Relay (us-east-2, Ohio)"]
+        RELAY["Zero-Copy Rust TCP Relay Bridge<br/>AWS EC2 t3.micro (us-east-2, Ohio)<br/>Length-Prefixed Framing (>Q)<br/>TCP_NODELAY • 8-Byte Magic Handshake"]:::relay
+    end
 
-    ORCH -->|"4. START_SESSION Frame"| N0_DRIVER
-    N0_DRIVER -->|"5. Forward Activations"| N1_PROC
-    N1_PROC -->|"6. Forward Activations"| NN_PROC
-    NN_PROC --> NN_SAMP
-    NN_SAMP -->|"7. Direct STREAM_TOKEN Frame"| SRV
-    NN_SAMP -.->|"8. Peer Loop TOKEN_ID"| N0_DRIVER
-    SRV -->|"9. Token SSE Stream"| GW
-    GW -->|"10. text/event-stream"| C
+    subgraph Node1Instance["4. Kaggle Node 1 (Oregon, GCP)"]
+        subgraph GPU_N1["cuda:0 — Terminal Slice & Verifier"]
+            N1_LAYERS["Qwen2.5-7B (Layers 14..28)<br/>FP16 • 7.64 GB VRAM"]:::node1
+            N1_HEAD["RMSNorm & LM Head"]:::node1
+            N1_VERIFY["Causal Speculative Verifier<br/>Multi-Token Verification & KV Rollback"]:::node1
+            N1_KV["Per-Session DynamicCache"]:::node1
+        end
+    end
+
+    C -->|"1. User Prompt"| N0_EMB
+    DRAFT_KV -.-|"Prefill Prompt KV"| DRAFT
+    DRAFT -->|"2. Propose K=8 Draft Tokens"| N0_EMB
+    N0_EMB --> N0_LAYERS
+    N0_LAYERS -->|"3. Binary Activation Tensor [1, 9, 3584]"| RELAY
+    RELAY -->|"4. Stream to Peer"| N1_LAYERS
+    N1_LAYERS --> N1_HEAD
+    N1_HEAD --> N1_VERIFY
+    N1_VERIFY -->|"5. Token Response (Accepted Count M + Next Token)"| RELAY
+    RELAY -->|"6. Stream to Node 0"| N0_LAYERS
+    N0_KV -.-|"Rollback to past_seq_len + M"| N0_LAYERS
+    DRAFT_KV -.-|"Rollback to past_seq_len + M"| DRAFT
+    N0_LAYERS -->|"7. Stream Output Tokens"| C
 ```
 
 ---
