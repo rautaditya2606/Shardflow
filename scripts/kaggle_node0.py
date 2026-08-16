@@ -310,10 +310,25 @@ def generate(
 
             if spec_k > 0:
                 t_step_0 = time.perf_counter()
-                drafts = pending_drafts
-                pending_drafts = []
+                t_draft_0 = time.perf_counter()
+                drafts = []
                 draft_gen_ms = 0.0
                 draft_wait_ms = 0.0
+
+                if ngram_sampler and spec_k > 0:
+                    drafts = ngram_sampler.find_candidates(token_history, k=spec_k)
+                    draft_gen_ms = (time.perf_counter() - t_draft_0) * 1000.0
+                    draft_wait_ms = 0.0
+                elif draft_sampler and spec_k > 0:
+                    drafts = draft_sampler.generate_drafts(
+                        next_token,
+                        k=spec_k,
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                    )
+                    draft_gen_ms = (time.perf_counter() - t_draft_0) * 1000.0
+                    draft_wait_ms = draft_gen_ms
 
                 if drafts:
                     total_drafted += len(drafts)
@@ -330,10 +345,6 @@ def generate(
                 cache = node.kv_store.get(session_id)
                 past_seq_len = node._get_cache_seq_len(cache)
 
-                # ═══════════════════════════════════════════════════════
-                # PHASE 1: Immediate Node 0 Forward Pass on cuda:0
-                # Fired at t=0ms — Node 1 starts at t=35ms instead of t=125ms
-                # ═══════════════════════════════════════════════════════
                 t_fwd_0 = time.perf_counter()
                 cand_output = node._forward(cand_hidden, session_id=session_id, compute_head=False)
                 if cand_output.is_cuda:
@@ -344,50 +355,16 @@ def generate(
                 primary_round_id = current_round_counter
                 send_stats = send_tensor_timed(sock, cand_output, draft_tokens=drafts, round_id=primary_round_id, parent_round_id=0)
 
-                # ═══════════════════════════════════════════════════════
-                # PHASE 2: Parallel Drafting on cuda:1 during WAN + Node 1 compute
-                # Budget: ~86ms WAN + ~45ms N1 compute = ~131ms
-                # Drafting takes ~85ms -> completely hidden in network transit
-                # ═══════════════════════════════════════════════════════
-                t_draft_0 = time.perf_counter()
-                anchor_token = drafts[-1] if drafts else next_token
-                generated_drafts: List[int] = []
-
-                if draft_sampler and spec_k > 0:
-                    generated_drafts = draft_sampler.generate_drafts(
-                        anchor_token,
-                        k=spec_k,
-                        temperature=temperature,
-                        top_k=top_k,
-                        top_p=top_p,
-                    )
-                    draft_gen_ms = (time.perf_counter() - t_draft_0) * 1000.0
-                elif ngram_sampler and spec_k > 0:
-                    generated_drafts = ngram_sampler.find_candidates(token_history + drafts, k=spec_k)
-                    draft_gen_ms = (time.perf_counter() - t_draft_0) * 1000.0
-
-                # ═══════════════════════════════════════════════════════
-                # PHASE 3: Receive verification from Node 1
-                # ═══════════════════════════════════════════════════════
                 next_token, accepted_count, is_eos, recv_stats = fetch_response(primary_round_id)
                 total_accepted += max(0, accepted_count - 1)
 
-                # Reconcile speculation: commit or rollback
                 committed_len = past_seq_len + accepted_count
                 if cache is not None:
                     rewind_kv_cache(cache, committed_len)
 
                 draft_rewind_len = past_seq_len + accepted_count - 1
-                is_full_hit = (accepted_count == len(drafts) + 1) and not is_eos
-
-                if is_full_hit and generated_drafts:
-                    # Full hit! Pre-drafted tokens for next round are 100% valid
-                    pending_drafts = generated_drafts
-                else:
-                    # Partial hit or mismatch: rewind draft model to true committed state
-                    if draft_sampler:
-                        draft_sampler.rewind(draft_rewind_len)
-                    pending_drafts = []
+                if draft_sampler:
+                    draft_sampler.rewind(draft_rewind_len)
 
                 if drafts and accepted_count > 1:
                     for d_idx in range(accepted_count - 1):
