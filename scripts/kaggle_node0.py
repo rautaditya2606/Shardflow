@@ -300,7 +300,8 @@ def generate(
                     invalidated_rounds.discard(r_id)
                     continue
                 pending_responses[r_id] = (tok, acc, eos, stats)
-            return pending_responses.pop(target_round_id)
+            res = pending_responses.pop(target_round_id)
+            return res
 
         while step < max_tokens and not is_eos:
             if next_token == eos_token_id:
@@ -537,12 +538,9 @@ def generate(
                     torch.cuda.synchronize(output.device)
                 t_fwd_1 = time.perf_counter()
 
-                send_stats = send_tensor_timed(sock, output)
-
-                if receiver is not None:
-                    next_token, _, is_eos, recv_stats = receiver.get()
-                else:
-                    next_token, _, is_eos, recv_stats = recv_token_timed(sock)
+                current_round_counter += 1
+                send_stats = send_tensor_timed(sock, output, round_id=current_round_counter, parent_round_id=0)
+                next_token, _, is_eos, recv_stats = fetch_response(current_round_counter)
                 
                 generated_tokens.append(next_token)
                 token_history.append(next_token)

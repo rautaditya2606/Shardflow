@@ -356,7 +356,15 @@ def main():
 
                     is_eos = (token_id == args.eos_token_id)
                     node1_compute_ms = (t_smpl_1 - t_c2g_0) * 1000.0
-                    send_stats = send_token_timed(sock, token_id, accepted_count=1, is_eos=is_eos, compute_ms=node1_compute_ms)
+                    send_stats = send_token_timed(
+                        sock,
+                        token_id,
+                        accepted_count=1,
+                        is_eos=is_eos,
+                        compute_ms=node1_compute_ms,
+                        round_id=round_id,
+                        is_stale_discard=False,
+                    )
                     t_step_1 = time.perf_counter()
 
                     profiler.record(
