@@ -118,7 +118,7 @@ class PipelineNode:
         self.draft_sampler: Optional[DraftSampler] = None
         if self.is_first_node and draft_model and self.spec_k > 0:
             try:
-                target_draft_device = draft_device or model_slice.device
+                target_draft_device = torch.device(draft_device) if draft_device else model_slice.device
                 self.draft_sampler = DraftSampler(
                     model_path=draft_model,
                     device=target_draft_device,
@@ -126,10 +126,17 @@ class PipelineNode:
                     spec_k=spec_k,
                 )
                 logger.info("DraftSampler initialized on Node 0 (draft_model=%s, device=%s, K=%d)", draft_model, target_draft_device, spec_k)
+                if target_draft_device != model_slice.device:
+                    from shardflow.node.draft_model import AsyncDraftSampler
+                    self.async_draft_sampler = AsyncDraftSampler(self.draft_sampler)
+                    logger.info("AsyncDraftSampler worker initialized on %s (overlapping with Node 0 compute + WAN)", target_draft_device)
+                else:
+                    self.async_draft_sampler = None
             except Exception as e:
                 logger.error("❌ FAILED to initialize DraftSampler for '%s': %s", draft_model, e)
                 print(f"\n❌ [ERROR] Could not load draft model '{draft_model}': {e}\n", flush=True)
                 self.draft_sampler = None
+                self.async_draft_sampler = None
 
         # Connection to next node (if not the last)
         self._next_client: Optional[object] = None
