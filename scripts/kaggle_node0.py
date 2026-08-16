@@ -195,6 +195,9 @@ def generate(
     if draft_sampler:
         draft_sampler.prefill(prompt_tokens)
 
+    if spec_k > 0 and draft_sampler is None and ngram_sampler is None:
+        print(f"\n⚠️ [WARNING] spec_k={spec_k} but neither draft_sampler nor ngram_sampler is active! Running 1-token decode.", flush=True)
+
     t_start = time.perf_counter()
     t_first_token = None
     generated_tokens = []

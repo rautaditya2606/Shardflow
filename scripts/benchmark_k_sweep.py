@@ -123,8 +123,12 @@ def run_k_sweep(
             ngram_sampler = None
             if k > 0 and not draft_model:
                 ngram_sampler = NGramDraftSampler(max_ngram_size=3, min_ngram_size=1, spec_k=k)
+                print(f"  [Active Sampler]: NGramDraftSampler(spec_k={k})", flush=True)
             elif k > 0 and draft_model and node.draft_sampler:
                 node.draft_sampler.spec_k = k
+                print(f"  [Active Sampler]: DraftSampler({draft_model}, spec_k={k})", flush=True)
+            else:
+                print(f"  [Active Sampler]: None (Standard 1-token decode)", flush=True)
 
             k_profiler = Node0Profiler()
             tps_list = []
