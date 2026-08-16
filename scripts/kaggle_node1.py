@@ -273,8 +273,9 @@ def main():
 
                     is_eos = (next_token == args.eos_token_id)
                     t_head_1 = time.perf_counter()
+                    node1_compute_ms = (t_head_1 - t_c2g_0) * 1000.0
 
-                    send_stats = send_token_timed(sock, next_token, accepted_count=accepted_count, is_eos=is_eos)
+                    send_stats = send_token_timed(sock, next_token, accepted_count=accepted_count, is_eos=is_eos, compute_ms=node1_compute_ms)
                     t_step_1 = time.perf_counter()
                     step += accepted_count
 
@@ -323,7 +324,8 @@ def main():
                     t_smpl_1 = time.perf_counter()
 
                     is_eos = (token_id == args.eos_token_id)
-                    send_stats = send_token_timed(sock, token_id, accepted_count=1, is_eos=is_eos)
+                    node1_compute_ms = (t_smpl_1 - t_c2g_0) * 1000.0
+                    send_stats = send_token_timed(sock, token_id, accepted_count=1, is_eos=is_eos, compute_ms=node1_compute_ms)
                     t_step_1 = time.perf_counter()
 
                     profiler.record(

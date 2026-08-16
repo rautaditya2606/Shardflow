@@ -395,21 +395,23 @@ def send_token(
     token_id: int,
     accepted_count: int = 1,
     is_eos: bool = False,
+    compute_ms: float = 0.0,
 ) -> None:
     """
     Send a token response (Node 1 -> Node 0) with 8-byte length prefix framing.
     """
-    payload_len = 1 + 8 + 4 + 1
+    payload_len = 1 + 8 + 4 + 1 + 4
     buf = bytearray(LENGTH_PREFIX_SIZE + payload_len)
     struct.pack_into(LENGTH_PREFIX_FMT, buf, 0, payload_len)
     struct.pack_into(
-        ">BqIB",
+        ">BqIBf",
         buf,
         LENGTH_PREFIX_SIZE,
         MSG_TOKEN,
         int(token_id),
         int(accepted_count),
         1 if is_eos else 0,
+        float(compute_ms),
     )
     sock.sendall(buf)
 
@@ -419,22 +421,24 @@ def send_token_timed(
     token_id: int,
     accepted_count: int = 1,
     is_eos: bool = False,
+    compute_ms: float = 0.0,
 ) -> dict:
     """
     Send a token response (Node 1 -> Node 0) with timing measurement.
     """
     t_start = time.perf_counter()
-    payload_len = 1 + 8 + 4 + 1
+    payload_len = 1 + 8 + 4 + 1 + 4
     buf = bytearray(LENGTH_PREFIX_SIZE + payload_len)
     struct.pack_into(LENGTH_PREFIX_FMT, buf, 0, payload_len)
     struct.pack_into(
-        ">BqIB",
+        ">BqIBf",
         buf,
         LENGTH_PREFIX_SIZE,
         MSG_TOKEN,
         int(token_id),
         int(accepted_count),
         1 if is_eos else 0,
+        float(compute_ms),
     )
     t_ser_end = time.perf_counter()
     sock.sendall(buf)
@@ -461,7 +465,10 @@ def recv_token(sock: socket.socket) -> Tuple[int, int, bool]:
     if msg_type != MSG_TOKEN:
         raise ValueError(f"Expected MSG_TOKEN (0x02), got msg_type={msg_type}")
 
-    token_id, accepted_count, is_eos_val = struct.unpack_from(">qIB", payload, 1)
+    if len(payload) >= 18:
+        token_id, accepted_count, is_eos_val, _ = struct.unpack_from(">qIBf", payload, 1)
+    else:
+        token_id, accepted_count, is_eos_val = struct.unpack_from(">qIB", payload, 1)
     return token_id, accepted_count, bool(is_eos_val)
 
 
@@ -480,11 +487,21 @@ def recv_token_timed(sock: socket.socket) -> Tuple[int, int, bool, dict]:
     if msg_type != MSG_TOKEN:
         raise ValueError(f"Expected MSG_TOKEN (0x02), got msg_type={msg_type}")
 
-    token_id, accepted_count, is_eos_val = struct.unpack_from(">qIB", payload, 1)
+    compute_ms = 0.0
+    if len(payload) >= 18:
+        token_id, accepted_count, is_eos_val, compute_ms = struct.unpack_from(">qIBf", payload, 1)
+    else:
+        token_id, accepted_count, is_eos_val = struct.unpack_from(">qIB", payload, 1)
     t_deser_1 = time.perf_counter()
+
+    raw_recv_ms = (t_recv_end - t_start) * 1000.0
+    net_rtt = max(0.0, raw_recv_ms - compute_ms) if compute_ms > 0 else raw_recv_ms
     timings = {
-        "tcp_recv_ms": (t_recv_end - t_start) * 1000.0,
+        "tcp_recv_ms": raw_recv_ms,
         "deserialize_ms": (t_deser_1 - t_deser_0) * 1000.0,
+        "node1_compute_ms": compute_ms,
+        "network_rtt_ms": net_rtt,
+        "one_way_flight_ms": net_rtt / 2.0,
         "total_recv_ms": (t_deser_1 - t_start) * 1000.0,
     }
     return token_id, accepted_count, bool(is_eos_val), timings

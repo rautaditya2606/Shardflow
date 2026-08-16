@@ -71,6 +71,9 @@ class Node0Profiler:
         self.serialize_times = []
         self.tcp_send_times = []
         self.tcp_recv_wait_times = []
+        self.node1_compute_times = []
+        self.pure_network_rtt_times = []
+        self.inter_round_bubble_times = []
         self.total_step_times = []
         # ponytail: per-round speculative tracking
         self.accepted_per_round = []
@@ -91,6 +94,9 @@ class Node0Profiler:
         gpu0_ms: float = 0.0,
         pcie_ms: float = 0.0,
         gpu1_ms: float = 0.0,
+        node1_compute_ms: float = 0.0,
+        network_rtt_ms: float = 0.0,
+        bubble_ms: float = 0.0,
         accepted: int = 1,
         drafted: int = 0,
         is_spec: bool = False,
@@ -106,6 +112,9 @@ class Node0Profiler:
         self.serialize_times.append(ser_ms)
         self.tcp_send_times.append(send_ms)
         self.tcp_recv_wait_times.append(recv_ms)
+        self.node1_compute_times.append(node1_compute_ms)
+        self.pure_network_rtt_times.append(network_rtt_ms)
+        self.inter_round_bubble_times.append(bubble_ms)
         self.total_step_times.append(total_ms)
         self.accepted_per_round.append(accepted)
         self.drafted_per_round.append(drafted)
@@ -139,7 +148,12 @@ class Node0Profiler:
         print(f"  3. GPU -> CPU Transfer:       {avg(self.gpu_to_cpu_times):6.2f} ms  (p95: {p95(self.gpu_to_cpu_times):6.2f} ms)")
         print(f"  4. Tensor Serialization:      {avg(self.serialize_times):6.2f} ms  (p95: {p95(self.serialize_times):6.2f} ms)")
         print(f"  5. TCP Send (Node 0 -> EC2):  {avg(self.tcp_send_times):6.2f} ms  (p95: {p95(self.tcp_send_times):6.2f} ms)")
-        print(f"  6. TCP Recv Wait (RTT+Node1): {avg(self.tcp_recv_wait_times):6.2f} ms  (p95: {p95(self.tcp_recv_wait_times):6.2f} ms)")
+        print(f"  6. Total Recv Wait (Node 0):  {avg(self.tcp_recv_wait_times):6.2f} ms  (p95: {p95(self.tcp_recv_wait_times):6.2f} ms)")
+        if any(t > 0 for t in self.node1_compute_times):
+            print(f"     ├── Node 1 Remote Compute: {avg(self.node1_compute_times):6.2f} ms  (p95: {p95(self.node1_compute_times):6.2f} ms)")
+            print(f"     └── Pure Network Wire RTT: {avg(self.pure_network_rtt_times):6.2f} ms  (p95: {p95(self.pure_network_rtt_times):6.2f} ms)")
+        if any(t >= 0 for t in self.inter_round_bubble_times):
+            print(f"  7. Inter-Round Bubble (T10-T9):{avg(self.inter_round_bubble_times):6.2f} ms  (p95: {p95(self.inter_round_bubble_times):6.2f} ms)")
         print("  " + "-" * 66, flush=True)
         print(f"  TOTAL STEP LATENCY:           {avg_total:6.2f} ms  ({1000.0/avg_total:.2f} TPS)", flush=True)
 
@@ -461,13 +475,16 @@ def generate(
                         g2c_ms=send_stats["gpu_to_cpu_ms"],
                         ser_ms=send_stats["serialize_ms"],
                         send_ms=send_stats["tcp_send_ms"],
-                        recv_ms=recv_stats["tcp_recv_ms"],
+                        recv_ms=recv_stats.get("tcp_recv_ms", 0.0),
                         total_ms=(t_step_1 - t_step_0) * 1000.0,
                         draft_gen_ms=draft_gen_ms,
                         draft_wait_ms=draft_wait_ms,
                         gpu0_ms=fwd_bk.get("gpu0_ms", 0.0),
                         pcie_ms=fwd_bk.get("pcie_ms", 0.0),
                         gpu1_ms=fwd_bk.get("gpu1_ms", 0.0),
+                        node1_compute_ms=recv_stats.get("node1_compute_ms", 0.0),
+                        network_rtt_ms=recv_stats.get("network_rtt_ms", 0.0),
+                        bubble_ms=0.0 if (t_fwd_1 == t_fwd_0) else (t_fwd_1 - t_fwd_0) * 1000.0,
                         accepted=accepted_count,
                         drafted=len(drafts),
                         is_spec=True,
@@ -511,12 +528,15 @@ def generate(
                         g2c_ms=send_stats["gpu_to_cpu_ms"],
                         ser_ms=send_stats["serialize_ms"],
                         send_ms=send_stats["tcp_send_ms"],
-                        recv_ms=recv_stats["tcp_recv_ms"],
+                        recv_ms=recv_stats.get("tcp_recv_ms", 0.0),
                         total_ms=(t_step_1 - t_step_0) * 1000.0,
                         draft_gen_ms=draft_gen_ms,
                         gpu0_ms=fwd_bk.get("gpu0_ms", 0.0),
                         pcie_ms=fwd_bk.get("pcie_ms", 0.0),
                         gpu1_ms=fwd_bk.get("gpu1_ms", 0.0),
+                        node1_compute_ms=recv_stats.get("node1_compute_ms", 0.0),
+                        network_rtt_ms=recv_stats.get("network_rtt_ms", 0.0),
+                        bubble_ms=(t_fwd_1 - t_fwd_0) * 1000.0,
                         accepted=1,
                         drafted=0,
                         is_spec=False,
