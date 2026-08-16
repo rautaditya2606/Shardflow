@@ -63,6 +63,9 @@ class Node0Profiler:
         self.embed_times = []
         self.draft_gen_times = []
         self.draft_wait_times = []
+        self.gpu0_fwd_times = []
+        self.pcie_transfer_times = []
+        self.gpu1_fwd_times = []
         self.node0_gpu_times = []
         self.gpu_to_cpu_times = []
         self.serialize_times = []
@@ -85,6 +88,9 @@ class Node0Profiler:
         total_ms: float,
         draft_gen_ms: float = 0.0,
         draft_wait_ms: float = 0.0,
+        gpu0_ms: float = 0.0,
+        pcie_ms: float = 0.0,
+        gpu1_ms: float = 0.0,
         accepted: int = 1,
         drafted: int = 0,
         is_spec: bool = False,
@@ -92,6 +98,9 @@ class Node0Profiler:
         self.embed_times.append(embed_ms)
         self.draft_gen_times.append(draft_gen_ms)
         self.draft_wait_times.append(draft_wait_ms)
+        self.gpu0_fwd_times.append(gpu0_ms)
+        self.pcie_transfer_times.append(pcie_ms)
+        self.gpu1_fwd_times.append(gpu1_ms)
         self.node0_gpu_times.append(gpu_fwd_ms)
         self.gpu_to_cpu_times.append(g2c_ms)
         self.serialize_times.append(ser_ms)
@@ -118,7 +127,15 @@ class Node0Profiler:
         if any(t > 0 for t in self.draft_wait_times):
             print(f"  0b. Draft Wait at Recon:      {avg(self.draft_wait_times):6.2f} ms  (p95: {p95(self.draft_wait_times):6.2f} ms)")
         print(f"  1. Token Embeddings:          {avg(self.embed_times):6.2f} ms  (p95: {p95(self.embed_times):6.2f} ms)")
-        print(f"  2. Node 0 GPU Forward (Sync): {avg(self.node0_gpu_times):6.2f} ms  (p95: {p95(self.node0_gpu_times):6.2f} ms)")
+
+        if any(t > 0 for t in self.pcie_transfer_times):
+            print(f"  2a. GPU 0 Forward (L0..L6):   {avg(self.gpu0_fwd_times):6.2f} ms  (p95: {p95(self.gpu0_fwd_times):6.2f} ms)")
+            print(f"  2b. PCIe Transfer (G0 -> G1): {avg(self.pcie_transfer_times):6.2f} ms  (p95: {p95(self.pcie_transfer_times):6.2f} ms)")
+            print(f"  2c. GPU 1 Forward (L7..L13):  {avg(self.gpu1_fwd_times):6.2f} ms  (p95: {p95(self.gpu1_fwd_times):6.2f} ms)")
+            print(f"  2. Total Node 0 Forward (Sync):{avg(self.node0_gpu_times):6.2f} ms  (p95: {p95(self.node0_gpu_times):6.2f} ms)")
+        else:
+            print(f"  2. Node 0 GPU Forward (Sync): {avg(self.node0_gpu_times):6.2f} ms  (p95: {p95(self.node0_gpu_times):6.2f} ms)")
+
         print(f"  3. GPU -> CPU Transfer:       {avg(self.gpu_to_cpu_times):6.2f} ms  (p95: {p95(self.gpu_to_cpu_times):6.2f} ms)")
         print(f"  4. Tensor Serialization:      {avg(self.serialize_times):6.2f} ms  (p95: {p95(self.serialize_times):6.2f} ms)")
         print(f"  5. TCP Send (Node 0 -> EC2):  {avg(self.tcp_send_times):6.2f} ms  (p95: {p95(self.tcp_send_times):6.2f} ms)")
@@ -435,9 +452,9 @@ def generate(
                 token_history.append(next_token)
                 print(tokenizer.decode([next_token], skip_special_tokens=True), end="", flush=True)
                 step += accepted_count
-
                 t_step_1 = time.perf_counter()
                 if profiler is not None:
+                    fwd_bk = getattr(node, "last_forward_breakdown", {})
                     profiler.record(
                         embed_ms=0.0,
                         gpu_fwd_ms=(t_fwd_1 - t_fwd_0) * 1000.0,
@@ -448,6 +465,9 @@ def generate(
                         total_ms=(t_step_1 - t_step_0) * 1000.0,
                         draft_gen_ms=draft_gen_ms,
                         draft_wait_ms=draft_wait_ms,
+                        gpu0_ms=fwd_bk.get("gpu0_ms", 0.0),
+                        pcie_ms=fwd_bk.get("pcie_ms", 0.0),
+                        gpu1_ms=fwd_bk.get("gpu1_ms", 0.0),
                         accepted=accepted_count,
                         drafted=len(drafts),
                         is_spec=True,
@@ -475,14 +495,16 @@ def generate(
                     next_token, _, is_eos, recv_stats = receiver.get()
                 else:
                     next_token, _, is_eos, recv_stats = recv_token_timed(sock)
-                t_step_1 = time.perf_counter()
-
+                
                 generated_tokens.append(next_token)
                 token_history.append(next_token)
                 print(tokenizer.decode([next_token], skip_special_tokens=True), end="", flush=True)
+                
+                t_step_1 = time.perf_counter()
                 step += 1
 
                 if profiler is not None:
+                    fwd_bk = getattr(node, "last_forward_breakdown", {})
                     profiler.record(
                         embed_ms=(t_emb_1 - t_emb_0) * 1000.0,
                         gpu_fwd_ms=(t_fwd_1 - t_fwd_0) * 1000.0,
@@ -492,6 +514,9 @@ def generate(
                         recv_ms=recv_stats["tcp_recv_ms"],
                         total_ms=(t_step_1 - t_step_0) * 1000.0,
                         draft_gen_ms=draft_gen_ms,
+                        gpu0_ms=fwd_bk.get("gpu0_ms", 0.0),
+                        pcie_ms=fwd_bk.get("pcie_ms", 0.0),
+                        gpu1_ms=fwd_bk.get("gpu1_ms", 0.0),
                         accepted=1,
                         drafted=0,
                         is_spec=False,

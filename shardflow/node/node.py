@@ -928,12 +928,24 @@ class PipelineNode:
 
             cache_position = position_ids.squeeze(0)
 
+            # Detailed timing breakdown for multi-GPU forward
+            dev0_time = 0.0
+            pcie_time = 0.0
+            dev1_time = 0.0
+            t_sub0 = time.perf_counter()
+
             # Run through each layer with direct kwargs
             for layer in self.model_slice.layers:
                 layer_params = list(layer.parameters())
                 if layer_params:
                     layer_dev = layer_params[0].device
                     if hidden_states.device != layer_dev:
+                        if hidden_states.is_cuda:
+                            torch.cuda.synchronize(hidden_states.device)
+                        t_sub1 = time.perf_counter()
+                        dev0_time += (t_sub1 - t_sub0) * 1000.0
+
+                        t_pcie0 = time.perf_counter()
                         hidden_states = hidden_states.to(layer_dev, non_blocking=False)
                         position_ids = position_ids.to(layer_dev, non_blocking=False)
                         cache_position = cache_position.to(layer_dev, non_blocking=False)
@@ -944,6 +956,11 @@ class PipelineNode:
                                 position_embeddings[0].to(layer_dev),
                                 position_embeddings[1].to(layer_dev),
                             )
+                        if hidden_states.is_cuda:
+                            torch.cuda.synchronize(hidden_states.device)
+                        t_pcie1 = time.perf_counter()
+                        pcie_time += (t_pcie1 - t_pcie0) * 1000.0
+                        t_sub0 = time.perf_counter()
 
                 kwargs = {
                     "attention_mask": causal_mask,
@@ -961,6 +978,18 @@ class PipelineNode:
                     hidden_states = layer_output[0]
                 else:
                     hidden_states = layer_output
+
+            if hidden_states.is_cuda:
+                torch.cuda.synchronize(hidden_states.device)
+            t_sub_end = time.perf_counter()
+            dev1_time += (t_sub_end - t_sub0) * 1000.0
+
+            self.last_forward_breakdown = {
+                "gpu0_ms": dev0_time if pcie_time > 0 else dev1_time,
+                "pcie_ms": pcie_time,
+                "gpu1_ms": dev1_time if pcie_time > 0 else 0.0,
+                "total_fwd_ms": dev0_time + pcie_time + dev1_time,
+            }
 
             # Eager path: StaticCache._seen_tokens is not updated by layer.forward();
             # manually advance it so get_seq_length() returns the correct next position
