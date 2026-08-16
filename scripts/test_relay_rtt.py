@@ -47,7 +47,7 @@ def run_echo(host: str, port: int, auth_byte: bytes, iters: int):
 
     sock = connect_to_relay(host=host, port=port, auth_byte=auth_byte)
     try:
-        handshake(sock)
+        handshake(sock, is_initiator=False)
         print("Waiting for tensors from sender...", flush=True)
 
         count = 0
