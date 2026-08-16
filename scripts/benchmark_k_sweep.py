@@ -53,6 +53,8 @@ def run_k_sweep(
     dtype: str = "float16",
     max_tokens: int = 60,
     load_in_4bit: bool = False,
+    enable_async_spec: bool = False,
+    enable_async_recv: bool = False,
 ):
     config = AutoConfig.from_pretrained(model_path)
     total_layers = getattr(config, "num_hidden_layers", 28)
@@ -64,10 +66,13 @@ def run_k_sweep(
         if major < 8:
             target_dtype = torch.float16
 
+    use_async = enable_async_recv or enable_async_spec
     print("=" * 75)
     print("🔬 SHARDFLOW SPECULATIVE DECODING K-SWEEP BENCHMARK")
     print(f"Base Model:     {model_path} (Layers {layer_start}..{layer_end})")
     print(f"Draft Model:    {draft_model or 'N-gram prompt lookup'}")
+    print(f"Async Spec:     {'ENABLED ⚡ (Phase 5A Single-Continuation Lookahead)' if enable_async_spec else 'DISABLED'}")
+    print(f"Async Recv:     {'ENABLED ⚡ (Background Thread)' if use_async else 'DISABLED'}")
     print(f"K Sweep Values: {k_list}")
     print(f"Relay:          {relay_host}:{relay_port}")
     print("=" * 75)
@@ -111,6 +116,7 @@ def run_k_sweep(
 
     print("\nConnecting to relay...")
     sock = connect_to_relay(host=relay_host, port=relay_port, auth_byte=AUTH_BYTE)
+    receiver = AsyncTokenReceiver(sock) if use_async else None
     try:
         handshake(sock)
         print("🌟 Handshake successful! Beginning K-sweep iterations...\n")
@@ -147,6 +153,8 @@ def run_k_sweep(
                     ngram_sampler=ngram_sampler,
                     eos_token_id=eos_id,
                     profiler=prompt_prof,
+                    receiver=receiver,
+                    enable_async_spec=enable_async_spec,
                 )
 
                 if stats["tokens"] > 1:
@@ -178,6 +186,9 @@ def run_k_sweep(
 
             tok_per_round = (sum(spec_acc) / len(spec_acc)) if spec_acc else 1.0
             acc_rate = (sum(max(0, a - 1) for a in spec_acc) / sum(spec_drf) * 100.0) if (spec_drf and sum(spec_drf) > 0) else 0.0
+            full_hits = sum(1 for acc, drf in zip(spec_acc, spec_drf) if acc == drf + 1)
+            full_hit_rate = (full_hits / len(spec_acc) * 100.0) if spec_acc else 0.0
+            rollback_rate = 100.0 - full_hit_rate if spec_acc else 0.0
 
             results_table.append({
                 "k": k,
@@ -185,36 +196,41 @@ def run_k_sweep(
                 "ttft_ms": avg_ttft,
                 "tokens_per_round": tok_per_round,
                 "accept_rate": acc_rate,
+                "full_hit_rate": full_hit_rate,
+                "rollback_rate": rollback_rate,
                 "draft_ms": avg_draft,
                 "fwd_ms": avg_fwd,
                 "wait_ms": avg_wait,
             })
 
         # Print Final Comparison Table
-        print("\n" + "=" * 88)
+        print("\n" + "=" * 102)
         print("📊 SPECULATIVE DECODING K-SWEEP EMPIRICAL RESULTS")
-        print("=" * 88)
-        header = f"{'K':>3} | {'TPS':>6} | {'TTFT (ms)':>9} | {'Tok/Round':>9} | {'Accept %':>8} | {'Draft (ms)':>10} | {'N0 Fwd (ms)':>11} | {'Wait (ms)':>9}"
+        print("=" * 102)
+        header = f"{'K':>3} | {'TPS':>6} | {'TTFT (ms)':>9} | {'Tok/Round':>9} | {'Full Hit %':>10} | {'Rollback %':>10} | {'Draft (ms)':>10} | {'N0 Fwd (ms)':>11} | {'Wait (ms)':>9}"
         print(header)
-        print("-" * 88)
+        print("-" * 102)
         for row in results_table:
             print(
                 f"{row['k']:3d} | "
                 f"{row['tps']:6.2f} | "
                 f"{row['ttft_ms']:9.1f} | "
                 f"{row['tokens_per_round']:9.2f} | "
-                f"{row['accept_rate']:7.1f}% | "
+                f"{row['full_hit_rate']:9.1f}% | "
+                f"{row['rollback_rate']:9.1f}% | "
                 f"{row['draft_ms']:10.2f} | "
                 f"{row['fwd_ms']:11.2f} | "
                 f"{row['wait_ms']:9.2f}"
             )
-        print("=" * 88)
+        print("=" * 102)
 
         if results_table:
             best = max(results_table, key=lambda r: r["tps"])
-            print(f"\n🏆 Optimal Configuration: K={best['k']} with {best['tps']:.2f} TPS ({best['tokens_per_round']:.2f} tokens/round)")
+            print(f"\n🏆 Optimal Configuration: K={best['k']} with {best['tps']:.2f} TPS ({best['tokens_per_round']:.2f} tokens/round, {best['full_hit_rate']:.1f}% full hits)")
 
     finally:
+        if receiver is not None:
+            receiver.stop()
         sock.close()
 
 
@@ -222,7 +238,7 @@ def main():
     parser = argparse.ArgumentParser(description="ShardFlow K-Sweep Speculative Decoding Benchmark")
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct", help="Model path or HF ID")
     parser.add_argument("--draft-model", default=None, help="Draft model path for neural speculative (optional)")
-    parser.add_argument("--k-values", default="0,1,2,3,4,6,8", help="Comma-separated K values to test")
+    parser.add_argument("--k-values", default="1,2,3,4", help="Comma-separated K values to test (default: 1,2,3,4)")
     parser.add_argument("--relay-host", default=RELAY_HOST, help="Relay IP")
     parser.add_argument("--layer-start", type=int, default=0, help="Starting layer index (default: 0)")
     parser.add_argument("--layer-end", type=int, default=None, help="Ending layer index (default: total_layers // 2)")
@@ -231,6 +247,8 @@ def main():
     parser.add_argument("--dtype", choices=["float16", "bfloat16"], default="float16", help="Precision")
     parser.add_argument("--max-tokens", type=int, default=60, help="Max tokens per generation")
     parser.add_argument("--4bit", action="store_true", help="Enable 4-bit loading")
+    parser.add_argument("--async-spec", action="store_true", default=False, help="Enable Phase 5A one-step-ahead speculative execution")
+    parser.add_argument("--async-recv", action="store_true", default=False, help="Enable async receiver thread")
     args = parser.parse_args()
 
     k_list = [int(k.strip()) for k in args.k_values.split(",") if k.strip()]
@@ -246,6 +264,8 @@ def main():
         dtype=args.dtype,
         max_tokens=args.max_tokens,
         load_in_4bit=getattr(args, "4bit", False),
+        enable_async_spec=args.async_spec,
+        enable_async_recv=args.async_recv,
     )
 
 
