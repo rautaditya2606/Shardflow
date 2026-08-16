@@ -406,8 +406,7 @@ def main():
                 for i in range(len(prompt_profiler.total_step_times)):
                     global_profiler.record(
                         prompt_profiler.embed_times[i],
-                        prompt_profiler.node0_fwd_times[i],
-                        prompt_profiler.cuda_sync_times[i],
+                        prompt_profiler.node0_gpu_times[i],
                         prompt_profiler.gpu_to_cpu_times[i],
                         prompt_profiler.serialize_times[i],
                         prompt_profiler.tcp_send_times[i],
