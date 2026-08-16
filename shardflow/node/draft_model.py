@@ -115,7 +115,7 @@ class DraftSampler:
         return self._seq_len
 
     def reset(self) -> None:
-        """Reset draft model KV cache for a new session."""
+        """Reset draft model KV cache for a new session. """
         self.cache = DynamicCache()
         self._seq_len = 0
 
