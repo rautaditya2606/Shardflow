@@ -211,8 +211,8 @@ def main():
                     logger.warning("Relay connection closed by peer. Waiting to reconnect...")
                     break
 
-                # If this is a prefill sequence (length > 1), reset KV cache and print profiler summary of previous prompt
-                if tensor.shape[1] > 1:
+                # If this is an initial prompt prefill (length > 1 and no drafts), reset KV cache and print profiler summary of previous prompt
+                if tensor.shape[1] > 1 and not drafts:
                     if step > 0:
                         profiler.print_breakdown()
                     node.kv_store.evict(session_id)
@@ -226,13 +226,15 @@ def main():
                 t_c2g_1 = time.perf_counter()
 
                 if drafts:
-                    # Speculative verification
+                    # Speculative verification of K candidate tokens
                     t_fwd_0 = time.perf_counter()
                     output = node._forward(
                         tensor_gpu,
                         session_id=session_id,
                         compute_head=True,
                     )
+                    if output.is_cuda:
+                        torch.cuda.synchronize(output.device)
                     t_fwd_1 = time.perf_counter()
 
                     t_head_0 = time.perf_counter()
@@ -252,6 +254,7 @@ def main():
                             break
 
                     if next_token is None:
+                        # All drafts accepted; bonus sample from final candidate position
                         next_token = sample_next_token(
                             output[0, -1, :],
                             temperature=args.temperature,
@@ -260,6 +263,8 @@ def main():
                         )
 
                     accepted_count = len(accepted_tokens) + 1
+
+                    # Rewind KV cache to exact accepted sequence length
                     cache = node.kv_store.get(session_id)
                     if cache is not None:
                         past_seq = node._get_cache_seq_len(cache)
@@ -269,13 +274,20 @@ def main():
                     is_eos = (next_token == args.eos_token_id)
                     t_head_1 = time.perf_counter()
 
-                    t_sync_0 = time.perf_counter()
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                    t_sync_1 = time.perf_counter()
-
                     send_stats = send_token_timed(sock, next_token, accepted_count=accepted_count, is_eos=is_eos)
                     t_step_1 = time.perf_counter()
+                    step += accepted_count
+
+                    profiler.record(
+                        recv_ms=recv_stats["tcp_recv_ms"],
+                        deser_ms=recv_stats["deserialize_ms"],
+                        c2g_ms=(t_c2g_1 - t_c2g_0) * 1000.0,
+                        fwd_ms=(t_fwd_1 - t_fwd_0) * 1000.0,
+                        head_ms=0.0,
+                        smpl_ms=(t_head_1 - t_head_0) * 1000.0,
+                        send_ms=send_stats["tcp_send_ms"],
+                        total_ms=(t_step_1 - t_step_0) * 1000.0,
+                    )
 
                 else:
                     # Standard 1-token decode

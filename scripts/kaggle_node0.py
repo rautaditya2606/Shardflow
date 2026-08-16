@@ -203,6 +203,18 @@ def generate(
                 print(tokenizer.decode([next_token], skip_special_tokens=True), end="", flush=True)
                 step += accepted_count
 
+                t_step_1 = time.perf_counter()
+                if profiler is not None:
+                    profiler.record(
+                        embed_ms=0.0,
+                        gpu_fwd_ms=0.0,
+                        g2c_ms=send_stats["gpu_to_cpu_ms"],
+                        ser_ms=send_stats["serialize_ms"],
+                        send_ms=send_stats["tcp_send_ms"],
+                        recv_ms=recv_stats["tcp_recv_ms"],
+                        total_ms=(t_step_1 - t_step_0) * 1000.0,
+                    )
+
             else:
                 # Standard 1-token decode with precise phase timing
                 t_emb_0 = time.perf_counter()
