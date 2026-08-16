@@ -4,6 +4,9 @@ Enables generating K candidate tokens locally on Node 0 in a single network roun
 """
 
 import logging
+import queue
+import threading
+import time
 from typing import Optional, List, Tuple
 import torch
 import torch.nn as nn
@@ -177,3 +180,122 @@ class DraftSampler:
             self._seq_len += 1
 
         return draft_tokens
+
+
+class AsyncDraftSampler:
+    """
+    Dedicated background worker thread for DraftSampler running on secondary GPU (e.g. cuda:1).
+    Decouples draft generation from main inference thread so drafting on cuda:1 overlaps
+    100% with Node 0 forward pass and TCP network verification round-trip.
+    """
+
+    def __init__(self, sampler: DraftSampler):
+        self.sampler = sampler
+        self._jobs: queue.Queue = queue.Queue(maxsize=4)
+        self._results: queue.Queue = queue.Queue(maxsize=4)
+        self._stopped = threading.Event()
+        self._active_job_id = 0
+        self._lock = threading.Lock()
+
+        self._thread = threading.Thread(
+            target=self._worker_loop,
+            daemon=True,
+            name="AsyncDraftSamplerWorker",
+        )
+        self._thread.start()
+
+    def _worker_loop(self) -> None:
+        if self.sampler.device.type == "cuda":
+            try:
+                torch.cuda.set_device(self.sampler.device)
+            except Exception:
+                pass
+
+        while not self._stopped.is_set():
+            try:
+                job = self._jobs.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if job is None:
+                break
+
+            job_id, current_token, k, temperature, top_k, top_p = job
+            t0 = time.perf_counter()
+            try:
+                drafts = self.sampler.generate_drafts(
+                    current_token=current_token,
+                    k=k,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                )
+            except Exception as e:
+                logger.error("AsyncDraftSampler error in worker: %s", e)
+                drafts = []
+            t1 = time.perf_counter()
+            draft_time_ms = (t1 - t0) * 1000.0
+
+            self._results.put((job_id, drafts, draft_time_ms))
+            self._jobs.task_done()
+
+    def submit(
+        self,
+        current_token: int,
+        k: Optional[int] = None,
+        temperature: float = 0.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+    ) -> int:
+        """Submit an asynchronous draft generation job to cuda:1."""
+        with self._lock:
+            self._active_job_id += 1
+            jid = self._active_job_id
+            # Clear old unprocessed results if any
+            while not self._results.empty():
+                try:
+                    self._results.get_nowait()
+                except queue.Empty:
+                    break
+            self._jobs.put((jid, current_token, k, temperature, top_k, top_p))
+            return jid
+
+    def get(self, job_id: int, timeout: Optional[float] = None) -> Tuple[List[int], float, float]:
+        """
+        Wait for draft result.
+        Returns: (draft_tokens, draft_gen_ms, wait_at_recon_ms)
+        """
+        t_wait_0 = time.perf_counter()
+        while True:
+            res_jid, drafts, draft_time_ms = self._results.get(timeout=timeout)
+            if res_jid == job_id:
+                t_wait_1 = time.perf_counter()
+                wait_at_recon_ms = (t_wait_1 - t_wait_0) * 1000.0
+                return drafts, draft_time_ms, wait_at_recon_ms
+
+    def prefill(self, prompt_tokens: List[int]) -> None:
+        """Synchronously prefill draft model cache before starting decode."""
+        self.sampler.prefill(prompt_tokens)
+
+    def rewind(self, target_seq_len: int) -> None:
+        """Rewind draft model cache to target sequence length."""
+        self.sampler.rewind(target_seq_len)
+
+    @property
+    def seq_len(self) -> int:
+        return self.sampler.seq_len
+
+    @property
+    def spec_k(self) -> int:
+        return self.sampler.spec_k
+
+    @spec_k.setter
+    def spec_k(self, val: int) -> None:
+        self.sampler.spec_k = val
+
+    def stop(self) -> None:
+        self._stopped.set()
+        try:
+            self._jobs.put_nowait(None)
+        except Exception:
+            pass

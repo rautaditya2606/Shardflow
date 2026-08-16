@@ -62,6 +62,7 @@ class Node0Profiler:
     def __init__(self):
         self.embed_times = []
         self.draft_gen_times = []
+        self.draft_wait_times = []
         self.node0_gpu_times = []
         self.gpu_to_cpu_times = []
         self.serialize_times = []
@@ -83,12 +84,14 @@ class Node0Profiler:
         recv_ms: float,
         total_ms: float,
         draft_gen_ms: float = 0.0,
+        draft_wait_ms: float = 0.0,
         accepted: int = 1,
         drafted: int = 0,
         is_spec: bool = False,
     ):
         self.embed_times.append(embed_ms)
         self.draft_gen_times.append(draft_gen_ms)
+        self.draft_wait_times.append(draft_wait_ms)
         self.node0_gpu_times.append(gpu_fwd_ms)
         self.gpu_to_cpu_times.append(g2c_ms)
         self.serialize_times.append(ser_ms)
@@ -111,15 +114,17 @@ class Node0Profiler:
         print(f"⏱️ NODE 0 PER-TOKEN LATENCY PROFILER BREAKDOWN ({n} decode steps)", flush=True)
         print("=" * 70, flush=True)
         if any(t > 0 for t in self.draft_gen_times):
-            print(f"  0. Draft Gen (CPU/GPU):      {avg(self.draft_gen_times):6.2f} ms  (p95: {p95(self.draft_gen_times):6.2f} ms)")
-        print(f"  1. Token Embeddings:         {avg(self.embed_times):6.2f} ms  (p95: {p95(self.embed_times):6.2f} ms)")
-        print(f"  2. Node 0 GPU Forward (Sync):{avg(self.node0_gpu_times):6.2f} ms  (p95: {p95(self.node0_gpu_times):6.2f} ms)")
-        print(f"  3. GPU -> CPU Transfer:      {avg(self.gpu_to_cpu_times):6.2f} ms  (p95: {p95(self.gpu_to_cpu_times):6.2f} ms)")
-        print(f"  4. Tensor Serialization:     {avg(self.serialize_times):6.2f} ms  (p95: {p95(self.serialize_times):6.2f} ms)")
-        print(f"  5. TCP Send (Node 0 -> EC2): {avg(self.tcp_send_times):6.2f} ms  (p95: {p95(self.tcp_send_times):6.2f} ms)")
-        print(f"  6. TCP Recv Wait (RTT+Node1):{avg(self.tcp_recv_wait_times):6.2f} ms  (p95: {p95(self.tcp_recv_wait_times):6.2f} ms)")
+            print(f"  0a. Draft Gen (cuda:1 Async): {avg(self.draft_gen_times):6.2f} ms  (p95: {p95(self.draft_gen_times):6.2f} ms)")
+        if any(t > 0 for t in self.draft_wait_times):
+            print(f"  0b. Draft Wait at Recon:      {avg(self.draft_wait_times):6.2f} ms  (p95: {p95(self.draft_wait_times):6.2f} ms)")
+        print(f"  1. Token Embeddings:          {avg(self.embed_times):6.2f} ms  (p95: {p95(self.embed_times):6.2f} ms)")
+        print(f"  2. Node 0 GPU Forward (Sync): {avg(self.node0_gpu_times):6.2f} ms  (p95: {p95(self.node0_gpu_times):6.2f} ms)")
+        print(f"  3. GPU -> CPU Transfer:       {avg(self.gpu_to_cpu_times):6.2f} ms  (p95: {p95(self.gpu_to_cpu_times):6.2f} ms)")
+        print(f"  4. Tensor Serialization:      {avg(self.serialize_times):6.2f} ms  (p95: {p95(self.serialize_times):6.2f} ms)")
+        print(f"  5. TCP Send (Node 0 -> EC2):  {avg(self.tcp_send_times):6.2f} ms  (p95: {p95(self.tcp_send_times):6.2f} ms)")
+        print(f"  6. TCP Recv Wait (RTT+Node1): {avg(self.tcp_recv_wait_times):6.2f} ms  (p95: {p95(self.tcp_recv_wait_times):6.2f} ms)")
         print("  " + "-" * 66, flush=True)
-        print(f"  TOTAL STEP LATENCY:          {avg_total:6.2f} ms  ({1000.0/avg_total:.2f} TPS)", flush=True)
+        print(f"  TOTAL STEP LATENCY:           {avg_total:6.2f} ms  ({1000.0/avg_total:.2f} TPS)", flush=True)
 
         spec_acc = [acc for acc, is_s in zip(self.accepted_per_round, self.is_spec_step) if is_s]
         spec_drf = [drf for drf, is_s in zip(self.drafted_per_round, self.is_spec_step) if is_s]
@@ -192,10 +197,13 @@ def generate(
 
     # Initialize neural draft sampler if specified
     draft_sampler = node.draft_sampler if (spec_k > 0 and node.draft_sampler is not None) else None
-    if draft_sampler:
+    async_drafter = getattr(node, "async_draft_sampler", None) if (spec_k > 0 and getattr(node, "async_draft_sampler", None) is not None) else None
+    if async_drafter:
+        async_drafter.prefill(prompt_tokens)
+    elif draft_sampler:
         draft_sampler.prefill(prompt_tokens)
 
-    if spec_k > 0 and draft_sampler is None and ngram_sampler is None:
+    if spec_k > 0 and draft_sampler is None and ngram_sampler is None and async_drafter is None:
         print(f"\n⚠️ [WARNING] spec_k={spec_k} but neither draft_sampler nor ngram_sampler is active! Running 1-token decode.", flush=True)
 
     t_start = time.perf_counter()
@@ -235,6 +243,11 @@ def generate(
         word = tokenizer.decode([next_token], skip_special_tokens=True)
         print(word, end="", flush=True)
 
+        # Kick off first background draft job on cuda:1 immediately
+        pending_draft_job = None
+        if async_drafter and spec_k > 0:
+            pending_draft_job = async_drafter.submit(next_token, k=spec_k, temperature=temperature, top_k=top_k, top_p=top_p)
+
         # 2. Autoregressive Decode Loop
         step = 1
         spec_pending = None
@@ -244,12 +257,16 @@ def generate(
                 break
 
             t_step_0 = time.perf_counter()
+            drafts = []
+            draft_gen_ms = 0.0
+            draft_wait_ms = 0.0
 
             if spec_pending is not None and spec_pending.get("valid", False):
                 # ponytail: Reuse speculative lookahead computed during previous network flight!
                 cand_output = spec_pending["output"]
                 drafts = spec_pending["drafts"]
                 draft_gen_ms = spec_pending.get("draft_gen_ms", 0.0)
+                draft_wait_ms = 0.0
                 t_fwd_0 = time.perf_counter()
                 t_fwd_1 = t_fwd_0
                 past_seq_len = spec_pending["past_seq_len"]
@@ -258,10 +275,21 @@ def generate(
                 total_drafted += len(drafts)
                 send_stats = send_tensor_timed(sock, cand_output, draft_tokens=drafts)
             else:
-                drafts = []
                 t_draft_0 = time.perf_counter()
                 if ngram_sampler and spec_k > 0:
                     drafts = ngram_sampler.find_candidates(token_history, k=spec_k)
+                    draft_gen_ms = (time.perf_counter() - t_draft_0) * 1000.0
+                    draft_wait_ms = 0.0
+                elif async_drafter and spec_k > 0:
+                    if pending_draft_job is not None:
+                        drafts, draft_gen_ms, draft_wait_ms = async_drafter.get(pending_draft_job)
+                        pending_draft_job = None
+                    else:
+                        drafts = async_drafter.sampler.generate_drafts(
+                            next_token, k=spec_k, temperature=temperature, top_k=top_k, top_p=top_p
+                        )
+                        draft_gen_ms = (time.perf_counter() - t_draft_0) * 1000.0
+                        draft_wait_ms = draft_gen_ms
                 elif draft_sampler and spec_k > 0:
                     drafts = draft_sampler.generate_drafts(
                         next_token,
@@ -270,8 +298,8 @@ def generate(
                         top_k=top_k,
                         top_p=top_p,
                     )
-                t_draft_1 = time.perf_counter()
-                draft_gen_ms = (t_draft_1 - t_draft_0) * 1000.0
+                    draft_gen_ms = (time.perf_counter() - t_draft_0) * 1000.0
+                    draft_wait_ms = draft_gen_ms
 
                 if drafts:
                     total_drafted += len(drafts)
@@ -299,6 +327,11 @@ def generate(
             if drafts:
                 cache = node.kv_store.get(session_id)
 
+                # Submit optimistic continuation draft job on cuda:1 while network is in flight!
+                if async_drafter and spec_k > 0:
+                    assumed_next = drafts[-1]
+                    pending_draft_job = async_drafter.submit(assumed_next, k=spec_k, temperature=temperature, top_k=top_k, top_p=top_p)
+
                 # Phase 5A: Single Speculative Continuation (Depth = 1) during network flight
                 if enable_async_spec and (step + len(drafts) + 1 < max_tokens):
                     # Speculatively predict exactly ONE continuation token E from the final draft
@@ -307,6 +340,14 @@ def generate(
                     la_drafts = []
                     if ngram_sampler and spec_k > 0:
                         la_drafts = ngram_sampler.find_candidates(token_history + drafts, k=1)
+                    elif async_drafter and spec_k > 0:
+                        la_drafts = async_drafter.sampler.generate_drafts(
+                            assumed_next,
+                            k=1,
+                            temperature=temperature,
+                            top_k=top_k,
+                            top_p=top_p,
+                        )
                     elif draft_sampler and spec_k > 0:
                         la_drafts = draft_sampler.generate_drafts(
                             assumed_next,
@@ -361,16 +402,27 @@ def generate(
                         # Partial hit or mismatch: single-slice rollback
                         if cache is not None:
                             rewind_kv_cache(cache, past_seq_len + accepted_count)
-                        if draft_sampler:
+                        if async_drafter:
+                            async_drafter.rewind(past_seq_len + accepted_count)
+                            pending_draft_job = async_drafter.submit(next_token, k=spec_k, temperature=temperature, top_k=top_k, top_p=top_p)
+                        elif draft_sampler:
                             draft_target = draft_sampler.seq_len - len(drafts) - len(spec_pending["drafts"]) + (accepted_count - 1)
                             draft_sampler.rewind(draft_target)
                         spec_pending = None
                 else:
                     if cache is not None:
                         rewind_kv_cache(cache, past_seq_len + accepted_count)
-                    if draft_sampler:
-                        draft_target = draft_sampler.seq_len - len(drafts) + (accepted_count - 1)
-                        draft_sampler.rewind(draft_target)
+                    if accepted_count == len(drafts) + 1 and not is_eos:
+                        # Full hit without spec_pending: background draft job on cuda:1 is valid!
+                        pass
+                    else:
+                        # Partial hit or mismatch: rewind draft model and submit fresh job for verified next_token
+                        if async_drafter:
+                            async_drafter.rewind(past_seq_len + accepted_count)
+                            pending_draft_job = async_drafter.submit(next_token, k=spec_k, temperature=temperature, top_k=top_k, top_p=top_p)
+                        elif draft_sampler:
+                            draft_target = draft_sampler.seq_len - len(drafts) + (accepted_count - 1)
+                            draft_sampler.rewind(draft_target)
 
                 if accepted_count > 1:
                     for d_idx in range(accepted_count - 1):
@@ -395,6 +447,7 @@ def generate(
                         recv_ms=recv_stats["tcp_recv_ms"],
                         total_ms=(t_step_1 - t_step_0) * 1000.0,
                         draft_gen_ms=draft_gen_ms,
+                        draft_wait_ms=draft_wait_ms,
                         accepted=accepted_count,
                         drafted=len(drafts),
                         is_spec=True,

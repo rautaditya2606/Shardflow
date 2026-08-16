@@ -172,6 +172,7 @@ def run_k_sweep(
                             recv_ms=prompt_prof.tcp_recv_wait_times[i],
                             total_ms=prompt_prof.total_step_times[i],
                             draft_gen_ms=prompt_prof.draft_gen_times[i],
+                            draft_wait_ms=prompt_prof.draft_wait_times[i] if prompt_prof.draft_wait_times else 0.0,
                             accepted=prompt_prof.accepted_per_round[i],
                             drafted=prompt_prof.drafted_per_round[i],
                             is_spec=prompt_prof.is_spec_step[i],
@@ -182,6 +183,7 @@ def run_k_sweep(
             avg_fwd = statistics.mean(k_profiler.node0_gpu_times) if k_profiler.node0_gpu_times else 0.0
             avg_wait = statistics.mean(k_profiler.tcp_recv_wait_times) if k_profiler.tcp_recv_wait_times else 0.0
             avg_draft = statistics.mean(k_profiler.draft_gen_times) if k_profiler.draft_gen_times else 0.0
+            avg_draft_wait = statistics.mean(k_profiler.draft_wait_times) if k_profiler.draft_wait_times else 0.0
 
             spec_acc = [acc for acc, is_s in zip(k_profiler.accepted_per_round, k_profiler.is_spec_step) if is_s]
             spec_drf = [drf for drf, is_s in zip(k_profiler.drafted_per_round, k_profiler.is_spec_step) if is_s]
@@ -201,17 +203,18 @@ def run_k_sweep(
                 "full_hit_rate": full_hit_rate,
                 "rollback_rate": rollback_rate,
                 "draft_ms": avg_draft,
+                "draft_wait_ms": avg_draft_wait,
                 "fwd_ms": avg_fwd,
                 "wait_ms": avg_wait,
             })
 
         # Print Final Comparison Table
-        print("\n" + "=" * 102)
+        print("\n" + "=" * 115)
         print("📊 SPECULATIVE DECODING K-SWEEP EMPIRICAL RESULTS")
-        print("=" * 102)
-        header = f"{'K':>3} | {'TPS':>6} | {'TTFT (ms)':>9} | {'Tok/Round':>9} | {'Full Hit %':>10} | {'Rollback %':>10} | {'Draft (ms)':>10} | {'N0 Fwd (ms)':>11} | {'Wait (ms)':>9}"
+        print("=" * 115)
+        header = f"{'K':>3} | {'TPS':>6} | {'TTFT (ms)':>9} | {'Tok/Round':>9} | {'Full Hit %':>10} | {'Draft (ms)':>10} | {'Wait Recon (ms)':>15} | {'N0 Fwd (ms)':>11} | {'Wait (ms)':>9}"
         print(header)
-        print("-" * 102)
+        print("-" * 115)
         for row in results_table:
             print(
                 f"{row['k']:3d} | "
@@ -219,12 +222,12 @@ def run_k_sweep(
                 f"{row['ttft_ms']:9.1f} | "
                 f"{row['tokens_per_round']:9.2f} | "
                 f"{row['full_hit_rate']:9.1f}% | "
-                f"{row['rollback_rate']:9.1f}% | "
                 f"{row['draft_ms']:10.2f} | "
+                f"{row['draft_wait_ms']:15.2f} | "
                 f"{row['fwd_ms']:11.2f} | "
                 f"{row['wait_ms']:9.2f}"
             )
-        print("=" * 102)
+        print("=" * 115)
 
         if results_table:
             best = max(results_table, key=lambda r: r["tps"])
