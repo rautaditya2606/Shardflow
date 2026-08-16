@@ -287,6 +287,7 @@ def generate(
         expected_round_id = 1
         pending_responses = {}
         invalidated_rounds = set()
+        pending_drafts: List[int] = []
 
         def fetch_response(target_round_id: int):
             while target_round_id not in pending_responses:
@@ -307,192 +308,88 @@ def generate(
             if next_token == eos_token_id:
                 break
 
-            t_step_0 = time.perf_counter()
-            drafts = []
-            draft_gen_ms = 0.0
-            draft_wait_ms = 0.0
-
-            if spec_pending is not None and spec_pending.get("valid", False):
-                # Reuse speculative lookahead computed during previous network flight
-                cand_output = spec_pending["output"]
-                drafts = spec_pending["drafts"]
-                draft_gen_ms = spec_pending.get("draft_gen_ms", 0.0)
+            if spec_k > 0:
+                t_step_0 = time.perf_counter()
+                drafts = pending_drafts
+                pending_drafts = []
+                draft_gen_ms = 0.0
                 draft_wait_ms = 0.0
-                t_fwd_0 = time.perf_counter()
-                t_fwd_1 = t_fwd_0
-                past_seq_len = spec_pending["past_seq_len"]
-                primary_round_id = spec_pending["round_id"]
-                in_flight_already_sent = spec_pending.get("already_sent", False)
-                spec_pending = None
 
-                total_drafted += len(drafts)
-                if not in_flight_already_sent:
-                    current_round_counter += 1
-                    primary_round_id = current_round_counter
-                    send_stats = send_tensor_timed(sock, cand_output, draft_tokens=drafts, round_id=primary_round_id, parent_round_id=0)
+                if drafts:
+                    total_drafted += len(drafts)
+                    candidate_tokens = [next_token] + drafts
                 else:
-                    send_stats = {"cuda_sync_ms": 0.0, "gpu_to_cpu_ms": 0.0, "serialize_ms": 0.0, "tcp_send_ms": 0.0, "total_send_ms": 0.0}
-            else:
+                    candidate_tokens = [next_token]
+
+                cand_tensor = torch.tensor([candidate_tokens], dtype=torch.long, device=node.model_slice.device)
+                if node.model_slice.embed_tokens is not None:
+                    cand_hidden = node.model_slice.embed_tokens(cand_tensor)
+                else:
+                    cand_hidden = cand_tensor
+
+                cache = node.kv_store.get(session_id)
+                past_seq_len = node._get_cache_seq_len(cache)
+
+                # ═══════════════════════════════════════════════════════
+                # PHASE 1: Immediate Node 0 Forward Pass on cuda:0
+                # Fired at t=0ms — Node 1 starts at t=35ms instead of t=125ms
+                # ═══════════════════════════════════════════════════════
+                t_fwd_0 = time.perf_counter()
+                cand_output = node._forward(cand_hidden, session_id=session_id, compute_head=False)
+                if cand_output.is_cuda:
+                    torch.cuda.synchronize(cand_output.device)
+                t_fwd_1 = time.perf_counter()
+
+                current_round_counter += 1
+                primary_round_id = current_round_counter
+                send_stats = send_tensor_timed(sock, cand_output, draft_tokens=drafts, round_id=primary_round_id, parent_round_id=0)
+
+                # ═══════════════════════════════════════════════════════
+                # PHASE 2: Parallel Drafting on cuda:1 during WAN + Node 1 compute
+                # Budget: ~86ms WAN + ~45ms N1 compute = ~131ms
+                # Drafting takes ~85ms -> completely hidden in network transit
+                # ═══════════════════════════════════════════════════════
                 t_draft_0 = time.perf_counter()
-                if ngram_sampler and spec_k > 0:
-                    drafts = ngram_sampler.find_candidates(token_history, k=spec_k)
-                    draft_gen_ms = (time.perf_counter() - t_draft_0) * 1000.0
-                    draft_wait_ms = 0.0
-                elif async_drafter and spec_k > 0:
-                    if pending_draft_job is not None:
-                        drafts, draft_gen_ms, draft_wait_ms = async_drafter.get(pending_draft_job)
-                        pending_draft_job = None
-                    else:
-                        drafts = async_drafter.sampler.generate_drafts(
-                            next_token, k=spec_k, temperature=temperature, top_k=top_k, top_p=top_p
-                        )
-                        draft_gen_ms = (time.perf_counter() - t_draft_0) * 1000.0
-                        draft_wait_ms = draft_gen_ms
-                elif draft_sampler and spec_k > 0:
-                    drafts = draft_sampler.generate_drafts(
-                        next_token,
+                anchor_token = drafts[-1] if drafts else next_token
+                generated_drafts: List[int] = []
+
+                if draft_sampler and spec_k > 0:
+                    generated_drafts = draft_sampler.generate_drafts(
+                        anchor_token,
                         k=spec_k,
                         temperature=temperature,
                         top_k=top_k,
                         top_p=top_p,
                     )
                     draft_gen_ms = (time.perf_counter() - t_draft_0) * 1000.0
-                    draft_wait_ms = draft_gen_ms
+                elif ngram_sampler and spec_k > 0:
+                    generated_drafts = ngram_sampler.find_candidates(token_history + drafts, k=spec_k)
+                    draft_gen_ms = (time.perf_counter() - t_draft_0) * 1000.0
 
-                if drafts:
-                    total_drafted += len(drafts)
-                    candidate_tokens = [next_token] + drafts
-                    cand_tensor = torch.tensor([candidate_tokens], dtype=torch.long, device=node.model_slice.device)
-
-                    if node.model_slice.embed_tokens is not None:
-                        cand_hidden = node.model_slice.embed_tokens(cand_tensor)
-                    else:
-                        cand_hidden = cand_tensor
-
-                    cache = node.kv_store.get(session_id)
-                    past_seq_len = node._get_cache_seq_len(cache)
-
-                    t_fwd_0 = time.perf_counter()
-                    cand_output = node._forward(cand_hidden, session_id=session_id, compute_head=False)
-                    if cand_output.is_cuda:
-                        torch.cuda.synchronize(cand_output.device)
-                    t_fwd_1 = time.perf_counter()
-
-                    current_round_counter += 1
-                    primary_round_id = current_round_counter
-                    send_stats = send_tensor_timed(sock, cand_output, draft_tokens=drafts, round_id=primary_round_id, parent_round_id=0)
-                else:
-                    cand_output = None
-                    primary_round_id = 0
-
-            if drafts:
-                cache = node.kv_store.get(session_id)
-
-                # Submit optimistic continuation draft job on cuda:1 while network is in flight!
-                if async_drafter and spec_k > 0:
-                    assumed_next = drafts[-1]
-                    pending_draft_job = async_drafter.submit(assumed_next, k=spec_k, temperature=temperature, top_k=top_k, top_p=top_p)
-
-                # Speculative Continuation during network flight
-                child_round_id = 0
-                if enable_async_spec and (step + len(drafts) + 1 < max_tokens):
-                    # Speculatively predict bonus token and continuation candidate from the final draft
-                    t_la_d0 = time.perf_counter()
-                    la_candidates = []
-                    if ngram_sampler and spec_k > 0:
-                        la_candidates = ngram_sampler.find_candidates(token_history + drafts, k=spec_k + 1)
-                    t_la_d1 = time.perf_counter()
-                    la_draft_ms = (t_la_d1 - t_la_d0) * 1000.0
-
-                    if la_candidates:
-                        assumed_bonus_token = la_candidates[0]
-                        la_drafts = la_candidates[1:]
-
-                        la_cand_tokens = [assumed_bonus_token] + la_drafts
-                        la_cand_tensor = torch.tensor([la_cand_tokens], dtype=torch.long, device=node.model_slice.device)
-                        if node.model_slice.embed_tokens is not None:
-                            la_cand_hidden = node.model_slice.embed_tokens(la_cand_tensor)
-                        else:
-                            la_cand_hidden = la_cand_tensor
-
-                        la_past_seq_len = node._get_cache_seq_len(cache)
-                        t_la_fwd_0 = time.perf_counter()
-                        la_cand_output = node._forward(la_cand_hidden, session_id=session_id, compute_head=False)
-                        if la_cand_output.is_cuda:
-                            torch.cuda.synchronize(la_cand_output.device)
-                        t_la_fwd_1 = time.perf_counter()
-
-                        current_round_counter += 1
-                        child_round_id = current_round_counter
-                        already_sent_la = False
-                        if spec_window >= 2 and la_drafts:
-                            # In-flight transmission of speculative child frame over WAN
-                            send_tensor_timed(
-                                sock,
-                                la_cand_output,
-                                draft_tokens=la_drafts,
-                                round_id=child_round_id,
-                                parent_round_id=primary_round_id,
-                            )
-                            already_sent_la = True
-
-                        spec_pending = {
-                            "output": la_cand_output,
-                            "drafts": la_drafts,
-                            "cand_tokens": la_cand_tokens,
-                            "assumed_token": assumed_bonus_token,
-                            "assumed_accepted": len(drafts) + 1,
-                            "past_seq_len": la_past_seq_len,
-                            "draft_gen_ms": la_draft_ms,
-                            "round_id": child_round_id,
-                            "t_fwd_0": t_la_fwd_0,
-                            "t_fwd_1": t_la_fwd_1,
-                            "valid": False,
-                            "already_sent": already_sent_la,
-                        }
-
-                # Receive verification from Node 1 for primary_round_id
+                # ═══════════════════════════════════════════════════════
+                # PHASE 3: Receive verification from Node 1
+                # ═══════════════════════════════════════════════════════
                 next_token, accepted_count, is_eos, recv_stats = fetch_response(primary_round_id)
                 total_accepted += max(0, accepted_count - 1)
 
-                # Reconcile speculation: atomic single-depth commit or rollback
-                is_full_hit = (accepted_count == len(drafts) + 1) and not is_eos
-                if spec_pending is not None:
-                    if is_full_hit and (next_token == spec_pending["assumed_token"]):
-                        # Full hit! Lookahead is confirmed valid
-                        spec_pending["valid"] = True
-                    else:
-                        # Partial hit or mismatch: rollback KV cache to true committed length
-                        committed_len = past_seq_len + accepted_count
-                        if cache is not None:
-                            rewind_kv_cache(cache, committed_len)
-                        if child_round_id > 0:
-                            invalidated_rounds.add(child_round_id)
-                        draft_rewind_len = past_seq_len + accepted_count - 1
-                        if async_drafter:
-                            async_drafter.rewind(draft_rewind_len)
-                            pending_draft_job = async_drafter.submit(next_token, k=spec_k, temperature=temperature, top_k=top_k, top_p=top_p)
-                        elif draft_sampler:
-                            draft_sampler.rewind(draft_rewind_len)
-                        spec_pending = None
-                else:
-                    committed_len = past_seq_len + accepted_count
-                    if cache is not None:
-                        rewind_kv_cache(cache, committed_len)
-                    draft_rewind_len = past_seq_len + accepted_count - 1
-                    if not is_full_hit:
-                        if async_drafter:
-                            async_drafter.rewind(draft_rewind_len)
-                            pending_draft_job = async_drafter.submit(next_token, k=spec_k, temperature=temperature, top_k=top_k, top_p=top_p)
-                        elif draft_sampler:
-                            draft_sampler.rewind(draft_rewind_len)
-                    else:
-                        if async_drafter:
-                            async_drafter.rewind(draft_rewind_len)
-                        elif draft_sampler:
-                            draft_sampler.rewind(draft_rewind_len)
+                # Reconcile speculation: commit or rollback
+                committed_len = past_seq_len + accepted_count
+                if cache is not None:
+                    rewind_kv_cache(cache, committed_len)
 
-                if accepted_count > 1:
+                draft_rewind_len = past_seq_len + accepted_count - 1
+                is_full_hit = (accepted_count == len(drafts) + 1) and not is_eos
+
+                if is_full_hit and generated_drafts:
+                    # Full hit! Pre-drafted tokens for next round are 100% valid
+                    pending_drafts = generated_drafts
+                else:
+                    # Partial hit or mismatch: rewind draft model to true committed state
+                    if draft_sampler:
+                        draft_sampler.rewind(draft_rewind_len)
+                    pending_drafts = []
+
+                if drafts and accepted_count > 1:
                     for d_idx in range(accepted_count - 1):
                         tok = drafts[d_idx]
                         generated_tokens.append(tok)
