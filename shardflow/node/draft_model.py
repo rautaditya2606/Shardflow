@@ -149,18 +149,25 @@ class DraftSampler:
         if k <= 0:
             return []
 
-        # Greedy path: 100% GPU resident, single host extraction at the end
+        # Greedy path: 100% GPU resident, direct forward on underlying transformer model
         if temperature <= 0 or temperature < 1e-8:
             cur_tensor = torch.tensor([[current_token]], dtype=torch.long, device=self.device)
             gpu_drafts: List[torch.Tensor] = []
+            transformer = getattr(self.model, "model", self.model)
+            lm_head = getattr(self.model, "lm_head", None)
 
             for _ in range(k):
-                outputs = self.model(
+                hidden_states = transformer(
                     input_ids=cur_tensor,
                     past_key_values=self.cache,
                     use_cache=True,
-                )
-                cur_tensor = outputs.logits[:, -1:, :].argmax(dim=-1)
+                    return_dict=False,
+                )[0]
+                if lm_head is not None:
+                    logits = lm_head(hidden_states[:, -1:, :])
+                else:
+                    logits = hidden_states[:, -1:, :]
+                cur_tensor = logits.argmax(dim=-1)
                 gpu_drafts.append(cur_tensor)
                 self._seq_len += 1
 
