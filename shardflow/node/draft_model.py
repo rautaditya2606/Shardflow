@@ -106,29 +106,8 @@ class DraftSampler:
         self.transformer = getattr(self.model, "model", self.model)
         self.lm_head = getattr(self.model, "lm_head", None)
 
-        # Optional compilation on raw decoder stack
-        try:
-            self.transformer = torch.compile(
-                self.transformer,
-                mode="reduce-overhead",
-                fullgraph=False,
-            )
-            logger.info("DraftSampler: torch.compile(reduce-overhead) enabled on %s", self.device)
-        except Exception as e:
-            logger.warning("DraftSampler: torch.compile skipped (%s), running in direct eager mode", e)
-
         # Pre-allocated single-token buffer to avoid GPU tensor allocations in decode loop
         self._cur_tensor = torch.zeros((1, 1), dtype=torch.long, device=self.device)
-
-        # Warmup single step if on CUDA to trigger initial kernel compilation
-        if self.device.type == "cuda":
-            try:
-                warmup_cache = DynamicCache()
-                w_ids = torch.tensor([[100]], dtype=torch.long, device=self.device)
-                with torch.inference_mode():
-                    _ = self.transformer(input_ids=w_ids, past_key_values=warmup_cache, use_cache=True, return_dict=False)
-            except Exception:
-                pass
 
     @property
     def seq_len(self) -> int:
