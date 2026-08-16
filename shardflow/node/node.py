@@ -930,6 +930,21 @@ class PipelineNode:
 
             # Run through each layer with direct kwargs
             for layer in self.model_slice.layers:
+                layer_params = list(layer.parameters())
+                if layer_params:
+                    layer_dev = layer_params[0].device
+                    if hidden_states.device != layer_dev:
+                        hidden_states = hidden_states.to(layer_dev, non_blocking=False)
+                        position_ids = position_ids.to(layer_dev, non_blocking=False)
+                        cache_position = cache_position.to(layer_dev, non_blocking=False)
+                        if causal_mask is not None:
+                            causal_mask = causal_mask.to(layer_dev, non_blocking=False)
+                        if position_embeddings is not None and isinstance(position_embeddings, (tuple, list)):
+                            position_embeddings = (
+                                position_embeddings[0].to(layer_dev),
+                                position_embeddings[1].to(layer_dev),
+                            )
+
                 kwargs = {
                     "attention_mask": causal_mask,
                     "position_ids": position_ids,
@@ -957,8 +972,14 @@ class PipelineNode:
         # If last node and compute_head requested, apply final norm and LM head
         if self.is_last_node and compute_head:
             if self.model_slice.norm is not None:
+                norm_dev = next(self.model_slice.norm.parameters()).device
+                if hidden_states.device != norm_dev:
+                    hidden_states = hidden_states.to(norm_dev, non_blocking=False)
                 hidden_states = self.model_slice.norm(hidden_states)
             if self.model_slice.lm_head is not None:
+                head_dev = next(self.model_slice.lm_head.parameters()).device
+                if hidden_states.device != head_dev:
+                    hidden_states = hidden_states.to(head_dev, non_blocking=False)
                 hidden_states = self.model_slice.lm_head(hidden_states)
 
         return hidden_states

@@ -369,7 +369,22 @@ def load_layer_slice(
     if isinstance(target_dtype, str):
         target_dtype = getattr(torch, target_dtype)
 
-    target_device = torch.device(device)
+    if isinstance(device, str) and "," in device:
+        device_list = [torch.device(d.strip()) for d in device.split(",") if d.strip()]
+    elif isinstance(device, (list, tuple)):
+        device_list = [torch.device(d) for d in device]
+    else:
+        device_list = [torch.device(device)]
+
+    target_device = device_list[0]
+    num_slice_layers = layer_end - layer_start
+    per_dev = (num_slice_layers + len(device_list) - 1) // len(device_list)
+
+    def get_layer_device(local_idx: int) -> torch.device:
+        if len(device_list) <= 1:
+            return device_list[0]
+        dev_idx = min(local_idx // per_dev, len(device_list) - 1)
+        return device_list[dev_idx]
 
     # Force float16 if bfloat16 is requested but target GPU does not support hardware BF16 (e.g. Tesla P100 sm_60)
     if target_dtype == torch.bfloat16 and target_device.type == "cuda":
@@ -429,19 +444,21 @@ def load_layer_slice(
 
         # Allocate non-quantized 1D modules on target device
         if norm is not None:
-            norm = norm.to_empty(device=target_device)
+            norm = norm.to_empty(device=device_list[-1])
         if embed_tokens is not None:
-            embed_tokens = embed_tokens.to_empty(device=target_device)
+            embed_tokens = embed_tokens.to_empty(device=device_list[0])
 
     else:
         # FP16 / BF16 unquantized path
-        extracted_layers = extracted_layers.to_empty(device=target_device)
+        for local_idx in range(len(extracted_layers)):
+            layer_dev = get_layer_device(local_idx)
+            extracted_layers[local_idx] = extracted_layers[local_idx].to_empty(device=layer_dev)
         if norm is not None:
-            norm = norm.to_empty(device=target_device)
+            norm = norm.to_empty(device=device_list[-1])
         if lm_head is not None:
-            lm_head = lm_head.to_empty(device=target_device)
+            lm_head = lm_head.to_empty(device=device_list[-1])
         if embed_tokens is not None:
-            embed_tokens = embed_tokens.to_empty(device=target_device)
+            embed_tokens = embed_tokens.to_empty(device=device_list[0])
 
     logger.info(
         "AFTER DEVICE PLACEMENT: allocated=%.2f GB | reserved=%.2f GB",
@@ -516,6 +533,7 @@ def load_layer_slice(
                         orig_idx = int(parts[2])
                         if layer_start <= orig_idx < layer_end:
                             local_idx = orig_idx - layer_start
+                            layer_dev = get_layer_device(local_idx)
                             subpath = ".".join(parts[3:])
                             submod = extracted_layers[local_idx]
                             path_parts = subpath.split(".")
@@ -523,44 +541,49 @@ def load_layer_slice(
                                 submod = getattr(submod, part)
                             param_name = path_parts[-1]
                             current_param = getattr(submod, param_name, None)
-                            if current_param is not None and current_param.device == target_device:
+                            if current_param is not None and current_param.device == layer_dev:
                                 current_param.data.copy_(tensor, non_blocking=False)
                             else:
                                 param = nn.Parameter(
-                                    tensor.to(device=target_device, dtype=target_dtype, non_blocking=False),
+                                    tensor.to(device=layer_dev, dtype=target_dtype, non_blocking=False),
                                     requires_grad=False,
                                 )
                                 setattr(submod, param_name, param)
 
                     elif key.startswith("model.norm.") and norm is not None:
-                        if hasattr(norm, "weight") and norm.weight is not None and norm.weight.device == target_device:
+                        norm_dev = device_list[-1]
+                        if hasattr(norm, "weight") and norm.weight is not None and norm.weight.device == norm_dev:
                             norm.weight.data.copy_(tensor, non_blocking=False)
                         else:
                             norm.weight = nn.Parameter(
-                                tensor.to(device=target_device, dtype=target_dtype, non_blocking=False),
+                                tensor.to(device=norm_dev, dtype=target_dtype, non_blocking=False),
                                 requires_grad=False,
                             )
                     elif key.startswith("lm_head.") and lm_head is not None:
-                        if hasattr(lm_head, "weight") and lm_head.weight is not None and lm_head.weight.device == target_device:
+                        head_dev = device_list[-1]
+                        if hasattr(lm_head, "weight") and lm_head.weight is not None and lm_head.weight.device == head_dev:
                             lm_head.weight.data.copy_(tensor, non_blocking=False)
                         else:
                             lm_head.weight = nn.Parameter(
-                                tensor.to(device=target_device, dtype=target_dtype, non_blocking=False),
+                                tensor.to(device=head_dev, dtype=target_dtype, non_blocking=False),
                                 requires_grad=False,
                             )
                     elif key.startswith("model.embed_tokens.") and embed_tokens is not None:
-                        if hasattr(embed_tokens, "weight") and embed_tokens.weight is not None and embed_tokens.weight.device == target_device:
+                        embed_dev = device_list[0]
+                        if hasattr(embed_tokens, "weight") and embed_tokens.weight is not None and embed_tokens.weight.device == embed_dev:
                             embed_tokens.weight.data.copy_(tensor, non_blocking=False)
                         else:
                             embed_tokens.weight = nn.Parameter(
-                                tensor.to(device=target_device, dtype=target_dtype, non_blocking=False),
+                                tensor.to(device=embed_dev, dtype=target_dtype, non_blocking=False),
                                 requires_grad=False,
                             )
 
             del shard_dict
             if target_device.type == "cuda" and torch.cuda.is_available():
-                torch.cuda.synchronize(target_device)
-                torch.cuda.empty_cache()
+                for dev in device_list:
+                    if dev.type == "cuda":
+                        torch.cuda.synchronize(dev)
+                        torch.cuda.empty_cache()
 
             rss = proc.memory_info().rss / 1024**3
             avail = psutil.virtual_memory().available / 1024**3
@@ -603,17 +626,18 @@ def load_layer_slice(
             else:
                 for idx, orig_idx in enumerate(range(layer_start, layer_end)):
                     prefix = f"model.layers.{orig_idx}."
+                    layer_dev = get_layer_device(idx)
                     layer_sd = {
-                        k[len(prefix):]: v.to(target_device, dtype=target_dtype)
+                        k[len(prefix):]: v.to(layer_dev, dtype=target_dtype)
                         for k, v in state_dict.items() if k.startswith(prefix)
                     }
                     extracted_layers[idx].load_state_dict(layer_sd, strict=False)
                 if norm is not None:
-                    norm.load_state_dict({k[len("model.norm."):]: v.to(target_device, dtype=target_dtype) for k, v in state_dict.items() if k.startswith("model.norm.")}, strict=False)
+                    norm.load_state_dict({k[len("model.norm."):]: v.to(device_list[-1], dtype=target_dtype) for k, v in state_dict.items() if k.startswith("model.norm.")}, strict=False)
                 if lm_head is not None:
-                    lm_head.load_state_dict({k[len("lm_head."):]: v.to(target_device, dtype=target_dtype) for k, v in state_dict.items() if k.startswith("lm_head.")}, strict=False)
+                    lm_head.load_state_dict({k[len("lm_head."):]: v.to(device_list[-1], dtype=target_dtype) for k, v in state_dict.items() if k.startswith("lm_head.")}, strict=False)
                 if embed_tokens is not None:
-                    embed_tokens.load_state_dict({k[len("model.embed_tokens."):]: v.to(target_device, dtype=target_dtype) for k, v in state_dict.items() if k.startswith("model.embed_tokens.")}, strict=False)
+                    embed_tokens.load_state_dict({k[len("model.embed_tokens."):]: v.to(device_list[0], dtype=target_dtype) for k, v in state_dict.items() if k.startswith("model.embed_tokens.")}, strict=False)
             del state_dict
 
     del model
