@@ -117,9 +117,9 @@ def main():
     parser.add_argument("--top-k", type=int, default=0, help="Sampling top-k")
     parser.add_argument("--top-p", type=float, default=1.0, help="Sampling top-p")
     parser.add_argument("--eos-token-id", type=int, default=151643, help="EOS token ID")
-    parser.add_argument("--cuda-graphs", action="store_true", default=True, help="Enable CUDA Graphs and Static KV cache (default: True)")
-    parser.add_argument("--no-cuda-graphs", action="store_false", dest="cuda_graphs", help="Disable CUDA Graphs and use DynamicCache fallback")
-    parser.add_argument("--static-kv", action="store_true", default=True, help="Enable Static KV cache on GPU (default: True)")
+    parser.add_argument("--cuda-graphs", action="store_true", default=False, help="Enable CUDA Graphs and Static KV cache")
+    parser.add_argument("--no-cuda-graphs", action="store_false", dest="cuda_graphs", help="Disable CUDA Graphs and use DynamicCache fallback (default)")
+    parser.add_argument("--static-kv", action="store_true", default=False, help="Enable Static KV cache on GPU")
     parser.add_argument("--no-static-kv", action="store_false", dest="static_kv", help="Disable Static KV cache")
     args = parser.parse_args()
 

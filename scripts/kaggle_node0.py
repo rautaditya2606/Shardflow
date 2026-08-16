@@ -190,7 +190,7 @@ def generate(
 
                 if cache is not None:
                     rewind_kv_cache(cache, past_seq_len + accepted_count)
-                draft_target = draft_sampler.seq_len - len(drafts) + accepted_count
+                draft_target = draft_sampler.seq_len - len(drafts) + (accepted_count - 1)
                 draft_sampler.rewind(draft_target)
 
                 if drafts and accepted_count > 1:
@@ -303,9 +303,9 @@ def main():
     parser.add_argument("--dtype", choices=["float16", "bfloat16"], default="float16", help="Precision (default: float16)")
     parser.add_argument("--max-tokens", type=int, default=60, help="Max tokens per generation")
     parser.add_argument("--prompt", default=None, help="Single prompt to benchmark (optional)")
-    parser.add_argument("--cuda-graphs", action="store_true", default=True, help="Enable CUDA Graphs and Static KV cache (default: True)")
-    parser.add_argument("--no-cuda-graphs", action="store_false", dest="cuda_graphs", help="Disable CUDA Graphs and use DynamicCache fallback")
-    parser.add_argument("--static-kv", action="store_true", default=True, help="Enable Static KV cache on GPU (default: True)")
+    parser.add_argument("--cuda-graphs", action="store_true", default=False, help="Enable CUDA Graphs and Static KV cache")
+    parser.add_argument("--no-cuda-graphs", action="store_false", dest="cuda_graphs", help="Disable CUDA Graphs and use DynamicCache fallback (default)")
+    parser.add_argument("--static-kv", action="store_true", default=False, help="Enable Static KV cache on GPU")
     parser.add_argument("--no-static-kv", action="store_false", dest="static_kv", help="Disable Static KV cache")
     args = parser.parse_args()
 
