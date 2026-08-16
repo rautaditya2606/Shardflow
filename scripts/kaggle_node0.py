@@ -484,6 +484,7 @@ def main():
     parser = argparse.ArgumentParser(description="ShardFlow v2 Node 0 (Kaggle A TCP Relay Runner)")
     parser.add_argument("--model", default="Qwen/Qwen2.5-14B-Instruct", help="Model path or HF ID (default: Qwen/Qwen2.5-14B-Instruct)")
     parser.add_argument("--draft-model", default=None, help="Draft model path for speculative decoding (e.g. Qwen/Qwen2.5-0.5B-Instruct)")
+    parser.add_argument("--draft-device", default=None, help="Device for draft model (e.g. cuda:1 to run on secondary T4 GPU)")
     parser.add_argument("--spec-k", type=int, default=0, help="Speculative candidate tokens (default: 0 to disable, 4 to test)")
     parser.add_argument("--layer-start", type=int, default=0, help="Starting layer index (default: 0)")
     parser.add_argument("--layer-end", type=int, default=None, help="Ending layer index (default: half of total layers, e.g. 24 for 14B)")
@@ -525,7 +526,8 @@ def main():
         ngram_sampler = NGramDraftSampler(max_ngram_size=3, min_ngram_size=1, spec_k=args.spec_k)
         draft_info = f"Prompt-Lookup N-gram (<0.1ms CPU lookup) (Speculative K={args.spec_k})"
     elif args.spec_k > 0 and args.draft_model:
-        draft_info = f"Neural Draft ({args.draft_model}) (Speculative K={args.spec_k})"
+        draft_dev_str = f" on {args.draft_device}" if args.draft_device else ""
+        draft_info = f"Neural Draft ({args.draft_model}{draft_dev_str}) (Speculative K={args.spec_k})"
     else:
         draft_info = "DISABLED (spec_k=0)"
 
@@ -568,6 +570,7 @@ def main():
         is_first_node=True,
         is_last_node=False,
         draft_model=args.draft_model if args.spec_k > 0 else None,
+        draft_device=args.draft_device,
         spec_k=args.spec_k,
         enable_cuda_graphs=enable_cuda_graphs,
     )

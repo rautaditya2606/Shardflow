@@ -55,6 +55,7 @@ def run_k_sweep(
     load_in_4bit: bool = False,
     enable_async_spec: bool = False,
     enable_async_recv: bool = False,
+    draft_device: Optional[str] = None,
 ):
     config = AutoConfig.from_pretrained(model_path)
     total_layers = getattr(config, "num_hidden_layers", 28)
@@ -69,8 +70,8 @@ def run_k_sweep(
     use_async = enable_async_recv or enable_async_spec
     print("=" * 75)
     print("🔬 SHARDFLOW SPECULATIVE DECODING K-SWEEP BENCHMARK")
-    print(f"Base Model:     {model_path} (Layers {layer_start}..{layer_end})")
-    print(f"Draft Model:    {draft_model or 'N-gram prompt lookup'}")
+    print(f"Base Model:     {model_path} (Layers {layer_start}..{layer_end}) on {device}")
+    print(f"Draft Model:    {draft_model or 'N-gram prompt lookup'} on {draft_device or device}")
     print(f"Async Spec:     {'ENABLED ⚡ (Phase 5A Single-Continuation Lookahead)' if enable_async_spec else 'DISABLED'}")
     print(f"Async Recv:     {'ENABLED ⚡ (Background Thread)' if use_async else 'DISABLED'}")
     print(f"K Sweep Values: {k_list}")
@@ -100,6 +101,7 @@ def run_k_sweep(
         is_first_node=True,
         is_last_node=False,
         draft_model=draft_model if draft_model else None,
+        draft_device=draft_device,
         spec_k=max_k,
     )
 
@@ -249,6 +251,7 @@ def main():
     parser.add_argument("--4bit", action="store_true", help="Enable 4-bit loading")
     parser.add_argument("--async-spec", action="store_true", default=False, help="Enable Phase 5A one-step-ahead speculative execution")
     parser.add_argument("--async-recv", action="store_true", default=False, help="Enable async receiver thread")
+    parser.add_argument("--draft-device", default=None, help="Device for draft model (e.g. cuda:1)")
     args = parser.parse_args()
 
     k_list = [int(k.strip()) for k in args.k_values.split(",") if k.strip()]
@@ -266,6 +269,7 @@ def main():
         load_in_4bit=getattr(args, "4bit", False),
         enable_async_spec=args.async_spec,
         enable_async_recv=args.async_recv,
+        draft_device=args.draft_device,
     )
 
 

@@ -61,6 +61,7 @@ class PipelineNode:
         max_sessions: int = 4,
         enable_cuda_graphs: bool = True,
         draft_model: Optional[str] = None,
+        draft_device: Optional[str] = None,
         spec_k: int = 4,
         next_node_url: Optional[str] = None,
         http_port: Optional[int] = None,
@@ -116,13 +117,14 @@ class PipelineNode:
         self.draft_sampler: Optional[DraftSampler] = None
         if self.is_first_node and draft_model and self.spec_k > 0:
             try:
+                target_draft_device = draft_device or model_slice.device
                 self.draft_sampler = DraftSampler(
                     model_path=draft_model,
-                    device=model_slice.device,
+                    device=target_draft_device,
                     dtype=self._node_dtype,
                     spec_k=spec_k,
                 )
-                logger.info("DraftSampler initialized on Node 0 (draft_model=%s, K=%d)", draft_model, spec_k)
+                logger.info("DraftSampler initialized on Node 0 (draft_model=%s, device=%s, K=%d)", draft_model, target_draft_device, spec_k)
             except Exception as e:
                 logger.error("❌ FAILED to initialize DraftSampler for '%s': %s", draft_model, e)
                 print(f"\n❌ [ERROR] Could not load draft model '{draft_model}': {e}\n", flush=True)
