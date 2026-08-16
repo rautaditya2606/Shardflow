@@ -26,14 +26,14 @@ def benchmark(url="http://127.0.0.1:8000/v1/chat/completions", max_tokens=50, nu
     transport = get_transport_path(base_url)
 
     transport_label = {
-        "wireguard": "✅ WireGuard (direct UDP — ~5ms RTT)",
-        "socks5":    "⚠️  SOCKS5 (userspace proxy — ~200ms RTT) — RESULTS ARE DEGRADED",
-        "loopback":  "🔁 Loopback (same-host)",
-        "unknown":   "❓ Unknown (gateway may not expose /debug/transport yet)",
-    }.get(transport, f"❓ {transport}")
+        "wireguard": "[OK] WireGuard (direct UDP — ~5ms RTT)",
+        "socks5":    "[WARNING]  SOCKS5 (userspace proxy — ~200ms RTT) — RESULTS ARE DEGRADED",
+        "loopback":  " Loopback (same-host)",
+        "unknown":   " Unknown (gateway may not expose /debug/transport yet)",
+    }.get(transport, f" {transport}")
 
     print("=" * 65)
-    print("⚡ SHARDFLOW DISTRIBUTED INFERENCE BENCHMARK")
+    print(" SHARDFLOW DISTRIBUTED INFERENCE BENCHMARK")
     print(f"Target:     {url}")
     print(f"Transport:  {transport_label}")
     print(f"Max Tokens: {max_tokens} | Runs: {num_runs}")
@@ -41,9 +41,9 @@ def benchmark(url="http://127.0.0.1:8000/v1/chat/completions", max_tokens=50, nu
 
     if transport == "socks5":
         print()
-        print("  ⚠️  WARNING: Running over SOCKS5 (Tailscale userspace mode).")
-        print("  ⚠️  TPS will be ~1-2 tok/s due to TCP-over-TCP latency, NOT GPU speed.")
-        print("  ⚠️  Fix: ensure kernel TUN mode starts (check /tmp/tailscaled.log on Colab).")
+        print("  [WARNING]  WARNING: Running over SOCKS5 (Tailscale userspace mode).")
+        print("  [WARNING]  TPS will be ~1-2 tok/s due to TCP-over-TCP latency, NOT GPU speed.")
+        print("  [WARNING]  Fix: ensure kernel TUN mode starts (check /tmp/tailscaled.log on Colab).")
         print()
 
     prompt = "Explain why pipeline parallelism is important for large language models."
@@ -68,7 +68,7 @@ def benchmark(url="http://127.0.0.1:8000/v1/chat/completions", max_tokens=50, nu
 
         response = requests.post(url, json=payload, stream=True, timeout=120.0)
         if response.status_code != 200:
-            print(f"❌ Error: {response.status_code} - {response.text}")
+            print(f"[ERROR] Error: {response.status_code} - {response.text}")
             continue
 
         for line in response.iter_lines():
@@ -101,7 +101,7 @@ def benchmark(url="http://127.0.0.1:8000/v1/chat/completions", max_tokens=50, nu
         tps = (token_count - 1) / decode_time if decode_time > 0 and token_count > 1 else (token_count / decode_time if decode_time > 0 else 0)
 
         print()
-        print(f"  ➜ Tokens: {token_count} | TTFT: {ttft:.3f}s | Decode Time: {decode_time:.3f}s | TPS: {tps:.2f} tok/s")
+        print(f"   Tokens: {token_count} | TTFT: {ttft:.3f}s | Decode Time: {decode_time:.3f}s | TPS: {tps:.2f} tok/s")
 
         tps_results.append(tps)
         ttft_results.append(ttft)
@@ -112,14 +112,14 @@ def benchmark(url="http://127.0.0.1:8000/v1/chat/completions", max_tokens=50, nu
     if final_transport != "unknown":
         transport = final_transport
         transport_label = {
-            "wireguard": "✅ WireGuard (direct UDP — ~5ms RTT)",
-            "socks5":    "⚠️  SOCKS5 (userspace proxy — ~200ms RTT) — RESULTS ARE DEGRADED",
-            "loopback":  "🔁 Loopback (same-host)",
-            "unknown":   "❓ Unknown (gateway may not expose /debug/transport yet)",
-        }.get(transport, f"❓ {transport}")
+            "wireguard": "[OK] WireGuard (direct UDP — ~5ms RTT)",
+            "socks5":    "[WARNING]  SOCKS5 (userspace proxy — ~200ms RTT) — RESULTS ARE DEGRADED",
+            "loopback":  " Loopback (same-host)",
+            "unknown":   " Unknown (gateway may not expose /debug/transport yet)",
+        }.get(transport, f" {transport}")
 
     print("\n" + "=" * 65)
-    print("📊 BENCHMARK SUMMARY")
+    print(" BENCHMARK SUMMARY")
     print("=" * 65)
     print(f"  Transport:          {transport_label}")
     if tps_results:
@@ -128,8 +128,8 @@ def benchmark(url="http://127.0.0.1:8000/v1/chat/completions", max_tokens=50, nu
         print(f"  Avg Total Time:     {statistics.mean(total_time_results):.3f}s")
     if transport == "socks5":
         print()
-        print("  ⚠️  These results reflect SOCKS5 latency, not GPU throughput.")
-        print("  ⚠️  Re-run after fixing kernel TUN or running on Kaggle 2x T4 to get real numbers.")
+        print("  [WARNING]  These results reflect SOCKS5 latency, not GPU throughput.")
+        print("  [WARNING]  Re-run after fixing kernel TUN or running on Kaggle 2x T4 to get real numbers.")
     print("=" * 65)
 
 

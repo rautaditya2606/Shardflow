@@ -9,7 +9,7 @@ from shardflow.orchestrator.orchestrator import Orchestrator
 
 async def main():
     print("=" * 60)
-    print("🚀 TESTING SHARDFLOW DISTRIBUTED INFERENCE ACROSS COLAB NODES")
+    print(" TESTING SHARDFLOW DISTRIBUTED INFERENCE ACROSS COLAB NODES")
     print("=" * 60)
 
     model_path = "Qwen/Qwen2.5-7B-Instruct"
@@ -52,7 +52,7 @@ async def main():
     tps = token_count / decode_time if decode_time > 0 else 0
 
     print("\n" + "=" * 60)
-    print(f"✅ GENERATION COMPLETE!")
+    print(f"[OK] GENERATION COMPLETE!")
     print(f"  Tokens Generated: {token_count}")
     print(f"  TTFT (Prefill):   {ttft:.3f}s")
     print(f"  Total Time:       {total_time:.3f}s")

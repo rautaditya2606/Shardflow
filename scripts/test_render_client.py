@@ -12,7 +12,7 @@ def main():
 
     prompt = "Explain in 2 bullet points how distributed pipeline parallel inference works."
 
-    print(f"🚀 Sending prompt to Render API Gateway ({RENDER_URL})...")
+    print(f" Sending prompt to Render API Gateway ({RENDER_URL})...")
     print(f"Prompt: '{prompt}'\n")
 
     start_t = time.time()

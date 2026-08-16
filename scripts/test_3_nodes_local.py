@@ -111,7 +111,7 @@ def main():
     registry_url = f"http://127.0.0.1:{gateway_port}"
 
     print("\n" + "=" * 70)
-    print("🚀 SHARDFLOW 3-NODE LOCAL TEST (TinyLlama-1.1B-Chat-v1.0)")
+    print(" SHARDFLOW 3-NODE LOCAL TEST (TinyLlama-1.1B-Chat-v1.0)")
     print("=" * 70 + "\n")
 
     logger.info("1. Starting FastAPI Gateway Server on %s...", registry_url)
@@ -201,7 +201,7 @@ def main():
     tok_per_sec = token_count / (total_time - ttft) if (total_time - ttft) > 0 else 0
 
     print(f"\n\n{'=' * 70}")
-    print("✅ TEST SUCCESSFUL!")
+    print("[OK] TEST SUCCESSFUL!")
     print(f"Tokens Generated: {token_count}")
     print(f"Time to First Token (TTFT): {ttft:.3f}s")
     print(f"Total Execution Time: {total_time:.2f}s")

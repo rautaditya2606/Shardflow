@@ -29,7 +29,7 @@ async def setup_shardflow_pipeline():
     logger.setLevel(logging.WARNING)
 
     print(f"\n{'='*60}")
-    print(f"🚀 INITIALIZING SHARDFLOW PIPELINE (Device: {DEVICE})")
+    print(f" INITIALIZING SHARDFLOW PIPELINE (Device: {DEVICE})")
     print(f"{'='*60}\n")
 
     print("1. Loading GPU model layer slices...")
@@ -68,13 +68,13 @@ def main():
         try:
             r = requests.get(f"http://127.0.0.1:{GATEWAY_PORT}/health", timeout=1.0)
             if r.status_code == 200:
-                print("✅ Gateway server is online and ready!")
+                print("[OK] Gateway server is online and ready!")
                 break
         except Exception:
             time.sleep(0.5)
 
     print(f"\n{'='*60}")
-    print("🤖 TESTING CHAT COMPLETION (LOCAL LLM + LOCAL ORCHESTRATOR)")
+    print(" TESTING CHAT COMPLETION (LOCAL LLM + LOCAL ORCHESTRATOR)")
     print(f"{'='*60}\n")
 
     client = OpenAI(base_url=f"http://127.0.0.1:{GATEWAY_PORT}/v1", api_key="not-needed")
@@ -95,7 +95,7 @@ def main():
             print(chunk.choices[0].delta.content, end="", flush=True)
 
     print(f"\n\n{'='*60}")
-    print("✅ DEMO COMPLETE!")
+    print("[OK] DEMO COMPLETE!")
     print(f"{'='*60}\n")
 
 

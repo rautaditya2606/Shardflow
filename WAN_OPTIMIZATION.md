@@ -256,7 +256,7 @@ Ensure the following are set on all reader/writer sockets:
 - **Avg Total Time**: **32.11s** (50 tokens)
 - **Bottleneck**: Every token required a full cross-continent WAN round-trip (~500ms RTT) between local laptop and cloud nodes.
 
-### Run 2: v2 Peer-to-Peer Data-Plane (Direct P2P Token Loop) ⚡
+### Run 2: v2 Peer-to-Peer Data-Plane (Direct P2P Token Loop) 
 - **Architecture**: v2 Data-Plane (`START_SESSION` — token loop runs directly between GPU nodes; streaming tokens back asynchronously)
 - **Model**: `Qwen/Qwen2.5-7B-Instruct` (FP16, 2 nodes)
 - **Avg Decode TPS**: **4.59 tok/s** (Max: **4.61 tok/s**) — **2.44x Speedup** over v1!
@@ -266,9 +266,9 @@ Ensure the following are set on all reader/writer sockets:
 ```text
 --- Benchmark Run 3/3 ---
 Pipeline processing, often discussed in the V-riberglass composite form- -working through processes, operations, and network contexts-fashion or, more specifically, in the-depth, is crucial for the seamless and efficient processing, especially in the- ldings;
-  ➜ Tokens: 50 | TTFT: 3.859s | Decode Time: 10.625s | TPS: 4.61 tok/s
+  -> Tokens: 50 | TTFT: 3.859s | Decode Time: 10.625s | TPS: 4.61 tok/s
 =================================================================
-📊 BENCHMARK SUMMARY
+ BENCHMARK SUMMARY
 =================================================================
   Transport:          v2 P2P Data-Plane (Gateway Local)
   Avg Decode TPS:     4.59 tok/s (Max: 4.61 tok/s)

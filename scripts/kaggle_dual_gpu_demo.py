@@ -56,11 +56,11 @@ def main():
     use_cuda_graphs = not args.no_cuda_graphs
 
     print("=" * 70, flush=True)
-    print("🚀 SHARDFLOW DUAL-GPU (2x T4) ACCELERATED INFERENCE PIPELINE", flush=True)
+    print(" SHARDFLOW DUAL-GPU (2x T4) ACCELERATED INFERENCE PIPELINE", flush=True)
     print(f"Base Model:    {model_path} (FP16 partitioned across cuda:0 & cuda:1)")
     print(f"Draft Model:   {draft_path} (Speculative K={args.spec_k})")
-    print(f"CUDA Graphs:   {'✅ ENABLED (Zero kernel launch latency)' if use_cuda_graphs else '❌ DISABLED'}")
-    print(f"Data-Plane:    ✅ v2 P2P Streaming Direct Link")
+    print(f"CUDA Graphs:   {'[OK] ENABLED (Zero kernel launch latency)' if use_cuda_graphs else '[ERROR] DISABLED'}")
+    print(f"Data-Plane:    [OK] v2 P2P Streaming Direct Link")
     print(f"Gateway:       http://127.0.0.1:{args.port}")
     print("=" * 70, flush=True)
 
@@ -74,7 +74,7 @@ def main():
         try:
             r = requests.get(f"http://127.0.0.1:{args.port}/topology", timeout=1.0)
             if r.status_code == 200:
-                print("✅ Gateway & Registry are online!", flush=True)
+                print("[OK] Gateway & Registry are online!", flush=True)
                 break
         except Exception:
             time.sleep(0.5)
@@ -108,7 +108,7 @@ def main():
             raise RuntimeError(f"Node 1 failed to start (exit code {node1_proc.returncode}). Check /tmp/node1_local.log")
         try:
             with socket.create_connection(("127.0.0.1", 9501), timeout=1.0):
-                print("✅ Node 1 is online and listening on 127.0.0.1:9501!", flush=True)
+                print("[OK] Node 1 is online and listening on 127.0.0.1:9501!", flush=True)
                 break
         except Exception:
             time.sleep(1.5)
@@ -151,7 +151,7 @@ def main():
             raise RuntimeError(f"Node 0 failed to start (exit code {node0_proc.returncode}). Check /tmp/node0_local.log")
         try:
             with socket.create_connection(("127.0.0.1", 9500), timeout=1.0):
-                print("✅ Node 0 is online and registered with local Gateway!", flush=True)
+                print("[OK] Node 0 is online and registered with local Gateway!", flush=True)
                 break
         except Exception:
             time.sleep(1.5)
@@ -160,7 +160,7 @@ def main():
 
     # 4. Run Live Benchmark
     print("\n" + "=" * 70, flush=True)
-    print("⚡ [4/4] RUNNING LIVE DISTRIBUTED INFERENCE BENCHMARK", flush=True)
+    print(" [4/4] RUNNING LIVE DISTRIBUTED INFERENCE BENCHMARK", flush=True)
     print("=" * 70, flush=True)
 
     prompts = [
@@ -193,7 +193,7 @@ def main():
 
             resp = requests.post(chat_url, json=payload, stream=True, timeout=60.0)
             if resp.status_code != 200:
-                print(f"\n❌ Error {resp.status_code}: {resp.text}", flush=True)
+                print(f"\n[ERROR] Error {resp.status_code}: {resp.text}", flush=True)
                 continue
 
             for line in resp.iter_lines():
@@ -222,7 +222,7 @@ def main():
             tps = (tok_count - 1) / decode_time if decode_time > 0 and tok_count > 1 else (tok_count / decode_time if decode_time > 0 else 0)
 
             if tok_count == 0:
-                print("\n⚠️ No tokens generated. Checking Node 0 and Node 1 logs...", flush=True)
+                print("\n[WARNING] No tokens generated. Checking Node 0 and Node 1 logs...", flush=True)
                 try:
                     with open("/tmp/node0_local.log", "r") as f0:
                         lines0 = f0.readlines()[-15:]
@@ -234,7 +234,7 @@ def main():
                     print(f"Could not read logs: {ex}", flush=True)
 
             print("\n" + "-" * 50, flush=True)
-            print(f"📊 Tokens: {tok_count} | TTFT: {ttft*1000:.1f} ms | Decode Time: {decode_time:.2f} s | Throughput: {tps:.2f} TPS 🚀", flush=True)
+            print(f" Tokens: {tok_count} | TTFT: {ttft*1000:.1f} ms | Decode Time: {decode_time:.2f} s | Throughput: {tps:.2f} TPS ", flush=True)
             print("-" * 50, flush=True)
 
             if tok_count > 0:
@@ -244,8 +244,8 @@ def main():
         if tps_list:
             import statistics
             print("\n" + "=" * 70, flush=True)
-            print("🏆 FINAL BENCHMARK SUMMARY (Kaggle 2x T4 Dual-GPU)", flush=True)
-            print(f"  Avg Decode Throughput: {statistics.mean(tps_list):.2f} tokens/sec 🚀")
+            print("[BEST] FINAL BENCHMARK SUMMARY (Kaggle 2x T4 Dual-GPU)", flush=True)
+            print(f"  Avg Decode Throughput: {statistics.mean(tps_list):.2f} tokens/sec ")
             print(f"  Max Decode Throughput: {max(tps_list):.2f} tokens/sec")
             print(f"  Avg TTFT:              {statistics.mean(ttft_list)*1000:.1f} ms")
             print(f"  Total Cost:            $0.00 (Kaggle Free Tier)")

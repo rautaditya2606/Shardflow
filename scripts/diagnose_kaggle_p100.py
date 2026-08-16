@@ -52,7 +52,7 @@ logger = logging.getLogger("shardflow.diagnostics")
 
 def print_banner(title: str):
     print("\n" + "=" * 70, flush=True)
-    print(f"🔬 {title}", flush=True)
+    print(f" {title}", flush=True)
     print("=" * 70, flush=True)
 
 
@@ -86,7 +86,7 @@ def run_test_forward(model_path: str, layer_start: int, layer_end: int, is_last:
         device=device,
     )
     t_load = time.perf_counter() - t0
-    print(f"✅ Model slice loaded in {t_load:.2f}s", flush=True)
+    print(f"[OK] Model slice loaded in {t_load:.2f}s", flush=True)
     print_vram("Post-Load", device=device)
 
     node = PipelineNode(
@@ -110,12 +110,12 @@ def run_test_forward(model_path: str, layer_start: int, layer_end: int, is_last:
         torch.cuda.synchronize(device)
     t_fwd_1 = time.perf_counter() - t_fwd_0
     
-    print(f"✅ Single-token forward pass completed in {t_fwd_1*1000:.2f} ms! Output shape: {out_1.shape}, dtype={out_1.dtype}", flush=True)
+    print(f"[OK] Single-token forward pass completed in {t_fwd_1*1000:.2f} ms! Output shape: {out_1.shape}, dtype={out_1.dtype}", flush=True)
     
     if is_last:
         logits = out_1[0, -1, :]
         tok = sample_next_token(logits, temperature=0.0)
-        print(f"✅ Terminal LM head + Greedy sampling successful! Sampled token ID: {tok} (logits min={logits.min().item():.2f}, max={logits.max().item():.2f})", flush=True)
+        print(f"[OK] Terminal LM head + Greedy sampling successful! Sampled token ID: {tok} (logits min={logits.min().item():.2f}, max={logits.max().item():.2f})", flush=True)
 
     # 1B: Speculative candidate verification forward pass [1, 5, hidden_dim]
     print("\n--- [Step 1B] Speculative Multi-Token Forward Pass [1, 5, hidden_size] ---", flush=True)
@@ -129,12 +129,12 @@ def run_test_forward(model_path: str, layer_start: int, layer_end: int, is_last:
         torch.cuda.synchronize(device)
     t_fwd_5 = time.perf_counter() - t_fwd_0
     
-    print(f"✅ Multi-token forward pass completed in {t_fwd_5*1000:.2f} ms! Output shape: {out_5.shape}", flush=True)
+    print(f"[OK] Multi-token forward pass completed in {t_fwd_5*1000:.2f} ms! Output shape: {out_5.shape}", flush=True)
     print_vram("Post-Inference", device=device)
     
     # Cleanup session
     node.kv_store.evict("diag-sess-1")
-    print("🎉 TEST 1 PASSED: Pure CUDA execution on this hardware is 100% operational!\n", flush=True)
+    print(" TEST 1 PASSED: Pure CUDA execution on this hardware is 100% operational!\n", flush=True)
     return model_slice
 
 
@@ -155,7 +155,7 @@ async def run_test_idle(model_slice: ModelSlice, port: int = 9500, duration_seco
     )
     
     await node.start()
-    print(f"✅ Server listening on 0.0.0.0:{port}. Entering idle observation loop for {duration_seconds} seconds...", flush=True)
+    print(f"[OK] Server listening on 0.0.0.0:{port}. Entering idle observation loop for {duration_seconds} seconds...", flush=True)
     
     start_time = time.time()
     try:
@@ -172,7 +172,7 @@ async def run_test_idle(model_slice: ModelSlice, port: int = 9500, duration_seco
     finally:
         await node.stop()
     
-    print(f"🎉 TEST 2 PASSED: Server survived {duration_seconds}s idle with zero crashes!\n", flush=True)
+    print(f" TEST 2 PASSED: Server survived {duration_seconds}s idle with zero crashes!\n", flush=True)
 
 
 # =====================================================================
@@ -199,7 +199,7 @@ async def run_test_loopback(model_slice: ModelSlice, port: int = 9500):
     try:
         print("Connecting NodeClient to 127.0.0.1:%d..." % port, flush=True)
         await client.connect(max_retries=5, retry_delay=0.5)
-        print("✅ NodeClient connected successfully over local loopback!", flush=True)
+        print("[OK] NodeClient connected successfully over local loopback!", flush=True)
         
         hidden_size = model_slice.config.hidden_size if model_slice.config else 3584
         dummy_tensor = torch.randn(1, 1, hidden_size, dtype=torch.float16)
@@ -217,22 +217,22 @@ async def run_test_loopback(model_slice: ModelSlice, port: int = 9500):
         resp = await client.send_recv(req_msg, timeout=10.0)
         dt = (time.perf_counter() - t0) * 1000.0
         
-        print(f"✅ Response received in {dt:.2f} ms! Message type: {resp.msg_type.name}", flush=True)
+        print(f"[OK] Response received in {dt:.2f} ms! Message type: {resp.msg_type.name}", flush=True)
         if resp.msg_type == MessageType.TOKEN_ID:
-            print(f"✅ Token received from terminal node: token_id={resp.token_id}", flush=True)
+            print(f"[OK] Token received from terminal node: token_id={resp.token_id}", flush=True)
         elif resp.msg_type == MessageType.ACTIVATION:
-            print(f"✅ Activation tensor received: shape={resp.tensor.shape if resp.tensor is not None else None}", flush=True)
+            print(f"[OK] Activation tensor received: shape={resp.tensor.shape if resp.tensor is not None else None}", flush=True)
             
         # Test CLEAR message
         clear_msg = TensorMessage(msg_type=MessageType.CLEAR, session_id="diag-loopback-1")
         await client.send(clear_msg)
-        print("✅ CLEAR message sent and KV cache evicted successfully!", flush=True)
+        print("[OK] CLEAR message sent and KV cache evicted successfully!", flush=True)
         
     finally:
         await client.close()
         await node.stop()
         
-    print("🎉 TEST 3 PASSED: Local loopback IPC + serialization + GPU inference verified 100% working!\n", flush=True)
+    print(" TEST 3 PASSED: Local loopback IPC + serialization + GPU inference verified 100% working!\n", flush=True)
 
 
 # =====================================================================
@@ -254,11 +254,11 @@ def run_test_bore(port: int = 9500):
         t0 = time.perf_counter()
         proc, server, pub_port = start_bore_tunnel(port)
         dt = time.perf_counter() - t0
-        print(f"✅ Bore tunnel established in {dt:.2f}s at {server}:{pub_port} (PID={proc.pid})", flush=True)
+        print(f"[OK] Bore tunnel established in {dt:.2f}s at {server}:{pub_port} (PID={proc.pid})", flush=True)
         
         print("Testing outbound TCP connection to assigned bore endpoint %s:%d..." % (server, pub_port), flush=True)
         test_sock = socket.create_connection((server, pub_port), timeout=10.0)
-        print("✅ Successfully established end-to-end TCP connection through bore.pub tunnel!", flush=True)
+        print("[OK] Successfully established end-to-end TCP connection through bore.pub tunnel!", flush=True)
         test_sock.close()
         
         print("Observing bore tunnel stability for 30 seconds...", flush=True)
@@ -269,7 +269,7 @@ def run_test_bore(port: int = 9500):
             if proc.poll() is not None:
                 raise RuntimeError(f"Bore process died unexpectedly with returncode {proc.returncode}")
                 
-        print("🎉 TEST 4 PASSED: Bore tunnel proxy is operational!\n", flush=True)
+        print(" TEST 4 PASSED: Bore tunnel proxy is operational!\n", flush=True)
         
     finally:
         try:

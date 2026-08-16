@@ -65,7 +65,7 @@ def run_window_sweep(
             target_dtype = torch.float16
 
     print("=" * 75)
-    print("🔬 SHARDFLOW IN-FLIGHT SPECULATIVE WINDOW SWEEP BENCHMARK")
+    print(" SHARDFLOW IN-FLIGHT SPECULATIVE WINDOW SWEEP BENCHMARK")
     print(f"Base Model:        {model_path} (Layers {layer_start}..{layer_end}) on {device}")
     if draft_model:
         print(f"Draft Model:       {draft_model} (Neural Draft, K={spec_k})")
@@ -88,7 +88,7 @@ def run_window_sweep(
         device=device,
         dtype=target_dtype,
     )
-    print(f"✅ Model slice loaded in {time.perf_counter() - t0:.2f}s")
+    print(f"[OK] Model slice loaded in {time.perf_counter() - t0:.2f}s")
 
     print(f"[3/3] Initializing Node with spec_k={spec_k}...")
     node = PipelineNode(
@@ -104,13 +104,13 @@ def run_window_sweep(
         raise RuntimeError(f"Draft model '{draft_model}' failed to load on Node 0. Please check path.")
 
     if node.draft_sampler is not None:
-        print("\n⚡ Warming up torch.compile kernels on draft model before connecting to relay...")
+        print("\n Warming up torch.compile kernels on draft model before connecting to relay...")
         t_w0 = time.perf_counter()
         dummy_tokens = [151644, 872, 198, 100, 200, 300, 400, 500]
         node.draft_sampler.prefill(dummy_tokens)
         _ = node.draft_sampler.generate_drafts(dummy_tokens[-1], k=spec_k)
         node.draft_sampler.reset()
-        print(f"✅ Draft model warmup complete in {time.perf_counter() - t_w0:.2f}s")
+        print(f"[OK] Draft model warmup complete in {time.perf_counter() - t_w0:.2f}s")
 
     prompts = [
         "Explain quantum entanglement in simple terms.",
@@ -125,7 +125,7 @@ def run_window_sweep(
     receiver = AsyncTokenReceiver(sock)
     try:
         handshake(sock)
-        print("🌟 Handshake successful! Beginning Window-sweep iterations...\n")
+        print(" Handshake successful! Beginning Window-sweep iterations...\n")
 
         ngram_sampler = None
         if spec_k > 0 and not draft_model:
@@ -133,7 +133,7 @@ def run_window_sweep(
 
         for w in window_list:
             print("=" * 75)
-            print(f"▶️ RUNNING BENCHMARK WITH SPECULATIVE WINDOW W = {w} (K={spec_k})")
+            print(f" RUNNING BENCHMARK WITH SPECULATIVE WINDOW W = {w} (K={spec_k})")
             print("=" * 75)
 
             w_profiler = Node0Profiler()
@@ -215,7 +215,7 @@ def run_window_sweep(
 
         # Print Final Comparison Table
         print("\n" + "=" * 115)
-        print("📊 IN-FLIGHT SPECULATIVE WINDOW EMPIRICAL RESULTS (K=4 N-gram)")
+        print(" IN-FLIGHT SPECULATIVE WINDOW EMPIRICAL RESULTS (K=4 N-gram)")
         print("=" * 115)
         header = f"{'Window':>6} | {'TPS':>6} | {'TTFT (ms)':>9} | {'Tok/Round':>9} | {'Full Hit %':>10} | {'Bubble (ms)':>11} | {'N0 Fwd (ms)':>11} | {'N1 Comp (ms)':>12} | {'Net RTT (ms)':>12}"
         print(header)
@@ -236,7 +236,7 @@ def run_window_sweep(
 
         if results_table:
             best = max(results_table, key=lambda r: r["tps"])
-            print(f"\n🏆 Optimal In-Flight Window: W={best['window']} with {best['tps']:.2f} TPS ({best['tokens_per_round']:.2f} tokens/round, {best['full_hit_rate']:.1f}% full hits)")
+            print(f"\n[BEST] Optimal In-Flight Window: W={best['window']} with {best['tps']:.2f} TPS ({best['tokens_per_round']:.2f} tokens/round, {best['full_hit_rate']:.1f}% full hits)")
 
     finally:
         if receiver is not None:

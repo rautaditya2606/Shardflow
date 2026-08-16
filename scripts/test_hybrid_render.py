@@ -108,7 +108,7 @@ async def run_hybrid_test():
         duration = time.time() - start_t
 
         print("\n" + "="*60)
-        print("🎉 RENDER ORCHESTRATOR GENERATION SUCCESSFUL!")
+        print(" RENDER ORCHESTRATOR GENERATION SUCCESSFUL!")
         print("="*60)
         print("Response:", completion.choices[0].message.content)
         print("Duration: %.2fs" % duration)

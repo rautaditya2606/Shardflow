@@ -95,18 +95,18 @@ graph TD
 
     subgraph DataPlane["3. Distributed GPU Data Plane (TCP / bore.pub Tunnels)"]
         subgraph Node0["Pipeline Node 0 (Worker 1)"]
-            N0_PROC["Node 0 Processor<br/>Layers 0 ➔ L1 | Embeddings"]:::node0
+            N0_PROC["Node 0 Processor<br/>Layers 0 -> L1 | Embeddings"]:::node0
             N0_KV["DynamicCache Store<br/>(60s TTL Eviction)"]:::node0
             N0_DRIVER["v2 Data-Plane Driver<br/>(P2P Decode Loop)"]:::node0
         end
 
         subgraph Node1["Pipeline Node 1 (Worker 2)"]
-            N1_PROC["Node 1 Processor<br/>Layers L1 ➔ L2"]:::node1
+            N1_PROC["Node 1 Processor<br/>Layers L1 -> L2"]:::node1
             N1_KV["DynamicCache Store<br/>(60s TTL Eviction)"]:::node1
         end
 
         subgraph NodeN["Pipeline Terminal Node N (Worker N)"]
-            NN_PROC["Terminal Node Processor<br/>Layers L2 ➔ LN | RMSNorm | LM Head"]:::nodeN
+            NN_PROC["Terminal Node Processor<br/>Layers L2 -> LN | RMSNorm | LM Head"]:::nodeN
             NN_KV["DynamicCache Store<br/>(60s TTL Eviction)"]:::nodeN
             NN_SAMP["GPU Sampler<br/>Top-K / Top-P / Temp"]:::nodeN
         end

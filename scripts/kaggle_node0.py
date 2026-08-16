@@ -236,7 +236,7 @@ def generate(
         draft_sampler.prefill(prompt_tokens)
 
     if spec_k > 0 and draft_sampler is None and ngram_sampler is None and async_drafter is None:
-        print(f"\n⚠️ [WARNING] spec_k={spec_k} but neither draft_sampler nor ngram_sampler is active! Running 1-token decode.", flush=True)
+        print(f"\n[WARNING] [WARNING] spec_k={spec_k} but neither draft_sampler nor ngram_sampler is active! Running 1-token decode.", flush=True)
 
     t_start = time.perf_counter()
     t_first_token = None
@@ -450,12 +450,12 @@ def generate(
                     )
 
     except TimeoutError as te:
-        print(f"\n❌ [TIMEOUT ERROR]: {te}", flush=True)
+        print(f"\n[ERROR] [TIMEOUT ERROR]: {te}", flush=True)
         print("Kaggle Node 1 or EC2 Relay stopped responding. Please check Kaggle B status.", flush=True)
     except ConnectionError as ce:
-        print(f"\n❌ [CONNECTION ERROR]: {ce}", flush=True)
+        print(f"\n[ERROR] [CONNECTION ERROR]: {ce}", flush=True)
     except Exception as ex:
-        print(f"\n❌ [UNEXPECTED ERROR]: {ex}", flush=True)
+        print(f"\n[ERROR] [UNEXPECTED ERROR]: {ex}", flush=True)
     finally:
         node.kv_store.evict(session_id)
 
@@ -467,7 +467,7 @@ def generate(
     tps = (tok_count - 1) / decode_time if (decode_time > 0 and tok_count > 1) else (tok_count / decode_time if decode_time > 0 else 0)
 
     print("\n" + "-" * 55, flush=True)
-    stats_str = f"📊 Tokens: {tok_count} | TTFT: {ttft*1000:.1f} ms | Decode Time: {decode_time:.2f} s | Speed: {tps:.2f} TPS 🚀"
+    stats_str = f" Tokens: {tok_count} | TTFT: {ttft*1000:.1f} ms | Decode Time: {decode_time:.2f} s | Speed: {tps:.2f} TPS "
     if total_drafted > 0:
         accept_rate = (total_accepted / total_drafted) * 100.0
         stats_str += f" | Draft Accept Rate: {accept_rate:.1f}% ({total_accepted}/{total_drafted})"
@@ -538,13 +538,13 @@ def main():
 
     use_async_recv = args.async_recv or args.async_spec
     print("=" * 70, flush=True)
-    print("🚀 SHARDFLOW v2 REMOTE NODE 0 (KAGGLE INSTANCE A)", flush=True)
+    print(" SHARDFLOW v2 REMOTE NODE 0 (KAGGLE INSTANCE A)", flush=True)
     print(f"Base Model:    {model_path}")
     print(f"Layer Range:   [{layer_start}..{layer_end}) -> Indices {layer_start}..{layer_end-1} ({layer_end - layer_start}/{total_layers} layers + Embeddings)")
     print(f"Draft Model:   {draft_info}")
-    print(f"Async Spec:    {'ENABLED ⚡' if args.async_spec else 'DISABLED'}")
-    print(f"Async Recv:    {'ENABLED ⚡' if use_async_recv else 'DISABLED'}")
-    print(f"CUDA Graphs:   {'ENABLED ⚡' if enable_cuda_graphs else 'DISABLED (eager mode)'}")
+    print(f"Async Spec:    {'ENABLED ' if args.async_spec else 'DISABLED'}")
+    print(f"Async Recv:    {'ENABLED ' if use_async_recv else 'DISABLED'}")
+    print(f"CUDA Graphs:   {'ENABLED ' if enable_cuda_graphs else 'DISABLED (eager mode)'}")
     print(f"Static KV:     {'ENABLED (GPU StaticCache)' if enable_static_kv else 'DISABLED (DynamicCache)'}")
     print(f"Relay Target:  {args.relay_host}:{args.relay_port}")
     print(f"Precision:     {target_dtype}")
@@ -567,7 +567,7 @@ def main():
         dtype=target_dtype,
         load_in_4bit=getattr(args, "4bit", False),
     )
-    logger.info("✅ Model slice loaded in %.2f s", time.perf_counter() - t0)
+    logger.info("[OK] Model slice loaded in %.2f s", time.perf_counter() - t0)
 
     # 3. Initialize Pipeline Node & Draft Sampler
     node = PipelineNode(
@@ -591,14 +591,14 @@ def main():
             logger.info("Capturing CUDA Graphs on Node 0...")
             captured = node.graph_runner.capture(node.kv_store._static_slots[0].cache)
             if captured:
-                logger.info("✅ CUDA Graphs captured & active on Node 0!")
+                logger.info("[OK] CUDA Graphs captured & active on Node 0!")
 
     # 4. Connect to Relay and perform handshake with Node 1
     logger.info("Connecting to TCP relay at %s:%d ...", args.relay_host, args.relay_port)
     sock = connect_to_relay(host=args.relay_host, port=args.relay_port, auth_byte=AUTH_BYTE)
-    logger.info("✅ Connected to relay. Executing READY handshake with Node 1...")
+    logger.info("[OK] Connected to relay. Executing READY handshake with Node 1...")
     handshake(sock)
-    logger.info("🌟 HANDSHAKE COMPLETE! Cluster is paired and ready for inference.")
+    logger.info(" HANDSHAKE COMPLETE! Cluster is paired and ready for inference.")
 
     receiver = AsyncTokenReceiver(sock) if use_async_recv else None
 
@@ -616,7 +616,7 @@ def main():
     try:
         for idx, prompt in enumerate(prompts, 1):
             print(f"\n" + "=" * 60)
-            print(f"⚡ BENCHMARK PROMPT {idx}/{len(prompts)}")
+            print(f" BENCHMARK PROMPT {idx}/{len(prompts)}")
             print("=" * 60)
 
             prompt_profiler = Node0Profiler()
@@ -657,9 +657,9 @@ def main():
 
         if tps_results:
             print("\n" + "=" * 70)
-            print("🏆 FINAL BENCHMARK SUMMARY (ShardFlow v2 over Direct TCP Relay)")
+            print("[BEST] FINAL BENCHMARK SUMMARY (ShardFlow v2 over Direct TCP Relay)")
             print(f"  Model:                 {model_path}")
-            print(f"  Avg Decode Throughput: {statistics.mean(tps_results):.2f} tokens/sec 🚀")
+            print(f"  Avg Decode Throughput: {statistics.mean(tps_results):.2f} tokens/sec ")
             print(f"  Max Decode Throughput: {max(tps_results):.2f} tokens/sec")
             print(f"  Avg TTFT:              {statistics.mean(ttft_results)*1000:.1f} ms")
             print(f"  Transport:             Direct TCP Relay ({args.relay_host}:{args.relay_port})")

@@ -69,11 +69,11 @@ def run_k_sweep(
 
     use_async = enable_async_recv or enable_async_spec
     print("=" * 75)
-    print("🔬 SHARDFLOW SPECULATIVE DECODING K-SWEEP BENCHMARK")
+    print(" SHARDFLOW SPECULATIVE DECODING K-SWEEP BENCHMARK")
     print(f"Base Model:     {model_path} (Layers {layer_start}..{layer_end}) on {device}")
     print(f"Draft Model:    {draft_model or 'N-gram prompt lookup'} on {draft_device or device}")
-    print(f"Async Spec:     {'ENABLED ⚡ (Phase 5A Single-Continuation Lookahead)' if enable_async_spec else 'DISABLED'}")
-    print(f"Async Recv:     {'ENABLED ⚡ (Background Thread)' if use_async else 'DISABLED'}")
+    print(f"Async Spec:     {'ENABLED  (Phase 5A Single-Continuation Lookahead)' if enable_async_spec else 'DISABLED'}")
+    print(f"Async Recv:     {'ENABLED  (Background Thread)' if use_async else 'DISABLED'}")
     print(f"K Sweep Values: {k_list}")
     print(f"Relay:          {relay_host}:{relay_port}")
     print("=" * 75)
@@ -92,7 +92,7 @@ def run_k_sweep(
         dtype=target_dtype,
         load_in_4bit=load_in_4bit,
     )
-    print(f"✅ Model slice loaded in {time.perf_counter() - t0:.2f}s")
+    print(f"[OK] Model slice loaded in {time.perf_counter() - t0:.2f}s")
 
     max_k = max(k_list)
     print(f"[3/3] Initializing Node with max_k={max_k}...")
@@ -109,13 +109,13 @@ def run_k_sweep(
         raise RuntimeError(f"Draft model '{draft_model}' failed to load on Node 0 GPU. Please check path or HF model ID.")
 
     if node.draft_sampler is not None:
-        print("\n⚡ Warming up torch.compile kernels on draft model before connecting to relay...")
+        print("\n Warming up torch.compile kernels on draft model before connecting to relay...")
         t_w0 = time.perf_counter()
         dummy_tokens = [151644, 872, 198, 100, 200, 300, 400, 500]
         node.draft_sampler.prefill(dummy_tokens)
         _ = node.draft_sampler.generate_drafts(dummy_tokens[-1], k=max_k)
         node.draft_sampler.reset()
-        print(f"✅ Draft model warmup complete in {time.perf_counter() - t_w0:.2f}s")
+        print(f"[OK] Draft model warmup complete in {time.perf_counter() - t_w0:.2f}s")
 
     prompts = [
         "Explain quantum entanglement in simple terms.",
@@ -130,11 +130,11 @@ def run_k_sweep(
     receiver = AsyncTokenReceiver(sock) if use_async else None
     try:
         handshake(sock)
-        print("🌟 Handshake successful! Beginning K-sweep iterations...\n")
+        print(" Handshake successful! Beginning K-sweep iterations...\n")
 
         for k in k_list:
             print("=" * 75)
-            print(f"▶️ RUNNING BENCHMARK WITH K = {k}")
+            print(f" RUNNING BENCHMARK WITH K = {k}")
             print("=" * 75)
 
             ngram_sampler = None
@@ -219,7 +219,7 @@ def run_k_sweep(
 
         # Print Final Comparison Table
         print("\n" + "=" * 115)
-        print("📊 SPECULATIVE DECODING K-SWEEP EMPIRICAL RESULTS")
+        print(" SPECULATIVE DECODING K-SWEEP EMPIRICAL RESULTS")
         print("=" * 115)
         header = f"{'K':>3} | {'TPS':>6} | {'TTFT (ms)':>9} | {'Tok/Round':>9} | {'Full Hit %':>10} | {'Draft (ms)':>10} | {'Wait Recon (ms)':>15} | {'N0 Fwd (ms)':>11} | {'Wait (ms)':>9}"
         print(header)
@@ -240,7 +240,7 @@ def run_k_sweep(
 
         if results_table:
             best = max(results_table, key=lambda r: r["tps"])
-            print(f"\n🏆 Optimal Configuration: K={best['k']} with {best['tps']:.2f} TPS ({best['tokens_per_round']:.2f} tokens/round, {best['full_hit_rate']:.1f}% full hits)")
+            print(f"\n[BEST] Optimal Configuration: K={best['k']} with {best['tps']:.2f} TPS ({best['tokens_per_round']:.2f} tokens/round, {best['full_hit_rate']:.1f}% full hits)")
 
     finally:
         if receiver is not None:

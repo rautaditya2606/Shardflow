@@ -139,7 +139,7 @@ def connect_to_relay(
         sock.sendall(auth_byte)
         # Apply full socket tuning + data timeout
         configure_socket(sock, data_timeout=data_timeout)
-        logger.info("✅ Connected to relay at %s:%d (auth byte sent, timeout=%0.1fs)", host, port, data_timeout)
+        logger.info("[OK] Connected to relay at %s:%d (auth byte sent, timeout=%0.1fs)", host, port, data_timeout)
         return sock
     except Exception as e:
         sock.close()
@@ -165,14 +165,14 @@ def handshake(sock: socket.socket, is_initiator: bool = True, timeout: float = 1
             ack = recvall(sock, len(HANDSHAKE_MAGIC))
             if ack != HANDSHAKE_MAGIC:
                 raise ConnectionError(f"Handshake failed: expected {HANDSHAKE_MAGIC!r}, received {ack!r}")
-            logger.info("✅ Handshake successful: Peer node is READY!")
+            logger.info("[OK] Handshake successful: Peer node is READY!")
         else:
             logger.info("Waiting for READY handshake from Node 0 through relay...")
             ping = recvall(sock, len(HANDSHAKE_MAGIC))
             if ping != HANDSHAKE_MAGIC:
                 raise ConnectionError(f"Handshake failed: expected {HANDSHAKE_MAGIC!r}, received {ping!r}")
             sock.sendall(HANDSHAKE_MAGIC)
-            logger.info("✅ Handshake successful: Peer node is READY!")
+            logger.info("[OK] Handshake successful: Peer node is READY!")
     finally:
         sock.settimeout(orig_timeout)
 

@@ -41,7 +41,7 @@ from shardflow.transport.relay import (
 def run_echo(host: str, port: int, auth_byte: bytes, iters: int):
     """Echo node (Node 1) — receives tensors and sends tokens back."""
     print("=" * 65)
-    print("📡 SHARDFLOW RELAY TEST — ECHO NODE (NODE 1)")
+    print(" SHARDFLOW RELAY TEST — ECHO NODE (NODE 1)")
     print(f"Target Relay: {host}:{port}")
     print("=" * 65)
 
@@ -62,7 +62,7 @@ def run_echo(host: str, port: int, auth_byte: bytes, iters: int):
             if count % 10 == 0 or count == 1:
                 print(f"  [Echo] Received tensor {list(tensor.shape)} ({tensor.dtype}) -> Sent token response #{count}", flush=True)
 
-        print(f"✅ Echo session completed ({count} requests handled).")
+        print(f"[OK] Echo session completed ({count} requests handled).")
     finally:
         sock.close()
 
@@ -70,7 +70,7 @@ def run_echo(host: str, port: int, auth_byte: bytes, iters: int):
 def run_sender(host: str, port: int, auth_byte: bytes, iters: int, dim: int, dtype_str: str):
     """Sender node (Node 0) — sends 10KB tensors, measures RTT, and reports realistic baseline TPS."""
     print("=" * 65)
-    print("🚀 SHARDFLOW RELAY TEST — SENDER NODE (NODE 0)")
+    print(" SHARDFLOW RELAY TEST — SENDER NODE (NODE 0)")
     print(f"Target Relay: {host}:{port}")
     print(f"Payload Size: 1 x 1 x {dim} in {dtype_str} (~{(dim * 2) / 1024:.2f} KB)")
     print(f"Iterations:   {iters}")
@@ -103,7 +103,7 @@ def run_sender(host: str, port: int, auth_byte: bytes, iters: int, dim: int, dty
                 print(f"  Iteration {i:3d}/{iters}: RTT = {rtt_ms:6.2f} ms | Received Token ID = {tok_id}", flush=True)
 
         print("\n" + "=" * 65)
-        print("📊 BENCHMARK RESULTS")
+        print(" BENCHMARK RESULTS")
         print("=" * 65)
         avg_rtt = statistics.mean(latencies_ms)
         min_rtt = min(latencies_ms)
@@ -122,7 +122,7 @@ def run_sender(host: str, port: int, auth_byte: bytes, iters: int, dim: int, dty
         tps_7b = 1000.0 / (avg_rtt + 20.0)    # ~20ms compute on 7B
         tps_14b = 1000.0 / (avg_rtt + 35.0)   # ~35ms compute on 14B
 
-        print("📈 REALISTIC BASELINE DECODE TPS PROJECTIONS (Pure 1-Token Decode):")
+        print(" REALISTIC BASELINE DECODE TPS PROJECTIONS (Pure 1-Token Decode):")
         print(f"  Qwen2.5-7B  (RTT + ~20ms GPU compute):  {tps_7b:5.2f} tokens/sec")
         print(f"  Qwen2.5-14B (RTT + ~35ms GPU compute):  {tps_14b:5.2f} tokens/sec")
         print("=" * 65)

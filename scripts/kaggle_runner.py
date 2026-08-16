@@ -140,7 +140,7 @@ def main():
 
     if num_gpus >= 2 and not args.force_single_gpu and args.layer_start is None and args.layer_end is None:
         logger.info("=================================================================")
-        logger.info("🚀 INITIALIZING DUAL-GPU PIPELINE ON 2x T4 (cuda:0 & cuda:1)")
+        logger.info(" INITIALIZING DUAL-GPU PIPELINE ON 2x T4 (cuda:0 & cuda:1)")
         logger.info("   Node 0 (cuda:0, port %d) <--> Node 1 (cuda:1, port %d)", local_port, local_port + 1)
         logger.info("   Inter-GPU link: 127.0.0.1 (0.05ms local loopback latency)")
         logger.info("=================================================================")
@@ -189,7 +189,7 @@ def main():
                 raise RuntimeError(f"Node 1 process exited unexpectedly with returncode {node1_proc.returncode}")
             try:
                 with socket.create_connection(("127.0.0.1", local_port + 1), timeout=1.0):
-                    logger.info("✅ Node 1 is online and listening!")
+                    logger.info("[OK] Node 1 is online and listening!")
                     break
             except Exception:
                 time.sleep(1.0)
@@ -229,7 +229,7 @@ def main():
         node0_proc = subprocess.Popen(node0_cmd, env=node0_env, stdout=node0_write_file, stderr=subprocess.STDOUT)
 
         try:
-            logger.info("🚀 Dual-GPU pipeline is live and ready for inference!")
+            logger.info(" Dual-GPU pipeline is live and ready for inference!")
             while True:
                 line0 = node0_read_file.readline()
                 while line0:

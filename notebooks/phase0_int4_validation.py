@@ -34,12 +34,12 @@ def main():
             load_in_4bit=True,
             device=device,
         )
-        print(f"✅ Successfully loaded layers 0-11 in 4-bit (NF4)!")
+        print(f"[OK] Successfully loaded layers 0-11 in 4-bit (NF4)!")
         print(f"Layers extracted: {len(slice_info['layers'])}")
         allocated_vram = torch.cuda.memory_allocated() / 1e6
         print(f"VRAM usage: {allocated_vram:.2f} MB")
     except Exception as e:
-        print(f"❌ int4 loading test failed: {e}")
+        print(f"[ERROR] int4 loading test failed: {e}")
 
 
 if __name__ == "__main__":

@@ -155,7 +155,7 @@ def main():
     with open(args.output, "w") as f:
         json.dump(summary, f, indent=2)
 
-    print(f"\n✅ Benchmark completed! Summary saved to {args.output}")
+    print(f"\n[OK] Benchmark completed! Summary saved to {args.output}")
     print(json.dumps(summary, indent=2))
 
 

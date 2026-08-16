@@ -128,8 +128,8 @@ class PipelineNode:
                 logger.info("DraftSampler initialized on Node 0 (draft_model=%s, device=%s, K=%d)", draft_model, target_draft_device, spec_k)
                 self.async_draft_sampler = None
             except Exception as e:
-                logger.error("❌ FAILED to initialize DraftSampler for '%s': %s", draft_model, e)
-                print(f"\n❌ [ERROR] Could not load draft model '{draft_model}': {e}\n", flush=True)
+                logger.error("[ERROR] FAILED to initialize DraftSampler for '%s': %s", draft_model, e)
+                print(f"\n[ERROR] [ERROR] Could not load draft model '{draft_model}': {e}\n", flush=True)
                 self.draft_sampler = None
                 self.async_draft_sampler = None
 

@@ -142,10 +142,10 @@ def main():
     enable_cuda_graphs = args.cuda_graphs and enable_static_kv
 
     print("=" * 70, flush=True)
-    print("🚀 SHARDFLOW v2 REMOTE NODE 1 (KAGGLE INSTANCE B)", flush=True)
+    print(" SHARDFLOW v2 REMOTE NODE 1 (KAGGLE INSTANCE B)", flush=True)
     print(f"Base Model:    {model_path}")
     print(f"Layer Range:   [{layer_start}..{layer_end}) -> Indices {layer_start}..{layer_end-1} ({layer_end - layer_start}/{total_layers} layers + Final Norm + LM Head)")
-    print(f"CUDA Graphs:   {'ENABLED ⚡' if enable_cuda_graphs else 'DISABLED (eager mode)'}")
+    print(f"CUDA Graphs:   {'ENABLED ' if enable_cuda_graphs else 'DISABLED (eager mode)'}")
     print(f"Static KV:     {'ENABLED (GPU StaticCache)' if enable_static_kv else 'DISABLED (DynamicCache)'}")
     print(f"Relay Target:  {args.relay_host}:{args.relay_port}")
     print(f"Precision:     {target_dtype}")
@@ -165,7 +165,7 @@ def main():
         dtype=target_dtype,
         load_in_4bit=getattr(args, "4bit", False),
     )
-    logger.info("✅ Model slice loaded in %.2f s", time.perf_counter() - t0)
+    logger.info("[OK] Model slice loaded in %.2f s", time.perf_counter() - t0)
 
     # 2. Initialize Pipeline Node
     node = PipelineNode(
@@ -186,7 +186,7 @@ def main():
             logger.info("Capturing CUDA Graphs on Node 1...")
             captured = node.graph_runner.capture(node.kv_store._static_slots[0].cache)
             if captured:
-                logger.info("✅ CUDA Graphs captured & active on Node 1!")
+                logger.info("[OK] CUDA Graphs captured & active on Node 1!")
 
     # 3. Connect to Relay and enter compute loop with automatic reconnection
     profiler = Node1Profiler()
@@ -195,10 +195,10 @@ def main():
         try:
             logger.info("Connecting to TCP relay at %s:%d ...", args.relay_host, args.relay_port)
             sock = connect_to_relay(host=args.relay_host, port=args.relay_port, auth_byte=AUTH_BYTE)
-            logger.info("✅ Connected to relay. Waiting for Node 0 to connect...")
+            logger.info("[OK] Connected to relay. Waiting for Node 0 to connect...")
 
             handshake(sock, is_initiator=False)
-            logger.info("🌟 HANDSHAKE COMPLETE! Entering pure compute decode loop...")
+            logger.info(" HANDSHAKE COMPLETE! Entering pure compute decode loop...")
 
             session_id = "relay_session"
             step = 0
