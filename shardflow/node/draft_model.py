@@ -164,7 +164,9 @@ class DraftSampler:
                 gpu_drafts.append(cur_tensor)
                 self._seq_len += 1
 
-            return [int(t[0, 0].item()) for t in gpu_drafts]
+            if not gpu_drafts:
+                return []
+            return torch.cat(gpu_drafts, dim=-1).squeeze(0).tolist()
 
         # Sampling path (when temperature > 0)
         draft_tokens: List[int] = []
