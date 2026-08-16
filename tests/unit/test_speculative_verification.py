@@ -115,3 +115,84 @@ def test_causal_speculative_verification_immediate_rejection():
     assert accepted_tokens == []
     assert next_token == 777
     assert len(accepted_tokens) + 1 == 1
+
+
+def test_node0_profiler_speculative_metrics():
+    """Verify Node0Profiler correctly tracks effective tokens per round and bonus accept rate."""
+    from scripts.kaggle_node0 import Node0Profiler
+
+    profiler = Node0Profiler()
+    # Record 2 speculative rounds:
+    # Round 1: K=4 drafts, accepted_count=3 (2 bonus accepted)
+    # Round 2: K=4 drafts, accepted_count=5 (4 bonus accepted)
+    profiler.record(
+        embed_ms=0.0,
+        gpu_fwd_ms=30.0,
+        g2c_ms=0.05,
+        ser_ms=0.05,
+        send_ms=0.05,
+        recv_ms=90.0,
+        total_ms=120.0,
+        draft_gen_ms=2.5,
+        accepted=3,
+        drafted=4,
+        is_spec=True,
+    )
+    profiler.record(
+        embed_ms=0.0,
+        gpu_fwd_ms=30.0,
+        g2c_ms=0.05,
+        ser_ms=0.05,
+        send_ms=0.05,
+        recv_ms=90.0,
+        total_ms=120.0,
+        draft_gen_ms=2.5,
+        accepted=5,
+        drafted=4,
+        is_spec=True,
+    )
+
+    spec_acc = [acc for acc, is_s in zip(profiler.accepted_per_round, profiler.is_spec_step) if is_s]
+    spec_drf = [drf for drf, is_s in zip(profiler.drafted_per_round, profiler.is_spec_step) if is_s]
+
+    # Effective tokens per round = (3 + 5) / 2 = 4.0
+    tok_per_round = sum(spec_acc) / len(spec_acc)
+    assert tok_per_round == 4.0
+
+    # Bonus accept rate = ((3-1) + (5-1)) / (4 + 4) * 100 = 6/8 = 75.0%
+    bonus_rate = sum(max(0, a - 1) for a in spec_acc) / sum(spec_drf) * 100.0
+    assert bonus_rate == 75.0
+
+
+def test_speculative_lookahead_kv_reconciliation():
+    """Verify speculative lookahead KV states are cleanly truncated on partial acceptance."""
+    cache = DynamicCache()
+    # Initial sequence length = 10
+    for layer_idx in range(2):
+        k = torch.randn(1, 4, 10, 32)
+        v = torch.randn(1, 4, 10, 32)
+        cache.update(k, v, layer_idx=layer_idx)
+
+    past_seq_len = 10
+    # Step 1: Compute 5 candidate tokens (seq_len becomes 15)
+    for layer_idx in range(2):
+        k = torch.randn(1, 4, 5, 32)
+        v = torch.randn(1, 4, 5, 32)
+        cache.update(k, v, layer_idx=layer_idx)
+    assert cache.get_seq_length(0) == 15
+
+    # Lookahead speculative forward: Compute 5 more tokens ahead (seq_len becomes 20)
+    for layer_idx in range(2):
+        k = torch.randn(1, 4, 5, 32)
+        v = torch.randn(1, 4, 5, 32)
+        cache.update(k, v, layer_idx=layer_idx)
+    assert cache.get_seq_length(0) == 20
+
+    # Node 1 returns accepted_count = 3 (out of 5)
+    # Rewind should crop KV cache back to past_seq_len + accepted_count = 13
+    accepted_count = 3
+    rewind_kv_cache(cache, past_seq_len + accepted_count)
+
+    assert cache.get_seq_length(0) == 13
+    assert cache.get_seq_length(1) == 13
+

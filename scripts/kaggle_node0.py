@@ -61,21 +61,43 @@ class Node0Profiler:
 
     def __init__(self):
         self.embed_times = []
+        self.draft_gen_times = []
         self.node0_gpu_times = []
         self.gpu_to_cpu_times = []
         self.serialize_times = []
         self.tcp_send_times = []
         self.tcp_recv_wait_times = []
         self.total_step_times = []
+        # ponytail: per-round speculative tracking
+        self.accepted_per_round = []
+        self.drafted_per_round = []
+        self.is_spec_step = []
 
-    def record(self, embed_ms, gpu_fwd_ms, g2c_ms, ser_ms, send_ms, recv_ms, total_ms):
+    def record(
+        self,
+        embed_ms: float,
+        gpu_fwd_ms: float,
+        g2c_ms: float,
+        ser_ms: float,
+        send_ms: float,
+        recv_ms: float,
+        total_ms: float,
+        draft_gen_ms: float = 0.0,
+        accepted: int = 1,
+        drafted: int = 0,
+        is_spec: bool = False,
+    ):
         self.embed_times.append(embed_ms)
+        self.draft_gen_times.append(draft_gen_ms)
         self.node0_gpu_times.append(gpu_fwd_ms)
         self.gpu_to_cpu_times.append(g2c_ms)
         self.serialize_times.append(ser_ms)
         self.tcp_send_times.append(send_ms)
         self.tcp_recv_wait_times.append(recv_ms)
         self.total_step_times.append(total_ms)
+        self.accepted_per_round.append(accepted)
+        self.drafted_per_round.append(drafted)
+        self.is_spec_step.append(is_spec)
 
     def print_breakdown(self):
         if not self.total_step_times:
@@ -88,6 +110,8 @@ class Node0Profiler:
         print("\n" + "=" * 70, flush=True)
         print(f"⏱️ NODE 0 PER-TOKEN LATENCY PROFILER BREAKDOWN ({n} decode steps)", flush=True)
         print("=" * 70, flush=True)
+        if any(t > 0 for t in self.draft_gen_times):
+            print(f"  0. Draft Gen (CPU/GPU):      {avg(self.draft_gen_times):6.2f} ms  (p95: {p95(self.draft_gen_times):6.2f} ms)")
         print(f"  1. Token Embeddings:         {avg(self.embed_times):6.2f} ms  (p95: {p95(self.embed_times):6.2f} ms)")
         print(f"  2. Node 0 GPU Forward (Sync):{avg(self.node0_gpu_times):6.2f} ms  (p95: {p95(self.node0_gpu_times):6.2f} ms)")
         print(f"  3. GPU -> CPU Transfer:      {avg(self.gpu_to_cpu_times):6.2f} ms  (p95: {p95(self.gpu_to_cpu_times):6.2f} ms)")
@@ -96,7 +120,53 @@ class Node0Profiler:
         print(f"  6. TCP Recv Wait (RTT+Node1):{avg(self.tcp_recv_wait_times):6.2f} ms  (p95: {p95(self.tcp_recv_wait_times):6.2f} ms)")
         print("  " + "-" * 66, flush=True)
         print(f"  TOTAL STEP LATENCY:          {avg_total:6.2f} ms  ({1000.0/avg_total:.2f} TPS)", flush=True)
+
+        spec_acc = [acc for acc, is_s in zip(self.accepted_per_round, self.is_spec_step) if is_s]
+        spec_drf = [drf for drf, is_s in zip(self.drafted_per_round, self.is_spec_step) if is_s]
+        if spec_acc:
+            tot_acc = sum(spec_acc)
+            tot_drf = sum(spec_drf)
+            tok_per_round = tot_acc / len(spec_acc)
+            acc_rate = (sum(max(0, a - 1) for a in spec_acc) / tot_drf * 100.0) if tot_drf > 0 else 0.0
+            print("  " + "-" * 66, flush=True)
+            print(f"  Spec Rounds: {len(spec_acc):3d} | Eff Tokens/Round: {tok_per_round:4.2f} | Bonus Accept Rate: {acc_rate:5.1f}%", flush=True)
         print("=" * 70, flush=True)
+
+
+import queue
+import threading
+
+
+class AsyncTokenReceiver:
+    """
+    ponytail: Lightweight background receiver thread that pulls tokens from relay socket
+    into a thread-safe bounded queue, unblocking GPU execution.
+    """
+
+    def __init__(self, sock: socket.socket, maxsize: int = 4):
+        self.sock = sock
+        self.queue: queue.Queue = queue.Queue(maxsize=maxsize)
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            try:
+                result = recv_token_timed(self.sock)
+                self.queue.put(result)
+            except Exception as e:
+                self.queue.put(e)
+                break
+
+    def get(self, timeout: float = 30.0) -> Tuple[int, int, bool, dict]:
+        item = self.queue.get(timeout=timeout)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def stop(self):
+        self._stop_event.set()
 
 
 def generate(
@@ -112,6 +182,8 @@ def generate(
     ngram_sampler: Optional[NGramDraftSampler] = None,
     eos_token_id: int = 151643,
     profiler: Optional[Node0Profiler] = None,
+    receiver: Optional[AsyncTokenReceiver] = None,
+    enable_async_spec: bool = False,
 ) -> dict:
     """Generate tokens for a prompt through the distributed relay pipeline with error handling."""
     session_id = f"relay_session_{int(time.time()*1000)}"
@@ -148,7 +220,11 @@ def generate(
         send_tensor(sock, output)
 
         # Receive prefill token from Node 1
-        next_token, _, is_eos = recv_token(sock)
+        if receiver is not None:
+            next_token, _, is_eos, _ = receiver.get()
+        else:
+            next_token, _, is_eos = recv_token(sock)
+
         t_first_token = time.perf_counter()
         generated_tokens.append(next_token)
         token_history.append(next_token)
@@ -158,54 +234,140 @@ def generate(
 
         # 2. Autoregressive Decode Loop
         step = 1
+        spec_pending = None
+
         while step < max_tokens and not is_eos:
             if next_token == eos_token_id:
                 break
 
             t_step_0 = time.perf_counter()
-            drafts = []
 
-            if ngram_sampler and spec_k > 0:
-                drafts = ngram_sampler.find_candidates(token_history, k=spec_k)
-            elif draft_sampler and spec_k > 0:
-                drafts = draft_sampler.generate_drafts(
-                    next_token,
-                    k=spec_k,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
-                )
+            if spec_pending is not None and spec_pending.get("valid", False):
+                # ponytail: Reuse speculative lookahead computed during previous network flight!
+                cand_output = spec_pending["output"]
+                drafts = spec_pending["drafts"]
+                draft_gen_ms = spec_pending.get("draft_gen_ms", 0.0)
+                t_fwd_0 = spec_pending.get("t_fwd_0", t_step_0)
+                t_fwd_1 = spec_pending.get("t_fwd_1", t_step_0)
+                past_seq_len = spec_pending["past_seq_len"]
+                spec_pending = None
+
+                total_drafted += len(drafts)
+                send_stats = send_tensor_timed(sock, cand_output, draft_tokens=drafts)
+            else:
+                drafts = []
+                t_draft_0 = time.perf_counter()
+                if ngram_sampler and spec_k > 0:
+                    drafts = ngram_sampler.find_candidates(token_history, k=spec_k)
+                elif draft_sampler and spec_k > 0:
+                    drafts = draft_sampler.generate_drafts(
+                        next_token,
+                        k=spec_k,
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                    )
+                t_draft_1 = time.perf_counter()
+                draft_gen_ms = (t_draft_1 - t_draft_0) * 1000.0
+
+                if drafts:
+                    total_drafted += len(drafts)
+                    candidate_tokens = [next_token] + drafts
+                    cand_tensor = torch.tensor([candidate_tokens], dtype=torch.long, device=node.model_slice.device)
+
+                    if node.model_slice.embed_tokens is not None:
+                        cand_hidden = node.model_slice.embed_tokens(cand_tensor)
+                    else:
+                        cand_hidden = cand_tensor
+
+                    cache = node.kv_store.get(session_id)
+                    past_seq_len = node._get_cache_seq_len(cache)
+
+                    t_fwd_0 = time.perf_counter()
+                    cand_output = node._forward(cand_hidden, session_id=session_id, compute_head=False)
+                    if cand_output.is_cuda:
+                        torch.cuda.synchronize(cand_output.device)
+                    t_fwd_1 = time.perf_counter()
+
+                    send_stats = send_tensor_timed(sock, cand_output, draft_tokens=drafts)
+                else:
+                    cand_output = None
 
             if drafts:
-                total_drafted += len(drafts)
-
-                candidate_tokens = [next_token] + drafts
-                cand_tensor = torch.tensor([candidate_tokens], dtype=torch.long, device=node.model_slice.device)
-
-                if node.model_slice.embed_tokens is not None:
-                    cand_hidden = node.model_slice.embed_tokens(cand_tensor)
-                else:
-                    cand_hidden = cand_tensor
-
                 cache = node.kv_store.get(session_id)
-                past_seq_len = node._get_cache_seq_len(cache)
 
-                t_fwd_0 = time.perf_counter()
-                cand_output = node._forward(cand_hidden, session_id=session_id, compute_head=False)
-                if cand_output.is_cuda:
-                    torch.cuda.synchronize(cand_output.device)
-                t_fwd_1 = time.perf_counter()
+                # Phase 5A: Single Speculative Continuation (Depth = 1) during network flight
+                if enable_async_spec and (step + len(drafts) + 1 < max_tokens):
+                    # Speculatively predict exactly ONE continuation token E from the final draft
+                    assumed_next = drafts[-1]
+                    t_la_d0 = time.perf_counter()
+                    la_drafts = []
+                    if ngram_sampler and spec_k > 0:
+                        la_drafts = ngram_sampler.find_candidates(token_history + drafts, k=1)
+                    elif draft_sampler and spec_k > 0:
+                        la_drafts = draft_sampler.generate_drafts(
+                            assumed_next,
+                            k=1,
+                            temperature=temperature,
+                            top_k=top_k,
+                            top_p=top_p,
+                        )
+                    t_la_d1 = time.perf_counter()
+                    la_draft_ms = (t_la_d1 - t_la_d0) * 1000.0
 
-                send_stats = send_tensor_timed(sock, cand_output, draft_tokens=drafts)
+                    la_cand_tokens = [assumed_next] + la_drafts
+                    la_cand_tensor = torch.tensor([la_cand_tokens], dtype=torch.long, device=node.model_slice.device)
+                    if node.model_slice.embed_tokens is not None:
+                        la_cand_hidden = node.model_slice.embed_tokens(la_cand_tensor)
+                    else:
+                        la_cand_hidden = la_cand_tensor
 
-                next_token, accepted_count, is_eos, recv_stats = recv_token_timed(sock)
+                    la_past_seq_len = node._get_cache_seq_len(cache)
+                    t_la_fwd_0 = time.perf_counter()
+                    la_cand_output = node._forward(la_cand_hidden, session_id=session_id, compute_head=False)
+                    if la_cand_output.is_cuda:
+                        torch.cuda.synchronize(la_cand_output.device)
+                    t_la_fwd_1 = time.perf_counter()
+
+                    spec_pending = {
+                        "output": la_cand_output,
+                        "drafts": la_drafts,
+                        "cand_tokens": la_cand_tokens,
+                        "assumed_token": assumed_next,
+                        "assumed_accepted": len(drafts) + 1,
+                        "past_seq_len": la_past_seq_len,
+                        "draft_gen_ms": la_draft_ms,
+                        "t_fwd_0": t_la_fwd_0,
+                        "t_fwd_1": t_la_fwd_1,
+                        "valid": False,
+                    }
+
+                # Receive verification from Node 1
+                if receiver is not None:
+                    next_token, accepted_count, is_eos, recv_stats = receiver.get()
+                else:
+                    next_token, accepted_count, is_eos, recv_stats = recv_token_timed(sock)
                 total_accepted += max(0, accepted_count - 1)
 
-                if cache is not None:
-                    rewind_kv_cache(cache, past_seq_len + accepted_count)
-                if draft_sampler:
-                    draft_target = draft_sampler.seq_len - len(drafts) + (accepted_count - 1)
-                    draft_sampler.rewind(draft_target)
+                # Reconcile speculation: atomic single-depth commit or rollback
+                if spec_pending is not None:
+                    if accepted_count == spec_pending["assumed_accepted"] and not is_eos and next_token == spec_pending["assumed_token"]:
+                        # Full hit! Single continuation lookahead is valid
+                        spec_pending["valid"] = True
+                    else:
+                        # Partial hit or mismatch: single-slice rollback
+                        if cache is not None:
+                            rewind_kv_cache(cache, past_seq_len + accepted_count)
+                        if draft_sampler:
+                            draft_target = draft_sampler.seq_len - len(drafts) - len(spec_pending["drafts"]) + (accepted_count - 1)
+                            draft_sampler.rewind(draft_target)
+                        spec_pending = None
+                else:
+                    if cache is not None:
+                        rewind_kv_cache(cache, past_seq_len + accepted_count)
+                    if draft_sampler:
+                        draft_target = draft_sampler.seq_len - len(drafts) + (accepted_count - 1)
+                        draft_sampler.rewind(draft_target)
 
                 if accepted_count > 1:
                     for d_idx in range(accepted_count - 1):
@@ -229,6 +391,10 @@ def generate(
                         send_ms=send_stats["tcp_send_ms"],
                         recv_ms=recv_stats["tcp_recv_ms"],
                         total_ms=(t_step_1 - t_step_0) * 1000.0,
+                        draft_gen_ms=draft_gen_ms,
+                        accepted=accepted_count,
+                        drafted=len(drafts),
+                        is_spec=True,
                     )
 
             else:
@@ -249,7 +415,10 @@ def generate(
 
                 send_stats = send_tensor_timed(sock, output)
 
-                next_token, _, is_eos, recv_stats = recv_token_timed(sock)
+                if receiver is not None:
+                    next_token, _, is_eos, recv_stats = receiver.get()
+                else:
+                    next_token, _, is_eos, recv_stats = recv_token_timed(sock)
                 t_step_1 = time.perf_counter()
 
                 generated_tokens.append(next_token)
@@ -266,6 +435,10 @@ def generate(
                         send_ms=send_stats["tcp_send_ms"],
                         recv_ms=recv_stats["tcp_recv_ms"],
                         total_ms=(t_step_1 - t_step_0) * 1000.0,
+                        draft_gen_ms=draft_gen_ms,
+                        accepted=1,
+                        drafted=0,
+                        is_spec=False,
                     )
 
     except TimeoutError as te:
@@ -299,22 +472,8 @@ def generate(
         "decode_time": decode_time,
         "tps": tps,
         "draft_accept_rate": (total_accepted / total_drafted * 100.0) if total_drafted > 0 else None,
-    }
-
-    print("\n" + "-" * 55, flush=True)
-    stats_str = f"📊 Tokens: {tok_count} | TTFT: {ttft*1000:.1f} ms | Decode Time: {decode_time:.2f} s | Speed: {tps:.2f} TPS 🚀"
-    if total_drafted > 0:
-        accept_rate = (total_accepted / total_drafted) * 100.0
-        stats_str += f" | Draft Accept Rate: {accept_rate:.1f}% ({total_accepted}/{total_drafted})"
-    print(stats_str, flush=True)
-    print("-" * 55, flush=True)
-
-    return {
-        "tokens": tok_count,
-        "ttft": ttft,
-        "decode_time": decode_time,
-        "tps": tps,
-        "draft_accept_rate": (total_accepted / total_drafted * 100.0) if total_drafted > 0 else None,
+        "total_drafted": total_drafted,
+        "total_accepted": total_accepted,
     }
 
 
@@ -336,6 +495,8 @@ def main():
     parser.add_argument("--no-cuda-graphs", action="store_false", dest="cuda_graphs", help="Disable CUDA Graphs and use DynamicCache fallback (default)")
     parser.add_argument("--static-kv", action="store_true", default=False, help="Enable Static KV cache on GPU")
     parser.add_argument("--no-static-kv", action="store_false", dest="static_kv", help="Disable Static KV cache")
+    parser.add_argument("--async-recv", action="store_true", default=False, help="Enable asynchronous token receiver thread")
+    parser.add_argument("--async-spec", action="store_true", default=False, help="Enable one-step-ahead speculative execution during network flight")
     args = parser.parse_args()
 
     model_path = args.model if os.path.exists(args.model) else args.model
@@ -365,11 +526,14 @@ def main():
     else:
         draft_info = "DISABLED (spec_k=0)"
 
+    use_async_recv = args.async_recv or args.async_spec
     print("=" * 70, flush=True)
     print("🚀 SHARDFLOW v2 REMOTE NODE 0 (KAGGLE INSTANCE A)", flush=True)
     print(f"Base Model:    {model_path}")
     print(f"Layer Range:   [{layer_start}..{layer_end}) -> Indices {layer_start}..{layer_end-1} ({layer_end - layer_start}/{total_layers} layers + Embeddings)")
     print(f"Draft Model:   {draft_info}")
+    print(f"Async Spec:    {'ENABLED ⚡' if args.async_spec else 'DISABLED'}")
+    print(f"Async Recv:    {'ENABLED ⚡' if use_async_recv else 'DISABLED'}")
     print(f"CUDA Graphs:   {'ENABLED ⚡' if enable_cuda_graphs else 'DISABLED (eager mode)'}")
     print(f"Static KV:     {'ENABLED (GPU StaticCache)' if enable_static_kv else 'DISABLED (DynamicCache)'}")
     print(f"Relay Target:  {args.relay_host}:{args.relay_port}")
@@ -425,6 +589,8 @@ def main():
     handshake(sock)
     logger.info("🌟 HANDSHAKE COMPLETE! Cluster is paired and ready for inference.")
 
+    receiver = AsyncTokenReceiver(sock) if use_async_recv else None
+
     # 5. Run Live Inference Prompts
     prompts = [args.prompt] if args.prompt else [
         "Explain quantum entanglement in simple terms.",
@@ -454,19 +620,25 @@ def main():
                 ngram_sampler=ngram_sampler,
                 eos_token_id=eos_id,
                 profiler=prompt_profiler,
+                receiver=receiver,
+                enable_async_spec=args.async_spec,
             )
             if stats["tokens"] > 1:
                 tps_results.append(stats["tps"])
                 ttft_results.append(stats["ttft"])
                 for i in range(len(prompt_profiler.total_step_times)):
                     global_profiler.record(
-                        prompt_profiler.embed_times[i],
-                        prompt_profiler.node0_gpu_times[i],
-                        prompt_profiler.gpu_to_cpu_times[i],
-                        prompt_profiler.serialize_times[i],
-                        prompt_profiler.tcp_send_times[i],
-                        prompt_profiler.tcp_recv_wait_times[i],
-                        prompt_profiler.total_step_times[i],
+                        embed_ms=prompt_profiler.embed_times[i],
+                        gpu_fwd_ms=prompt_profiler.node0_gpu_times[i],
+                        g2c_ms=prompt_profiler.gpu_to_cpu_times[i],
+                        ser_ms=prompt_profiler.serialize_times[i],
+                        send_ms=prompt_profiler.tcp_send_times[i],
+                        recv_ms=prompt_profiler.tcp_recv_wait_times[i],
+                        total_ms=prompt_profiler.total_step_times[i],
+                        draft_gen_ms=prompt_profiler.draft_gen_times[i],
+                        accepted=prompt_profiler.accepted_per_round[i],
+                        drafted=prompt_profiler.drafted_per_round[i],
+                        is_spec=prompt_profiler.is_spec_step[i],
                     )
 
             prompt_profiler.print_breakdown()
@@ -483,6 +655,8 @@ def main():
             global_profiler.print_breakdown()
 
     finally:
+        if receiver is not None:
+            receiver.stop()
         sock.close()
 
 
