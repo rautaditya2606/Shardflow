@@ -106,19 +106,8 @@ class DraftSampler:
         self.transformer = getattr(self.model, "model", self.model)
         self.lm_head = getattr(self.model, "lm_head", None)
 
-        # Pre-allocated single-token buffer and pre-computed position_ids
+        # Pre-allocated single-token buffer to avoid GPU tensor allocations in decode loop
         self._cur_tensor = torch.zeros((1, 1), dtype=torch.long, device=self.device)
-        self._pos_ids = torch.arange(8192, dtype=torch.long, device=self.device).unsqueeze(0)
-
-        # Optional compilation on raw decoder stack with cudagraphs backend
-        try:
-            self.transformer = torch.compile(
-                self.transformer,
-                backend="cudagraphs",
-            )
-            logger.info("DraftSampler: torch.compile(backend=cudagraphs) enabled on %s", self.device)
-        except Exception as e:
-            logger.warning("DraftSampler: torch.compile skipped (%s), running in direct eager mode", e)
 
     @property
     def seq_len(self) -> int:
@@ -140,11 +129,9 @@ class DraftSampler:
         if not prompt_tokens:
             return
         input_ids = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
-        pos = self._pos_ids[:, :len(prompt_tokens)]
         self.transformer(
             input_ids=input_ids,
             past_key_values=self.cache,
-            position_ids=pos,
             use_cache=True,
             return_dict=False,
         )
@@ -178,11 +165,9 @@ class DraftSampler:
             gpu_drafts: List[torch.Tensor] = []
 
             for _ in range(k):
-                pos = self._pos_ids[:, self._seq_len : self._seq_len + 1]
                 hidden_states = self.transformer(
                     input_ids=self._cur_tensor,
                     past_key_values=self.cache,
-                    position_ids=pos,
                     use_cache=True,
                     return_dict=False,
                 )[0]
