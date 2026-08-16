@@ -120,8 +120,15 @@ class KVCacheStore:
         config: AutoConfig,
         device: torch.device,
         dtype: torch.dtype,
+        max_sessions: Optional[int] = None,
+        max_seq_len: Optional[int] = None,
+        **kwargs,
     ) -> None:
         """Pre-allocate static KV cache slots on the target device."""
+        if max_sessions is not None:
+            self.max_sessions = max_sessions
+        if max_seq_len is not None:
+            self.max_seq_len = max_seq_len
         if not self.enable_static_cache or device.type != "cuda" or not torch.cuda.is_available():
             logger.info("Static KV cache pool disabled or running on CPU — using DynamicCache fallback.")
             return
