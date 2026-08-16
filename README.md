@@ -14,11 +14,11 @@ A high-performance, general-purpose distributed LLM inference framework that par
 
 ShardFlow combines **neural speculative decoding ($K=8$ on dual-GPU nodes)**, **zero-copy binary tensor serialization**, and **high-throughput TCP relay transport** to overcome wide-area network latency (WAN) and deliver interactive LLM inference speeds across separate cloud data centers.
 
-> 🚀 **Live Verified Benchmark (Trans-Continental WAN):** **14.31 TPS** peak (**11.91 TPS** average, **4.36 tokens/round**, **58.0% acceptance rate**) running `Qwen2.5-7B-Instruct` in native FP16 across two geographically separated Kaggle notebook instances (Iowa $\leftrightarrow$ Oregon) communicating through an AWS EC2 TCP Relay (Ohio) over an **~86 ms public Internet RTT**.
+> **Live Verified Benchmark (Trans-Continental WAN):** **14.31 TPS** peak (**11.91 TPS** average, **4.36 tokens/round**, **58.0% acceptance rate**) running `Qwen2.5-7B-Instruct` in native FP16 across two geographically separated Kaggle notebook instances (Iowa <-> Oregon) communicating through an AWS EC2 TCP Relay (Ohio) over an **~86 ms public Internet RTT**.
 
 ---
 
-## 📊 Live Verified Empirical Results
+## Live Verified Empirical Results
 
 ### 1. Speculative Decoding Sweeps across Public WAN ($K \in \{0, 5, 8, 10, 12\}$)
 
@@ -26,7 +26,7 @@ Live benchmark of **Qwen2.5-7B-Instruct (14 layers on Node 0, 14 layers + Head o
 
 ```
 ===================================================================================================================
-📊 IN-FLIGHT SPECULATIVE WINDOW EMPIRICAL RESULTS (Qwen2.5-7B Target + Qwen2.5-0.5B Drafter)
+IN-FLIGHT SPECULATIVE WINDOW EMPIRICAL RESULTS (Qwen2.5-7B Target + Qwen2.5-0.5B Drafter)
 ===================================================================================================================
 Window |    TPS | TTFT (ms) | Tok/Round | Full Hit % | Bubble (ms) | N0 Fwd (ms) | N1 Comp (ms) | Net RTT (ms)
 -------------------------------------------------------------------------------------------------------------------
@@ -38,23 +38,23 @@ Window |    TPS | TTFT (ms) | Tok/Round | Full Hit % | Bubble (ms) | N0 Fwd (ms)
 
 | Prompt Topic | Domain | Accept Rate | Accepted Drafts | Total Tokens | Decode Time | Speed |
 |---|---|:---:|:---:|:---:|:---:|:---:|
-| **Explain Quantum Entanglement** | Conceptual / Science | **58.0%** | 51 / 88 | 63 tokens | 4.33 s | 🚀 **14.31 TPS** |
-| **Fibonacci Dynamic Programming** | Python Code Gen | **47.1%** | 49 / 104 | 63 tokens | 4.89 s | 🚀 **12.67 TPS** |
+| **Explain Quantum Entanglement** | Conceptual / Science | **58.0%** | 51 / 88 | 63 tokens | 4.33 s | **14.31 TPS** |
+| **Fibonacci Dynamic Programming** | Python Code Gen | **47.1%** | 49 / 104 | 63 tokens | 4.89 s | **12.67 TPS** |
 | **Pipeline Parallelism Advantages** | Technical LLM Systems | **28.5%** | 41 / 144 | 60 tokens | 6.73 s | **8.77 TPS** |
 
 #### Comparison against Autoregressive Baseline ($K=0$ vs $K=8$):
 
 | Configuration | Draft Model | Speculative $K$ | Avg Tok/Round | Avg RTT | Throughput | Speedup |
 |---|---|:---:|:---:|:---:|:---:|:---:|
-| **Non-Speculative Baseline** | None (Single token) | $K=0$ | 1.00 | 203 ms | **4.92 TPS** | 1.00× |
-| **N-gram Speculation** | N-gram Matcher | $K=4$ | 1.66 | 215 ms | **7.72 TPS** | 1.57× |
-| **Neural Draft $K=5$** | `Qwen2.5-0.5B` | $K=5$ | 2.83 | 259 ms | **9.55 TPS** | 1.94× |
-| **Neural Draft $K=8$ (Optimal)** | `Qwen2.5-0.5B` | **$K=8$** | **4.36** | **338 ms** | **11.91 TPS** (Peak: **14.31**) | 🚀 **2.42×** |
-| **Neural Draft $K=10$** | `Qwen2.5-0.5B` | $K=10$ | 4.20 | 412 ms | **9.65 TPS** | 1.96× |
+| **Non-Speculative Baseline** | None (Single token) | $K=0$ | 1.00 | 203 ms | **4.92 TPS** | 1.00x |
+| **N-gram Speculation** | N-gram Matcher | $K=4$ | 1.66 | 215 ms | **7.72 TPS** | 1.57x |
+| **Neural Draft $K=5$** | `Qwen2.5-0.5B` | $K=5$ | 2.83 | 259 ms | **9.55 TPS** | 1.94x |
+| **Neural Draft $K=8$ (Optimal)** | `Qwen2.5-0.5B` | **$K=8$** | **4.36** | **338 ms** | **11.91 TPS** (Peak: **14.31**) | **2.42x** |
+| **Neural Draft $K=10$** | `Qwen2.5-0.5B` | $K=10$ | 4.20 | 412 ms | **9.65 TPS** | 1.96x |
 
 ---
 
-## 🏗️ System Architecture
+## System Architecture
 
 ```mermaid
 graph TD
@@ -109,10 +109,10 @@ graph TD
 
 ---
 
-## ⚡ Core Technical Innovations
+## Core Technical Innovations
 
 ### 1. Dual-GPU Pipelined Draft Generation
-On Node 0 (which has 2× T4 GPUs on Kaggle), we place the 7B target model slice on `cuda:0` and the 0.5B draft model (`Qwen2.5-0.5B-Instruct`) on `cuda:1`.
+On Node 0 (which has 2x T4 GPUs on Kaggle), we place the 7B target model slice on `cuda:0` and the 0.5B draft model (`Qwen2.5-0.5B-Instruct`) on `cuda:1`.
 - **Zero VRAM Contention**: The 7B slice occupies 7.64 GB on GPU 0, while the 0.5B drafter occupies 0.98 GB on GPU 1.
 - **Direct Transformer Bypass**: We extract `model.model` and `model.lm_head` directly, bypassing the standard Hugging Face generation loop to eliminate CPU Python wrapper overhead.
 - **Vectorized Token Transfer**: Collects candidate token IDs directly on GPU into a single tensor and extracts via `.tolist()`, executing zero per-token CPU-GPU synchronizations.
@@ -140,7 +140,7 @@ Cloud notebooks (Kaggle/Colab) do not expose public IP addresses or open inbound
 
 ---
 
-## 🚀 Quickstart: Reproduce Live Cross-Kaggle Benchmark
+## Quickstart: Reproduce Live Cross-Kaggle Benchmark
 
 Run a 7B parameter model in native FP16 across two separate Kaggle notebook instances using the AWS EC2 TCP relay:
 
@@ -161,7 +161,7 @@ os.environ["HF_HOME"] = "/kaggle/working/hf_home"
     --relay-port 9500 \
     --dtype float16
 ```
-*(Wait until you see `[INFO] ✅ Connected to relay. Waiting for Node 0 to connect...`)*
+*(Wait until you see `[INFO] Connected to relay. Waiting for Node 0 to connect...`)*
 
 ---
 
@@ -190,7 +190,7 @@ os.environ["HF_HOME"] = "/kaggle/working/hf_home"
 
 ---
 
-## 💻 OpenAI-Compatible API Usage
+## OpenAI-Compatible API Usage
 
 ShardFlow exposes standard OpenAI-compatible endpoints (`POST /v1/chat/completions`) for seamless integration with client applications:
 
@@ -218,7 +218,7 @@ print()
 
 ---
 
-## 🧪 Local Development & Test Suite
+## Local Development & Test Suite
 
 Run the full unit test suite (testing auto-partitioning, KV pool management, protocol framing, and speculative verification):
 
@@ -236,6 +236,6 @@ python -m pytest -p no:opik tests/unit
 
 ---
 
-## 📜 License
+## License
 
 Distributed under the [MIT License](LICENSE).
