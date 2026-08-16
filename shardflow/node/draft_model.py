@@ -58,6 +58,12 @@ def rewind_kv_cache(cache: Cache, target_seq_len: int) -> None:
         rewind_dynamic_cache(cache, target_seq_len)
 
 
+# Global acceleration flags
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+
 class DraftSampler:
     """
     Lightweight draft model sampler running on Node 0.
@@ -76,9 +82,6 @@ class DraftSampler:
         self.dtype = dtype
         self.spec_k = spec_k
         self.cache = DynamicCache()
-        # Independent position counter for the draft model's KV cache.
-        # Tracked separately from the target model so rewind() receives the
-        # correct absolute draft position rather than the target's seq_len.
         self._seq_len: int = 0
 
         logger.info("Loading draft model %s on %s (dtype=%s, K=%d)...", model_path, device, dtype, spec_k)
@@ -97,8 +100,35 @@ class DraftSampler:
             actual_path,
             torch_dtype=dtype,
             cache_dir=target_cache,
-        ).to(device)
+        ).to(self.device)
         self.model.eval()
+
+        self.transformer = getattr(self.model, "model", self.model)
+        self.lm_head = getattr(self.model, "lm_head", None)
+
+        # Optional compilation on raw decoder stack
+        try:
+            self.transformer = torch.compile(
+                self.transformer,
+                mode="reduce-overhead",
+                fullgraph=False,
+            )
+            logger.info("DraftSampler: torch.compile(reduce-overhead) enabled on %s", self.device)
+        except Exception as e:
+            logger.warning("DraftSampler: torch.compile skipped (%s), running in direct eager mode", e)
+
+        # Pre-allocated single-token buffer to avoid GPU tensor allocations in decode loop
+        self._cur_tensor = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+
+        # Warmup single step if on CUDA to trigger initial kernel compilation
+        if self.device.type == "cuda":
+            try:
+                warmup_cache = DynamicCache()
+                w_ids = torch.tensor([[100]], dtype=torch.long, device=self.device)
+                with torch.inference_mode():
+                    _ = self.transformer(input_ids=w_ids, past_key_values=warmup_cache, use_cache=True, return_dict=False)
+            except Exception:
+                pass
 
     @property
     def seq_len(self) -> int:
@@ -120,10 +150,11 @@ class DraftSampler:
         if not prompt_tokens:
             return
         input_ids = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
-        self.model(
+        self.transformer(
             input_ids=input_ids,
             past_key_values=self.cache,
             use_cache=True,
+            return_dict=False,
         )
         self._seq_len = len(prompt_tokens)
 
@@ -149,26 +180,24 @@ class DraftSampler:
         if k <= 0:
             return []
 
-        # Greedy path: 100% GPU resident, direct forward on underlying transformer model
+        # Greedy path: 100% GPU resident, direct forward on compiled transformer
         if temperature <= 0 or temperature < 1e-8:
-            cur_tensor = torch.tensor([[current_token]], dtype=torch.long, device=self.device)
+            self._cur_tensor.fill_(current_token)
             gpu_drafts: List[torch.Tensor] = []
-            transformer = getattr(self.model, "model", self.model)
-            lm_head = getattr(self.model, "lm_head", None)
 
             for _ in range(k):
-                hidden_states = transformer(
-                    input_ids=cur_tensor,
+                hidden_states = self.transformer(
+                    input_ids=self._cur_tensor,
                     past_key_values=self.cache,
                     use_cache=True,
                     return_dict=False,
                 )[0]
-                if lm_head is not None:
-                    logits = lm_head(hidden_states[:, -1:, :])
+                if self.lm_head is not None:
+                    next_tok = self.lm_head(hidden_states[:, -1:, :]).argmax(dim=-1)
                 else:
-                    logits = hidden_states[:, -1:, :]
-                cur_tensor = logits.argmax(dim=-1)
-                gpu_drafts.append(cur_tensor)
+                    next_tok = hidden_states[:, -1:, :].argmax(dim=-1)
+                gpu_drafts.append(next_tok)
+                self._cur_tensor.copy_(next_tok)
                 self._seq_len += 1
 
             if not gpu_drafts:
