@@ -51,10 +51,10 @@ def run_echo(host: str, port: int, auth_byte: bytes, iters: int):
         print("Waiting for tensors from sender...", flush=True)
 
         count = 0
-        while iters == 0 or count < iters:
+        while True:
             try:
                 tensor, drafts = recv_tensor(sock)
-            except (ConnectionError, TimeoutError, EOFError):
+            except (ConnectionError, TimeoutError, EOFError, socket.error):
                 break
 
             count += 1
@@ -62,7 +62,7 @@ def run_echo(host: str, port: int, auth_byte: bytes, iters: int):
             if count % 10 == 0 or count == 1:
                 print(f"  [Echo] Received tensor {list(tensor.shape)} ({tensor.dtype}) -> Sent token response #{count}", flush=True)
 
-        print(f"✅ Echo session completed ({count} iterations).")
+        print(f"✅ Echo session completed ({count} requests handled).")
     finally:
         sock.close()
 
