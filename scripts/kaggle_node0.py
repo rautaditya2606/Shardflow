@@ -60,18 +60,16 @@ class Node0Profiler:
 
     def __init__(self):
         self.embed_times = []
-        self.node0_fwd_times = []
-        self.cuda_sync_times = []
+        self.node0_gpu_times = []
         self.gpu_to_cpu_times = []
         self.serialize_times = []
         self.tcp_send_times = []
         self.tcp_recv_wait_times = []
         self.total_step_times = []
 
-    def record(self, embed_ms, fwd_ms, sync_ms, g2c_ms, ser_ms, send_ms, recv_ms, total_ms):
+    def record(self, embed_ms, gpu_fwd_ms, g2c_ms, ser_ms, send_ms, recv_ms, total_ms):
         self.embed_times.append(embed_ms)
-        self.node0_fwd_times.append(fwd_ms)
-        self.cuda_sync_times.append(sync_ms)
+        self.node0_gpu_times.append(gpu_fwd_ms)
         self.gpu_to_cpu_times.append(g2c_ms)
         self.serialize_times.append(ser_ms)
         self.tcp_send_times.append(send_ms)
@@ -90,12 +88,11 @@ class Node0Profiler:
         print(f"⏱️ NODE 0 PER-TOKEN LATENCY PROFILER BREAKDOWN ({n} decode steps)", flush=True)
         print("=" * 70, flush=True)
         print(f"  1. Token Embeddings:         {avg(self.embed_times):6.2f} ms  (p95: {p95(self.embed_times):6.2f} ms)")
-        print(f"  2. Node 0 GPU Forward:       {avg(self.node0_fwd_times):6.2f} ms  (p95: {p95(self.node0_fwd_times):6.2f} ms)")
-        print(f"  3. CUDA Synchronize:         {avg(self.cuda_sync_times):6.2f} ms  (p95: {p95(self.cuda_sync_times):6.2f} ms)")
-        print(f"  4. GPU -> CPU Transfer:      {avg(self.gpu_to_cpu_times):6.2f} ms  (p95: {p95(self.gpu_to_cpu_times):6.2f} ms)")
-        print(f"  5. Tensor Serialization:     {avg(self.serialize_times):6.2f} ms  (p95: {p95(self.serialize_times):6.2f} ms)")
-        print(f"  6. TCP Send (Node 0 -> EC2): {avg(self.tcp_send_times):6.2f} ms  (p95: {p95(self.tcp_send_times):6.2f} ms)")
-        print(f"  7. TCP Recv Wait (RTT+Node1):{avg(self.tcp_recv_wait_times):6.2f} ms  (p95: {p95(self.tcp_recv_wait_times):6.2f} ms)")
+        print(f"  2. Node 0 GPU Forward (Sync):{avg(self.node0_gpu_times):6.2f} ms  (p95: {p95(self.node0_gpu_times):6.2f} ms)")
+        print(f"  3. GPU -> CPU Transfer:      {avg(self.gpu_to_cpu_times):6.2f} ms  (p95: {p95(self.gpu_to_cpu_times):6.2f} ms)")
+        print(f"  4. Tensor Serialization:     {avg(self.serialize_times):6.2f} ms  (p95: {p95(self.serialize_times):6.2f} ms)")
+        print(f"  5. TCP Send (Node 0 -> EC2): {avg(self.tcp_send_times):6.2f} ms  (p95: {p95(self.tcp_send_times):6.2f} ms)")
+        print(f"  6. TCP Recv Wait (RTT+Node1):{avg(self.tcp_recv_wait_times):6.2f} ms  (p95: {p95(self.tcp_recv_wait_times):6.2f} ms)")
         print("  " + "-" * 66, flush=True)
         print(f"  TOTAL STEP LATENCY:          {avg_total:6.2f} ms  ({1000.0/avg_total:.2f} TPS)", flush=True)
         print("=" * 70, flush=True)
@@ -218,6 +215,8 @@ def generate(
 
                 t_fwd_0 = time.perf_counter()
                 output = node._forward(hidden, session_id=session_id, compute_head=False)
+                if output.is_cuda:
+                    torch.cuda.synchronize(output.device)
                 t_fwd_1 = time.perf_counter()
 
                 send_stats = send_tensor_timed(sock, output)
@@ -232,8 +231,7 @@ def generate(
                 if profiler is not None:
                     profiler.record(
                         embed_ms=(t_emb_1 - t_emb_0) * 1000.0,
-                        fwd_ms=(t_fwd_1 - t_fwd_0) * 1000.0,
-                        sync_ms=send_stats["cuda_sync_ms"],
+                        gpu_fwd_ms=(t_fwd_1 - t_fwd_0) * 1000.0,
                         g2c_ms=send_stats["gpu_to_cpu_ms"],
                         ser_ms=send_stats["serialize_ms"],
                         send_ms=send_stats["tcp_send_ms"],

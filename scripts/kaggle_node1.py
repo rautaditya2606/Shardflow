@@ -65,18 +65,18 @@ class Node1Profiler:
         self.deserialize_times = []
         self.cpu_to_gpu_times = []
         self.node1_fwd_times = []
-        self.head_sample_times = []
-        self.cuda_sync_times = []
+        self.lm_head_times = []
+        self.sampling_times = []
         self.tcp_send_times = []
         self.total_step_times = []
 
-    def record(self, recv_ms, deser_ms, c2g_ms, fwd_ms, head_ms, sync_ms, send_ms, total_ms):
+    def record(self, recv_ms, deser_ms, c2g_ms, fwd_ms, head_ms, smpl_ms, send_ms, total_ms):
         self.tcp_recv_times.append(recv_ms)
         self.deserialize_times.append(deser_ms)
         self.cpu_to_gpu_times.append(c2g_ms)
         self.node1_fwd_times.append(fwd_ms)
-        self.head_sample_times.append(head_ms)
-        self.cuda_sync_times.append(sync_ms)
+        self.lm_head_times.append(head_ms)
+        self.sampling_times.append(smpl_ms)
         self.tcp_send_times.append(send_ms)
         self.total_step_times.append(total_ms)
 
@@ -94,12 +94,12 @@ class Node1Profiler:
         print(f"  1. TCP Recv Wait (from Relay):{avg(self.tcp_recv_times):6.2f} ms  (p95: {p95(self.tcp_recv_times):6.2f} ms)")
         print(f"  2. Tensor Deserialization:    {avg(self.deserialize_times):6.2f} ms  (p95: {p95(self.deserialize_times):6.2f} ms)")
         print(f"  3. CPU -> GPU Transfer:       {avg(self.cpu_to_gpu_times):6.2f} ms  (p95: {p95(self.cpu_to_gpu_times):6.2f} ms)")
-        print(f"  4. Node 1 GPU Forward:        {avg(self.node1_fwd_times):6.2f} ms  (p95: {p95(self.node1_fwd_times):6.2f} ms)")
-        print(f"  5. Final Norm + LM Head + Smpl:{avg(self.head_sample_times):6.2f} ms  (p95: {p95(self.head_sample_times):6.2f} ms)")
-        print(f"  6. CUDA Synchronize:          {avg(self.cuda_sync_times):6.2f} ms  (p95: {p95(self.cuda_sync_times):6.2f} ms)")
+        print(f"  4. Node 1 Forward (14 Layers):{avg(self.node1_fwd_times):6.2f} ms  (p95: {p95(self.node1_fwd_times):6.2f} ms)")
+        print(f"  5. Final Norm + LM Head:      {avg(self.lm_head_times):6.2f} ms  (p95: {p95(self.lm_head_times):6.2f} ms)")
+        print(f"  6. Token Sampling (Argmax):   {avg(self.sampling_times):6.2f} ms  (p95: {p95(self.sampling_times):6.2f} ms)")
         print(f"  7. TCP Send Token (to EC2):   {avg(self.tcp_send_times):6.2f} ms  (p95: {p95(self.tcp_send_times):6.2f} ms)")
         print("  " + "-" * 66, flush=True)
-        print(f"  TOTAL NODE 1 LATENCY:         {avg_total:6.2f} ms", flush=True)
+        print(f"  TOTAL NODE 1 COMPUTE+IO:      {avg_total:6.2f} ms", flush=True)
         print("=" * 70, flush=True)
 
 
@@ -270,6 +270,8 @@ def main():
                         session_id=session_id,
                         compute_head=False,
                     )
+                    if hidden_out.is_cuda:
+                        torch.cuda.synchronize(hidden_out.device)
                     t_fwd_1 = time.perf_counter()
 
                     t_head_0 = time.perf_counter()
@@ -279,21 +281,20 @@ def main():
                         logits = node.model_slice.lm_head(hidden_out)
                     else:
                         logits = hidden_out
+                    if logits.is_cuda:
+                        torch.cuda.synchronize(logits.device)
+                    t_head_1 = time.perf_counter()
 
+                    t_smpl_0 = time.perf_counter()
                     token_id = sample_next_token(
                         logits[0, -1, :],
                         temperature=args.temperature,
                         top_k=args.top_k,
                         top_p=args.top_p,
                     )
+                    t_smpl_1 = time.perf_counter()
+
                     is_eos = (token_id == args.eos_token_id)
-                    t_head_1 = time.perf_counter()
-
-                    t_sync_0 = time.perf_counter()
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                    t_sync_1 = time.perf_counter()
-
                     send_stats = send_token_timed(sock, token_id, accepted_count=1, is_eos=is_eos)
                     t_step_1 = time.perf_counter()
 
@@ -303,16 +304,18 @@ def main():
                         c2g_ms=(t_c2g_1 - t_c2g_0) * 1000.0,
                         fwd_ms=(t_fwd_1 - t_fwd_0) * 1000.0,
                         head_ms=(t_head_1 - t_head_0) * 1000.0,
-                        sync_ms=(t_sync_1 - t_sync_0) * 1000.0,
+                        smpl_ms=(t_smpl_1 - t_smpl_0) * 1000.0,
                         send_ms=send_stats["tcp_send_ms"],
                         total_ms=(t_step_1 - t_step_0) * 1000.0,
                     )
 
                 if step > 0 and (step % 30 == 0):
-                    logger.info("Node 1 Step %4d | GPU Fwd: %.2f ms | Norm+Head+Smpl: %.2f ms", step, (t_fwd_1 - t_fwd_0)*1000, (t_head_1 - t_head_0)*1000)
+                    logger.info("Node 1 Step %4d | 14-L GPU: %.2f ms | LM Head: %.2f ms | Sample: %.2f ms",
+                                step, (t_fwd_1 - t_fwd_0)*1000, (t_head_1 - t_head_0)*1000, (t_smpl_1 - t_smpl_0)*1000)
 
         except (ConnectionError, socket.error) as e:
-            logger.warning("Relay connection error (%s). Reconnecting in 3s...", e)
+            logger.warning("Relay connection closed or reset (%s). Reconnecting in 3s...", e)
+            profiler.print_breakdown()
             time.sleep(3.0)
         except KeyboardInterrupt:
             logger.info("Shutting down Node 1...")
@@ -320,6 +323,7 @@ def main():
             break
         except Exception as e:
             logger.exception("Unexpected error in Node 1: %s", e)
+            profiler.print_breakdown()
             time.sleep(2.0)
 
 
