@@ -126,12 +126,7 @@ class PipelineNode:
                     spec_k=spec_k,
                 )
                 logger.info("DraftSampler initialized on Node 0 (draft_model=%s, device=%s, K=%d)", draft_model, target_draft_device, spec_k)
-                if target_draft_device != model_slice.device:
-                    from shardflow.node.draft_model import AsyncDraftSampler
-                    self.async_draft_sampler = AsyncDraftSampler(self.draft_sampler)
-                    logger.info("AsyncDraftSampler worker initialized on %s (overlapping with Node 0 compute + WAN)", target_draft_device)
-                else:
-                    self.async_draft_sampler = None
+                self.async_draft_sampler = None
             except Exception as e:
                 logger.error("❌ FAILED to initialize DraftSampler for '%s': %s", draft_model, e)
                 print(f"\n❌ [ERROR] Could not load draft model '{draft_model}': {e}\n", flush=True)
