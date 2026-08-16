@@ -35,6 +35,7 @@ from transformers import AutoConfig, AutoTokenizer
 from shardflow.node.layer_loader import load_layer_slice
 from shardflow.node.node import PipelineNode
 from shardflow.node.draft_model import DraftSampler, rewind_kv_cache
+from shardflow.node.ngram_draft import NGramDraftSampler
 from shardflow.transport.relay import (
     RELAY_HOST,
     RELAY_PORT,
@@ -108,6 +109,7 @@ def generate(
     top_k: int = 0,
     top_p: float = 1.0,
     spec_k: int = 0,
+    ngram_sampler: Optional[NGramDraftSampler] = None,
     eos_token_id: int = 151643,
     profiler: Optional[Node0Profiler] = None,
 ) -> dict:
@@ -116,7 +118,7 @@ def generate(
     prompt_tokens = tokenizer.encode(prompt)
     prompt_len = len(prompt_tokens)
 
-    # Initialize draft sampler if speculative decoding is enabled
+    # Initialize neural draft sampler if specified
     draft_sampler = node.draft_sampler if (spec_k > 0 and node.draft_sampler is not None) else None
     if draft_sampler:
         draft_sampler.prefill(prompt_tokens)
@@ -124,6 +126,7 @@ def generate(
     t_start = time.perf_counter()
     t_first_token = None
     generated_tokens = []
+    token_history = list(prompt_tokens)
     total_drafted = 0
     total_accepted = 0
 
@@ -148,6 +151,7 @@ def generate(
         next_token, _, is_eos = recv_token(sock)
         t_first_token = time.perf_counter()
         generated_tokens.append(next_token)
+        token_history.append(next_token)
 
         word = tokenizer.decode([next_token], skip_special_tokens=True)
         print(word, end="", flush=True)
@@ -159,9 +163,11 @@ def generate(
                 break
 
             t_step_0 = time.perf_counter()
+            drafts = []
 
-            if draft_sampler and spec_k > 0:
-                # Speculative decoding path
+            if ngram_sampler and spec_k > 0:
+                drafts = ngram_sampler.find_candidates(token_history, k=spec_k)
+            elif draft_sampler and spec_k > 0:
                 drafts = draft_sampler.generate_drafts(
                     next_token,
                     k=spec_k,
@@ -169,6 +175,8 @@ def generate(
                     top_k=top_k,
                     top_p=top_p,
                 )
+
+            if drafts:
                 total_drafted += len(drafts)
 
                 candidate_tokens = [next_token] + drafts
@@ -182,7 +190,12 @@ def generate(
                 cache = node.kv_store.get(session_id)
                 past_seq_len = node._get_cache_seq_len(cache)
 
+                t_fwd_0 = time.perf_counter()
                 cand_output = node._forward(cand_hidden, session_id=session_id, compute_head=False)
+                if cand_output.is_cuda:
+                    torch.cuda.synchronize(cand_output.device)
+                t_fwd_1 = time.perf_counter()
+
                 send_stats = send_tensor_timed(sock, cand_output, draft_tokens=drafts)
 
                 next_token, accepted_count, is_eos, recv_stats = recv_token_timed(sock)
@@ -190,16 +203,19 @@ def generate(
 
                 if cache is not None:
                     rewind_kv_cache(cache, past_seq_len + accepted_count)
-                draft_target = draft_sampler.seq_len - len(drafts) + (accepted_count - 1)
-                draft_sampler.rewind(draft_target)
+                if draft_sampler:
+                    draft_target = draft_sampler.seq_len - len(drafts) + (accepted_count - 1)
+                    draft_sampler.rewind(draft_target)
 
-                if drafts and accepted_count > 1:
+                if accepted_count > 1:
                     for d_idx in range(accepted_count - 1):
                         tok = drafts[d_idx]
                         generated_tokens.append(tok)
+                        token_history.append(tok)
                         print(tokenizer.decode([tok], skip_special_tokens=True), end="", flush=True)
 
                 generated_tokens.append(next_token)
+                token_history.append(next_token)
                 print(tokenizer.decode([next_token], skip_special_tokens=True), end="", flush=True)
                 step += accepted_count
 
@@ -207,7 +223,7 @@ def generate(
                 if profiler is not None:
                     profiler.record(
                         embed_ms=0.0,
-                        gpu_fwd_ms=0.0,
+                        gpu_fwd_ms=(t_fwd_1 - t_fwd_0) * 1000.0,
                         g2c_ms=send_stats["gpu_to_cpu_ms"],
                         ser_ms=send_stats["serialize_ms"],
                         send_ms=send_stats["tcp_send_ms"],
@@ -237,6 +253,7 @@ def generate(
                 t_step_1 = time.perf_counter()
 
                 generated_tokens.append(next_token)
+                token_history.append(next_token)
                 print(tokenizer.decode([next_token], skip_special_tokens=True), end="", flush=True)
                 step += 1
 
@@ -339,11 +356,20 @@ def main():
     enable_static_kv = args.static_kv and use_cuda
     enable_cuda_graphs = args.cuda_graphs and enable_static_kv
 
+    ngram_sampler = None
+    if args.spec_k > 0 and not args.draft_model:
+        ngram_sampler = NGramDraftSampler(max_ngram_size=3, min_ngram_size=1, spec_k=args.spec_k)
+        draft_info = f"Prompt-Lookup N-gram (<0.1ms CPU lookup) (Speculative K={args.spec_k})"
+    elif args.spec_k > 0 and args.draft_model:
+        draft_info = f"Neural Draft ({args.draft_model}) (Speculative K={args.spec_k})"
+    else:
+        draft_info = "DISABLED (spec_k=0)"
+
     print("=" * 70, flush=True)
     print("🚀 SHARDFLOW v2 REMOTE NODE 0 (KAGGLE INSTANCE A)", flush=True)
     print(f"Base Model:    {model_path}")
     print(f"Layer Range:   [{layer_start}..{layer_end}) -> Indices {layer_start}..{layer_end-1} ({layer_end - layer_start}/{total_layers} layers + Embeddings)")
-    print(f"Draft Model:   {args.draft_model or 'DISABLED (spec_k=0)'} (Speculative K={args.spec_k})")
+    print(f"Draft Model:   {draft_info}")
     print(f"CUDA Graphs:   {'ENABLED ⚡' if enable_cuda_graphs else 'DISABLED (eager mode)'}")
     print(f"Static KV:     {'ENABLED (GPU StaticCache)' if enable_static_kv else 'DISABLED (DynamicCache)'}")
     print(f"Relay Target:  {args.relay_host}:{args.relay_port}")
@@ -425,6 +451,7 @@ def main():
                 max_tokens=args.max_tokens,
                 temperature=0.0,
                 spec_k=args.spec_k,
+                ngram_sampler=ngram_sampler,
                 eos_token_id=eos_id,
                 profiler=prompt_profiler,
             )
