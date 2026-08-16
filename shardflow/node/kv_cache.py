@@ -118,32 +118,33 @@ class KVCacheStore:
     def initialize_static_pool(
         self,
         config: AutoConfig,
-        device: torch.device,
+        device: Union[torch.device, str],
         dtype: torch.dtype,
         max_sessions: Optional[int] = None,
         max_seq_len: Optional[int] = None,
         **kwargs,
     ) -> None:
         """Pre-allocate static KV cache slots on the target device."""
+        target_device = torch.device(device) if isinstance(device, str) else device
         if max_sessions is not None:
             self.max_sessions = max_sessions
         if max_seq_len is not None:
             self.max_seq_len = max_seq_len
-        if not self.enable_static_cache or device.type != "cuda" or not torch.cuda.is_available():
+        if not self.enable_static_cache or target_device.type != "cuda" or not torch.cuda.is_available():
             logger.info("Static KV cache pool disabled or running on CPU — using DynamicCache fallback.")
             return
 
         try:
             logger.info(
                 "Pre-allocating %d StaticKVSlots on %s (max_seq=%d, dtype=%s)...",
-                self.max_sessions, device, self.max_seq_len, dtype,
+                self.max_sessions, target_device, self.max_seq_len, dtype,
             )
             self._static_slots = [
                 StaticKVSlot(
                     slot_id=i,
                     config=config,
                     max_seq_len=self.max_seq_len,
-                    device=str(device),
+                    device=str(target_device),
                     dtype=dtype,
                 )
                 for i in range(self.max_sessions)

@@ -8,6 +8,7 @@ socket timeout guards, and zero-copy tensor serialization.
 
 import socket
 import struct
+import time
 import logging
 from typing import Optional, Tuple, List, Union
 import torch
