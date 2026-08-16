@@ -571,8 +571,8 @@ def main():
             target_dtype = torch.float16
 
     use_cuda = (args.device == "cuda" or (isinstance(args.device, str) and args.device.startswith("cuda"))) and torch.cuda.is_available()
-    enable_static_kv = args.static_kv and use_cuda
-    enable_cuda_graphs = args.cuda_graphs and enable_static_kv
+    enable_cuda_graphs = args.cuda_graphs and use_cuda
+    enable_static_kv = (args.static_kv or enable_cuda_graphs) and use_cuda
 
     ngram_sampler = None
     if args.spec_k > 0 and not args.draft_model:
