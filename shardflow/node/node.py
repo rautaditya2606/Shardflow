@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import logging
 import sys
+import time
 import warnings
 # ponytail: suppress transformers' max_cache_len DeprecationWarning — it fires from inside
 # model layer forward passes we don't control (fixed upstream in transformers >= 5.16)
