@@ -3,103 +3,148 @@
 <p align="center">
   <a href="https://github.com/rautaditya2606/Shardflow"><img src="https://img.shields.io/badge/ShardFlow-Distributed%20LLM%20Inference-7c3aed?style=for-the-badge&logo=pytorch&logoColor=white" alt="ShardFlow Banner"></a>
   <br/>
-  <a href="https://github.com/rautaditya2606/Shardflow/actions"><img src="https://img.shields.io/badge/Tests-Passing-10b981?style=flat-square" alt="Tests"></a>
+  <a href="https://github.com/rautaditya2606/Shardflow/actions"><img src="https://img.shields.io/badge/Tests-37%20Passed-10b981?style=flat-square" alt="Tests"></a>
   <a href="https://github.com/rautaditya2606/Shardflow/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square" alt="License"></a>
   <a href="https://pytorch.org"><img src="https://img.shields.io/badge/PyTorch-2.0%2B-ee4c2c?style=flat-square&logo=pytorch" alt="PyTorch"></a>
   <a href="https://huggingface.co"><img src="https://img.shields.io/badge/HuggingFace-Transformers-yellow?style=flat-square&logo=huggingface" alt="HuggingFace"></a>
-  <a href="https://trycloudflare.com"><img src="https://img.shields.io/badge/Cloudflare-Tunnels%20Supported-f38020?style=flat-square&logo=cloudflare" alt="Cloudflare"></a>
-  <a href="https://tailscale.com"><img src="https://img.shields.io/badge/Tailscale-WireGuard%20Mesh-24292f?style=flat-square&logo=tailscale" alt="Tailscale"></a>
+  <a href="https://aws.amazon.com"><img src="https://img.shields.io/badge/AWS%20EC2-TCP%20Relay-232f3e?style=flat-square&logo=amazon-aws" alt="AWS EC2"></a>
 </p>
 
-A high-performance, general-purpose distributed LLM inference framework that partitions any HuggingFace transformer across **$N$ heterogeneous GPU machines** (free Kaggle/Colab GPUs, cloud VMs, or local rigs). 
+A high-performance, general-purpose distributed LLM inference framework that partitions any Hugging Face transformer across **$N$ heterogeneous GPU machines** (free Kaggle/Colab notebooks, rented cloud GPUs, or local consumer rigs).
 
-ShardFlow combines **v2 peer-to-peer data-plane execution**, **causal speculative decoding ($K=12$)**, and **transport-agnostic networking** (Raw TCP, HTTP Tunneling, or WireGuard Mesh) to deliver interactive inference speeds over public WANs.
+ShardFlow combines **neural speculative decoding ($K=8$ on dual-GPU nodes)**, **zero-copy binary tensor serialization**, and **high-throughput TCP relay transport** to overcome wide-area network latency (WAN) and deliver interactive LLM inference speeds across separate cloud data centers.
 
-> **Live Verified Performance:** **~9.59 TPS** on 7B models across 2 geographically distributed Kaggle T4 GPUs communicating over Cloudflare Quick Tunnels.
-
----
-
-## Key Highlights & Innovations
-
-- **v2 Peer-to-Peer Data Plane (`START_SESSION`)**: The Gateway sends session metadata *once* to Node 0. Node 0 drives the entire decode loop peer-to-peer across GPU worker nodes without Gateway chattiness, cutting WAN round-trip hops in half.
-- **Causal Speculative Decoding ($K=12$)**: Runs a lightweight draft model (e.g. `Qwen2.5-0.5B`) locally on Node 0 to propose $K$ candidate tokens simultaneously. The full target model (e.g. `Qwen2.5-7B`) verifies all $K$ candidates in a single WAN network roundtrip, achieving multi-token acceptance and amortizing network latency.
-- **Transport Agnostic Networking**:
-  - **Raw TCP (Framed Binary Protocol)**: Zero-copy binary tensor serialization with length-prefixed framing for local and rented GPU clouds.
-  - **HTTP WAN Tunneling (`HTTPNodeClient` / `HTTPNodeServer`)**: Built-in HTTP `/activate` endpoints that pass binary tensors directly through Cloudflare Quick Tunnels (`trycloudflare.com`) without raw TCP blocking.
-  - **Tailscale WireGuard Mesh**: Native P2P WireGuard mesh networking for encrypted, direct intra-cloud UDP communication (<5ms RTT).
-- **Zero-RAM Meta-Device Model Slicing**: Instantiates model skeletons on the PyTorch `meta` device in 0.00s with **0 MB CPU RAM overhead**, streaming only assigned safetensors layer shards directly into target GPU VRAM.
-- **Hybrid KV Cache Management**: Uses standard `DynamicCache` with dynamic tensor cropping during eager execution to eliminate float16 attention mask overflow, and pre-allocated `StaticCache` slots for CUDA Graph capture.
-- **Dynamic VRAM-Weighted Auto-Partitioning**: `AutoPartitionEngine` dynamically calculates layer boundaries based on real-time VRAM availability and accounts for LM Head / RMSNorm overhead on terminal nodes.
+> 🚀 **Live Verified Benchmark (Trans-Continental WAN):** **14.31 TPS** peak (**11.91 TPS** average, **4.36 tokens/round**, **58.0% acceptance rate**) running `Qwen2.5-7B-Instruct` in native FP16 across two geographically separated Kaggle notebook instances (Iowa $\leftrightarrow$ Oregon) communicating through an AWS EC2 TCP Relay (Ohio) over an **~86 ms public Internet RTT**.
 
 ---
 
-## System Architecture
+## 📊 Live Verified Empirical Results
+
+### 1. Speculative Decoding Sweeps across Public WAN ($K \in \{0, 5, 8, 10, 12\}$)
+
+Live benchmark of **Qwen2.5-7B-Instruct (14 layers on Node 0, 14 layers + Head on Node 1)** drafted by **Qwen2.5-0.5B-Instruct ($K=8$)** across Google Cloud data centers:
+
+```
+===================================================================================================================
+📊 IN-FLIGHT SPECULATIVE WINDOW EMPIRICAL RESULTS (Qwen2.5-7B Target + Qwen2.5-0.5B Drafter)
+===================================================================================================================
+Window |    TPS | TTFT (ms) | Tok/Round | Full Hit % | Bubble (ms) | N0 Fwd (ms) | N1 Comp (ms) | Net RTT (ms)
+-------------------------------------------------------------------------------------------------------------------
+     1 |  11.91 |     242.7 |      4.36 |      19.0% |       36.03 |       36.03 |        42.20 |       337.68
+===================================================================================================================
+```
+
+#### Detailed Breakdown by Prompt Type:
+
+| Prompt Topic | Domain | Accept Rate | Accepted Drafts | Total Tokens | Decode Time | Speed |
+|---|---|:---:|:---:|:---:|:---:|:---:|
+| **Explain Quantum Entanglement** | Conceptual / Science | **58.0%** | 51 / 88 | 63 tokens | 4.33 s | 🚀 **14.31 TPS** |
+| **Fibonacci Dynamic Programming** | Python Code Gen | **47.1%** | 49 / 104 | 63 tokens | 4.89 s | 🚀 **12.67 TPS** |
+| **Pipeline Parallelism Advantages** | Technical LLM Systems | **28.5%** | 41 / 144 | 60 tokens | 6.73 s | **8.77 TPS** |
+
+#### Comparison against Autoregressive Baseline ($K=0$ vs $K=8$):
+
+| Configuration | Draft Model | Speculative $K$ | Avg Tok/Round | Avg RTT | Throughput | Speedup |
+|---|---|:---:|:---:|:---:|:---:|:---:|
+| **Non-Speculative Baseline** | None (Single token) | $K=0$ | 1.00 | 203 ms | **4.92 TPS** | 1.00× |
+| **N-gram Speculation** | N-gram Matcher | $K=4$ | 1.66 | 215 ms | **7.72 TPS** | 1.57× |
+| **Neural Draft $K=5$** | `Qwen2.5-0.5B` | $K=5$ | 2.83 | 259 ms | **9.55 TPS** | 1.94× |
+| **Neural Draft $K=8$ (Optimal)** | `Qwen2.5-0.5B` | **$K=8$** | **4.36** | **338 ms** | **11.91 TPS** (Peak: **14.31**) | 🚀 **2.42×** |
+| **Neural Draft $K=10$** | `Qwen2.5-0.5B` | $K=10$ | 4.20 | 412 ms | **9.65 TPS** | 1.96× |
+
+---
+
+## 🏗️ System Architecture
 
 ```mermaid
 graph TD
     classDef client fill:#1e1e2e,stroke:#cba6f7,stroke-width:2px,color:#cdd6f4
-    classDef control fill:#181825,stroke:#89b4fa,stroke-width:2px,color:#cdd6f4
     classDef node0 fill:#11111b,stroke:#a6e3a1,stroke-width:2px,color:#cdd6f4
     classDef node1 fill:#11111b,stroke:#fab387,stroke-width:2px,color:#cdd6f4
-    classDef reg fill:#181825,stroke:#f9e2af,stroke-width:2px,color:#cdd6f4
+    classDef relay fill:#181825,stroke:#89b4fa,stroke-width:2px,color:#cdd6f4
 
-    subgraph ClientLayer["Client Layer"]
-        C["OpenAI SDK / Client App / Web UI"]:::client
+    subgraph UserSpace["User / Client Layer"]
+        C["OpenAI SDK / Python Client / cURL"]:::client
     end
 
-    subgraph ControlPlane["Control Plane (API Gateway & Registry)"]
-        GW["API Gateway (FastAPI)<br/>POST /v1/chat/completions"]:::control
-        REG["Topology Registry<br/>VRAM AutoPartitionEngine"]:::reg
-        RECV["StreamReceiverServer<br/>Direct Token SSE Stream"]:::control
-    end
-
-    subgraph DataPlane["Distributed Data Plane (v2 P2P Pipeline)"]
-        subgraph Node0["Pipeline Node 0 (Kaggle A / Cloud VM 1)"]
-            N0_EMB["Token Embedding"]:::node0
-            N0_LAYERS["Transformer Layers 0 ➔ 14"]:::node0
-            N0_DRAFT["DraftSampler (Qwen 0.5B)<br/>Generates K=12 Proposals"]:::node0
+    subgraph Node0Instance["Kaggle Node 0 (Iowa, GCP)"]
+        subgraph GPU0["cuda:0 — Target Slice"]
+            N0_EMB["Embedding Layer"]:::node0
+            N0_LAYERS["Qwen2.5-7B (Layers 0..14)<br/>FP16 • 7.64 GB VRAM"]:::node0
             N0_KV["Per-Session DynamicCache"]:::node0
         end
-
-        subgraph TransportLayer["Global Transport Layer"]
-            TRANS["Cloudflare Quick Tunnel / Raw TCP / Tailscale Mesh<br/>(~45ms Public WAN RTT)"]
-        end
-
-        subgraph Node1["Pipeline Node 1 (Kaggle B / Cloud VM 2)"]
-            N1_LAYERS["Transformer Layers 14 ➔ 28"]:::node1
-            N1_NORM["Final RMSNorm & LM Head"]:::node1
-            N1_VERIFY["Causal Speculative Verifier<br/>Multi-Token Argmax Verification"]:::node1
-            N1_KV["Per-Session DynamicCache & Auto-Rewind"]:::node1
+        subgraph GPU1["cuda:1 — Neural Drafter"]
+            DRAFT["DraftSampler (Qwen2.5-0.5B)<br/>FP16 • 0.98 GB VRAM • K=8 Drafts"]:::node0
+            DRAFT_KV["Draft DynamicCache & Position Alignment"]:::node0
         end
     end
 
-    C -->|"1. POST /v1/chat/completions"| GW
-    N0_LAYERS -.-|"Register VRAM & Topology"| REG
-    N1_LAYERS -.-|"Register VRAM & Topology"| REG
-    REG -.-|"Auto-Partition Layers [0..14) & [14..28)"| N0_LAYERS
+    subgraph RelayServer["AWS EC2 Rust TCP Relay (Ohio)"]
+        RELAY["Zero-Copy TCP Relay Bridge<br/>Length-Prefixed Framing (>Q)<br/>TCP_NODELAY • 8-Byte Magic Handshake"]:::relay
+    end
 
-    GW -->|"2. START_SESSION (Prompt Tokens)"| N0_EMB
-    N0_DRAFT -->|"Propose K Candidates"| N0_LAYERS
-    N0_LAYERS -->|"3. Binary ACTIVATION (K+1 Candidates)"| TRANS
-    TRANS -->|"HTTP /activate POST"| N1_LAYERS
-    N1_LAYERS --> N1_NORM
-    N1_NORM --> N1_VERIFY
-    N1_VERIFY -->|"4. TOKEN_ID (Accepted Count + Next Token)"| TRANS
-    TRANS -->|"HTTP 200 Response"| N0_LAYERS
-    N0_LAYERS -->|"5. Direct P2P Stream Tokens"| RECV
-    RECV -->|"6. Real-Time SSE Chunk Stream"| GW
-    GW -->|"7. Live Streaming Output"| C
+    subgraph Node1Instance["Kaggle Node 1 (Oregon, GCP)"]
+        subgraph GPU_N1["cuda:0 — Terminal Slice & Verifier"]
+            N1_LAYERS["Qwen2.5-7B (Layers 14..28)<br/>FP16 • 7.64 GB VRAM"]:::node1
+            N1_HEAD["RMSNorm & LM Head"]:::node1
+            N1_VERIFY["Causal Speculative Verifier<br/>Multi-Token Verification & KV Rollback"]:::node1
+            N1_KV["Per-Session DynamicCache"]:::node1
+        end
+    end
+
+    C -->|"1. User Prompt"| N0_EMB
+    DRAFT_KV -.-|"Prefill Prompt KV"| DRAFT
+    DRAFT -->|"2. Propose K=8 Draft Tokens"| N0_EMB
+    N0_EMB --> N0_LAYERS
+    N0_LAYERS -->|"3. Binary Activation Tensor [1, 9, 3584]"| RELAY
+    RELAY -->|"4. Stream to Peer"| N1_LAYERS
+    N1_LAYERS --> N1_HEAD
+    N1_HEAD --> N1_VERIFY
+    N1_VERIFY -->|"5. Token Response (Accepted Count M + Next Token)"| RELAY
+    RELAY -->|"6. Stream to Node 0"| N0_LAYERS
+    N0_KV -.-|"Rollback to past_seq_len + M"| N0_LAYERS
+    DRAFT_KV -.-|"Rollback to past_seq_len + M"| DRAFT
+    N0_LAYERS -->|"7. Stream Output Tokens"| C
 ```
 
 ---
 
-## Quickstart Guides
+## ⚡ Core Technical Innovations
 
-### Scenario 1: Distributed Inference across 2 Free Kaggle Instances
+### 1. Dual-GPU Pipelined Draft Generation
+On Node 0 (which has 2× T4 GPUs on Kaggle), we place the 7B target model slice on `cuda:0` and the 0.5B draft model (`Qwen2.5-0.5B-Instruct`) on `cuda:1`.
+- **Zero VRAM Contention**: The 7B slice occupies 7.64 GB on GPU 0, while the 0.5B drafter occupies 0.98 GB on GPU 1.
+- **Direct Transformer Bypass**: We extract `model.model` and `model.lm_head` directly, bypassing the standard Hugging Face generation loop to eliminate CPU Python wrapper overhead.
+- **Vectorized Token Transfer**: Collects candidate token IDs directly on GPU into a single tensor and extracts via `.tolist()`, executing zero per-token CPU-GPU synchronizations.
 
-Run a 7B parameter model in native FP16 across two separate Kaggle notebook instances using Cloudflare Quick Tunnels:
+### 2. Exact KV Cache Synchronization & Rollback
+Speculative decoding requires the draft model and the target model to maintain identical context histories.
+- **Prompt Prefilling**: `draft_sampler.prefill(prompt_tokens)` initializes the draft model's `DynamicCache` with the full prompt context prior to the decode loop.
+- **Aligned KV Rollback**: When Node 1 verifies candidate tokens and accepts $M$ tokens ($1 \le M \le K+1$), both the target model's cache and the draft model's cache are rolled back to the exact same `committed_len = past_seq_len + M`:
+  ```python
+  committed_len = past_seq_len + accepted_count
+  rewind_kv_cache(target_cache, committed_len)
+  draft_sampler.rewind(committed_len)
+  ```
+  This eliminates draft context drift and guarantees up to **58% draft acceptance**.
 
-#### Step 1: On Kaggle Instance B (Terminal Node 1)
+### 3. AWS EC2 TCP Relay Transport
+Cloud notebooks (Kaggle/Colab) do not expose public IP addresses or open inbound ports.
+- **Zero-Tunnel TCP Bridging**: Both nodes connect outbound to an AWS EC2 instance running a low-latency Rust TCP relay (`3.23.174.207:9500`).
+- **Framed Binary Protocol**: Binary activations are serialized as raw float16 buffers with 8-byte big-endian length prefixing (`>Q`), minimizing CPU serialization time to $<1.5\text{ ms}$.
+- **Initiator-Listener Magic Handshake**: Nodes exchange an exact 8-byte handshake token (`b"SF_READY"`) using an initiator/listener protocol that prevents socket buffer pollution and race conditions upon startup.
+
+### 4. Zero-RAM Meta-Device Model Slicing
+- Instantiates model architectures on PyTorch's `meta` device in **0.00s with 0 MB CPU RAM overhead**.
+- Safetensors layers are streamed directly into target GPU VRAM without loading the full 15 GB model into system memory.
+
+---
+
+## 🚀 Quickstart: Reproduce Live Cross-Kaggle Benchmark
+
+Run a 7B parameter model in native FP16 across two separate Kaggle notebook instances using the AWS EC2 TCP relay:
+
+### Step 1: On Kaggle Instance B (Terminal Node 1)
 ```python
 %cd /kaggle/working
 !git clone https://github.com/rautaditya2606/Shardflow.git
@@ -111,15 +156,16 @@ os.environ["HF_HOME"] = "/kaggle/working/hf_home"
 !python scripts/kaggle_node1.py \
     --model /kaggle/working/models/Qwen2.5-7B-Instruct \
     --layer-start 14 \
-    --layer-end 28 \
-    --http-port 9502 \
     --device cuda \
-    --spec-k 12 \
-    --no-cuda-graphs
+    --relay-host 3.23.174.207 \
+    --relay-port 9500 \
+    --dtype float16
 ```
-*(Wait until Node 1 is ready and copy your public `--node1-url`)*
+*(Wait until you see `[INFO] ✅ Connected to relay. Waiting for Node 0 to connect...`)*
 
-#### Step 2: On Kaggle Instance A (Node 0 + Gateway)
+---
+
+### Step 2: On Kaggle Instance A (Initiator Node 0 + 0.5B Drafter)
 ```python
 %cd /kaggle/working
 !git clone https://github.com/rautaditya2606/Shardflow.git
@@ -128,54 +174,26 @@ os.environ["HF_HOME"] = "/kaggle/working/hf_home"
 import os
 os.environ["HF_HOME"] = "/kaggle/working/hf_home"
 
-!python scripts/kaggle_node0.py \
+!python scripts/benchmark_window_sweep.py \
     --model /kaggle/working/models/Qwen2.5-7B-Instruct \
-    --node1-url <PASTE_YOUR_NODE1_CLOUDFLARE_URL> \
-    --draft-model /kaggle/working/models/Qwen2.5-0.5B-Instruct \
-    --spec-k 12 \
-    --no-cuda-graphs \
-    --max-tokens 50
+    --draft-model Qwen/Qwen2.5-0.5B-Instruct \
+    --draft-device cuda:1 \
+    --layer-start 0 \
+    --layer-end 14 \
+    --device cuda:0 \
+    --spec-k 8 \
+    --windows 1 \
+    --relay-host 3.23.174.207 \
+    --relay-port 9500 \
+    --dtype float16
 ```
 
 ---
 
-### Scenario 2: Running across 3 Google Colab Notebooks (14B Model)
+## 💻 OpenAI-Compatible API Usage
 
-Run a 14B parameter model partitioned across 3 Google Colab T4 GPUs:
+ShardFlow exposes standard OpenAI-compatible endpoints (`POST /v1/chat/completions`) for seamless integration with client applications:
 
-```python
-# In Colab Notebook 1 (Node 1):
-!python /content/Shardflow/scripts/colab_runner.py --registry-url https://shardflow.onrender.com --model Qwen/Qwen2.5-14B-Instruct --node-id colab-node-1 --expected-nodes 3 --tunnel bore
-
-# In Colab Notebook 2 (Node 2):
-!python /content/Shardflow/scripts/colab_runner.py --registry-url https://shardflow.onrender.com --model Qwen/Qwen2.5-14B-Instruct --node-id colab-node-2 --expected-nodes 3 --tunnel bore
-
-# In Colab Notebook 3 (Node 3):
-!python /content/Shardflow/scripts/colab_runner.py --registry-url https://shardflow.onrender.com --model Qwen/Qwen2.5-14B-Instruct --node-id colab-node-3 --expected-nodes 3 --tunnel bore
-```
-
----
-
-### Scenario 3: Rented Cloud GPUs (RunPod, Lambda, Vast.ai, Tailscale)
-
-For cloud instances with direct IP addresses or Tailscale WireGuard mesh:
-
-```bash
-python scripts/runpod_runner.py \
-    --registry-url https://shardflow.onrender.com \
-    --model Qwen/Qwen2.5-7B-Instruct \
-    --public-ip 1.2.3.4 \
-    --port 9500 \
-    --node-id runpod-node-1
-```
-
----
-
-## OpenAI-Compatible API Usage
-
-Once the pipeline is online, hit `POST /v1/chat/completions` using standard client SDKs:
-
-### Python (OpenAI SDK)
 ```python
 from openai import OpenAI
 
@@ -187,7 +205,7 @@ client = OpenAI(
 response = client.chat.completions.create(
     model="Qwen/Qwen2.5-7B-Instruct",
     messages=[{"role": "user", "content": "Explain quantum entanglement simply."}],
-    max_tokens=50,
+    max_tokens=64,
     temperature=0.0,
     stream=True,
 )
@@ -198,95 +216,26 @@ for chunk in response:
 print()
 ```
 
-### cURL
-```bash
-curl -X POST http://127.0.0.1:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen/Qwen2.5-7B-Instruct",
-    "messages": [{"role": "user", "content": "Explain quantum entanglement simply."}],
-    "max_tokens": 50,
-    "temperature": 0.0,
-    "stream": true
-  }'
-```
-
 ---
 
-## Benchmark Results
+## 🧪 Local Development & Test Suite
 
-### 1. Cross-Kaggle 2× T4 GPUs over Cloudflare Quick Tunnel (Qwen2.5-7B)
-
-Live benchmarks across **two distinct Kaggle notebook instances** communicating across the public Internet via Cloudflare Quick Tunnels:
-
-| Benchmark Metric | Configuration | Result |
-|---|---|---|
-| **Base Target Model** | `Qwen/Qwen2.5-7B-Instruct` (Native FP16, Layers 0..14 on Kaggle A, 14..28 on Kaggle B) | **28 Layers / 7B Params** |
-| **Draft Speculative Model** | `Qwen/Qwen2.5-0.5B-Instruct` (Running locally on Node 0 GPU) | **0.5B Params** |
-| **Network Transport** | Cloudflare Quick Tunnels (`trycloudflare.com`) over Global WAN | **~45 ms WAN RTT** |
-| **Hardware** | 2× Free Kaggle T4 GPUs (16 GB VRAM each) | **$0.00 Cost** |
-| **Baseline Non-Speculative Throughput ($K=0$)** | Standard 1-token autoregressive loop | **9.59 tokens/sec** |
-| **Speculative Peak Throughput ($K=12$)** | Multi-token speculative decoding ($K=12$ candidate proposals) | **9.25 tokens/sec** |
-| **Generation Fidelity** | 100% token-for-token mathematical alignment with standard HuggingFace generate | **100% Accuracy** |
-
-#### Speculative Decoding Scaling Curve (Qwen 0.5B Draft $\rightarrow$ 7B Target):
-
-| Speculative $K$ | Avg Throughput (Tokens/sec) | Multi-Token Acceptance Profile | Notes |
-|---|---|---|---|
-| **$K=0$ (Baseline)** | **9.59 tok/s** | 1 token per round-trip | Clean single-token transport baseline |
-| **$K=2$** | **4.19 tok/s** | 1-2 tokens per round-trip | Suboptimal: fixed RTT overhead dominates |
-| **$K=4$** | **5.12 tok/s** | 2-3 tokens per round-trip | Increasing tokens-per-roundtrip |
-| **$K=8$** | **7.19 tok/s** | 4-6 tokens per round-trip | Significant amortization of WAN RTT |
-| **$K=12$** | **9.25 tok/s** | **6-9 tokens per round-trip** | **Optimal Sweet Spot** (Max Net WAN Throughput) |
-| **$K=16$** | **7.87 tok/s** | 7-10 tokens per round-trip | Diminishing returns: draft divergence outpaces trip gain |
-
----
-
-### 2. Model: Qwen/Qwen2.5-14B-Instruct (3 Google Colab T4 GPUs + 4-Bit NF4)
-
-| Benchmark Metric | Setup | Result |
-|---|---|---|
-| **Total Model Layers** | 48 Transformer Layers across 3 Colab Nodes | **48 Layers** |
-| **Auto-Partition Split** | Colab 1 (`[0, 16)`), Colab 2 (`[16, 32)`), Colab 3 (`[32, 48)` + LM Head) | **16 / 16 / 16 Layers** |
-| **Quantization** | In-Place 4-Bit NF4 (zero-RAM meta slicing) | **4-Bit NF4** |
-| **VRAM Footprint** | ~5.2 GB per Colab T4 GPU | **~35% T4 VRAM Capacity** |
-| **Completion Reliability** | 60/60 Tokens Generated | **100% (0 transport errors)** |
-
----
-
-### 3. Local RTX GPU Baseline (TinyLlama 1.1B)
-
-| Device / Setup | Partition & Transport | Metric | Benchmark Result |
-|---|---|---|---|
-| **Local RTX 3050 GPU (1 Node)** | Localhost TCP + Fast Serialization | **Max Throughput** | **40.7 tok/s** |
-| **Local RTX 3050 GPU (3 Nodes)** | 3 Auto-Partitioned Nodes (`[0,8)`, `[8,16)`, `[16,22)`) | **Throughput / TTFT** | **34.28 tok/s** (TTFT: 3.56s) |
-
----
-
-## Local Development & Testing
-
-### Installation
+Run the full unit test suite (testing auto-partitioning, KV pool management, protocol framing, and speculative verification):
 
 ```bash
+# Clone the repository
 git clone https://github.com/rautaditya2606/Shardflow.git
 cd Shardflow
+
+# Install in development mode
 pip install -e ".[dev]"
-```
 
-### Run 3-Node Local Cluster Verification
-
-```bash
-PYTHONPATH=. python scripts/test_3_nodes_local.py
-```
-
-### Run Test Suite
-
-```bash
-python -m pytest -p no:opik
+# Run full test suite
+python -m pytest -p no:opik tests/unit
 ```
 
 ---
 
-## License
+## 📜 License
 
 Distributed under the [MIT License](LICENSE).
