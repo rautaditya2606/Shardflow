@@ -41,9 +41,10 @@ from shardflow.transport.relay import (
     connect_to_relay,
     handshake,
     send_tensor,
+    send_tensor_timed,
     recv_tensor,
-    send_token,
     recv_token,
+    recv_token_timed,
 )
 
 logging.basicConfig(
@@ -51,6 +52,52 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("node0")
+
+
+class Node0Profiler:
+    """Microsecond-accurate latency profiler for Node 0 decode steps."""
+
+    def __init__(self):
+        self.embed_times = []
+        self.node0_fwd_times = []
+        self.cuda_sync_times = []
+        self.gpu_to_cpu_times = []
+        self.serialize_times = []
+        self.tcp_send_times = []
+        self.tcp_recv_wait_times = []
+        self.total_step_times = []
+
+    def record(self, embed_ms, fwd_ms, sync_ms, g2c_ms, ser_ms, send_ms, recv_ms, total_ms):
+        self.embed_times.append(embed_ms)
+        self.node0_fwd_times.append(fwd_ms)
+        self.cuda_sync_times.append(sync_ms)
+        self.gpu_to_cpu_times.append(g2c_ms)
+        self.serialize_times.append(ser_ms)
+        self.tcp_send_times.append(send_ms)
+        self.tcp_recv_wait_times.append(recv_ms)
+        self.total_step_times.append(total_ms)
+
+    def print_breakdown(self):
+        if not self.total_step_times:
+            return
+        n = len(self.total_step_times)
+        avg = lambda lst: (sum(lst) / len(lst)) if lst else 0.0
+        p95 = lambda lst: sorted(lst)[int(len(lst) * 0.95)] if lst else 0.0
+
+        avg_total = avg(self.total_step_times)
+        print("\n" + "=" * 70, flush=True)
+        print(f"⏱️ NODE 0 PER-TOKEN LATENCY PROFILER BREAKDOWN ({n} decode steps)", flush=True)
+        print("=" * 70, flush=True)
+        print(f"  1. Token Embeddings:         {avg(self.embed_times):6.2f} ms  (p95: {p95(self.embed_times):6.2f} ms)")
+        print(f"  2. Node 0 GPU Forward:       {avg(self.node0_fwd_times):6.2f} ms  (p95: {p95(self.node0_fwd_times):6.2f} ms)")
+        print(f"  3. CUDA Synchronize:         {avg(self.cuda_sync_times):6.2f} ms  (p95: {p95(self.cuda_sync_times):6.2f} ms)")
+        print(f"  4. GPU -> CPU Transfer:      {avg(self.gpu_to_cpu_times):6.2f} ms  (p95: {p95(self.gpu_to_cpu_times):6.2f} ms)")
+        print(f"  5. Tensor Serialization:     {avg(self.serialize_times):6.2f} ms  (p95: {p95(self.serialize_times):6.2f} ms)")
+        print(f"  6. TCP Send (Node 0 -> EC2): {avg(self.tcp_send_times):6.2f} ms  (p95: {p95(self.tcp_send_times):6.2f} ms)")
+        print(f"  7. TCP Recv Wait (RTT+Node1):{avg(self.tcp_recv_wait_times):6.2f} ms  (p95: {p95(self.tcp_recv_wait_times):6.2f} ms)")
+        print("  " + "-" * 66, flush=True)
+        print(f"  TOTAL STEP LATENCY:          {avg_total:6.2f} ms  ({1000.0/avg_total:.2f} TPS)", flush=True)
+        print("=" * 70, flush=True)
 
 
 def generate(
@@ -64,6 +111,7 @@ def generate(
     top_p: float = 1.0,
     spec_k: int = 0,
     eos_token_id: int = 151643,
+    profiler: Optional[Node0Profiler] = None,
 ) -> dict:
     """Generate tokens for a prompt through the distributed relay pipeline with error handling."""
     session_id = f"relay_session_{int(time.time()*1000)}"
@@ -92,7 +140,7 @@ def generate(
         else:
             hidden_states = token_tensor
 
-        # Forward pass on Node 0 (Layers 0..24)
+        # Forward pass on Node 0
         output = node._forward(hidden_states, session_id=session_id, compute_head=False)
 
         # Transmit activation to Node 1 via relay
@@ -112,8 +160,10 @@ def generate(
             if next_token == eos_token_id:
                 break
 
+            t_step_0 = time.perf_counter()
+
             if draft_sampler and spec_k > 0:
-                # Speculative decoding: propose K drafts locally on Node 0 GPU
+                # Speculative decoding path
                 drafts = draft_sampler.generate_drafts(
                     next_token,
                     k=spec_k,
@@ -134,23 +184,17 @@ def generate(
                 cache = node.kv_store.get(session_id)
                 past_seq_len = node._get_cache_seq_len(cache)
 
-                # Forward candidate sequence through Node 0 layers
                 cand_output = node._forward(cand_hidden, session_id=session_id, compute_head=False)
+                send_stats = send_tensor_timed(sock, cand_output, draft_tokens=drafts)
 
-                # Send activation + draft token list to Node 1 for parallel verification
-                send_tensor(sock, cand_output, draft_tokens=drafts)
-
-                # Receive verification result
-                next_token, accepted_count, is_eos = recv_token(sock)
+                next_token, accepted_count, is_eos, recv_stats = recv_token_timed(sock)
                 total_accepted += max(0, accepted_count - 1)
 
-                # Rewind Node 0 KV cache and draft sampler
                 if cache is not None:
                     rewind_kv_cache(cache, past_seq_len + accepted_count)
                 draft_target = draft_sampler.seq_len - len(drafts) + accepted_count
                 draft_sampler.rewind(draft_target)
 
-                # Stream accepted tokens
                 if drafts and accepted_count > 1:
                     for d_idx in range(accepted_count - 1):
                         tok = drafts[d_idx]
@@ -162,20 +206,39 @@ def generate(
                 step += accepted_count
 
             else:
-                # Standard 1-token decode
+                # Standard 1-token decode with precise phase timing
+                t_emb_0 = time.perf_counter()
                 tok_tensor = torch.tensor([[next_token]], dtype=torch.long, device=node.model_slice.device)
                 if node.model_slice.embed_tokens is not None:
                     hidden = node.model_slice.embed_tokens(tok_tensor)
                 else:
                     hidden = tok_tensor
+                t_emb_1 = time.perf_counter()
 
+                t_fwd_0 = time.perf_counter()
                 output = node._forward(hidden, session_id=session_id, compute_head=False)
-                send_tensor(sock, output)
+                t_fwd_1 = time.perf_counter()
 
-                next_token, _, is_eos = recv_token(sock)
+                send_stats = send_tensor_timed(sock, output)
+
+                next_token, _, is_eos, recv_stats = recv_token_timed(sock)
+                t_step_1 = time.perf_counter()
+
                 generated_tokens.append(next_token)
                 print(tokenizer.decode([next_token], skip_special_tokens=True), end="", flush=True)
                 step += 1
+
+                if profiler is not None:
+                    profiler.record(
+                        embed_ms=(t_emb_1 - t_emb_0) * 1000.0,
+                        fwd_ms=(t_fwd_1 - t_fwd_0) * 1000.0,
+                        sync_ms=send_stats["cuda_sync_ms"],
+                        g2c_ms=send_stats["gpu_to_cpu_ms"],
+                        ser_ms=send_stats["serialize_ms"],
+                        send_ms=send_stats["tcp_send_ms"],
+                        recv_ms=recv_stats["tcp_recv_ms"],
+                        total_ms=(t_step_1 - t_step_0) * 1000.0,
+                    )
 
     except TimeoutError as te:
         print(f"\n❌ [TIMEOUT ERROR]: {te}", flush=True)
@@ -193,6 +256,22 @@ def generate(
     decode_time = (t_end - t_first_token) if t_first_token else total_time
     tok_count = len(generated_tokens)
     tps = (tok_count - 1) / decode_time if (decode_time > 0 and tok_count > 1) else (tok_count / decode_time if decode_time > 0 else 0)
+
+    print("\n" + "-" * 55, flush=True)
+    stats_str = f"📊 Tokens: {tok_count} | TTFT: {ttft*1000:.1f} ms | Decode Time: {decode_time:.2f} s | Speed: {tps:.2f} TPS 🚀"
+    if total_drafted > 0:
+        accept_rate = (total_accepted / total_drafted) * 100.0
+        stats_str += f" | Draft Accept Rate: {accept_rate:.1f}% ({total_accepted}/{total_drafted})"
+    print(stats_str, flush=True)
+    print("-" * 55, flush=True)
+
+    return {
+        "tokens": tok_count,
+        "ttft": ttft,
+        "decode_time": decode_time,
+        "tps": tps,
+        "draft_accept_rate": (total_accepted / total_drafted * 100.0) if total_drafted > 0 else None,
+    }
 
     print("\n" + "-" * 55, flush=True)
     stats_str = f"📊 Tokens: {tok_count} | TTFT: {ttft*1000:.1f} ms | Decode Time: {decode_time:.2f} s | Speed: {tps:.2f} TPS 🚀"
@@ -302,6 +381,7 @@ def main():
 
     tps_results = []
     ttft_results = []
+    global_profiler = Node0Profiler()
 
     try:
         for idx, prompt in enumerate(prompts, 1):
@@ -309,6 +389,7 @@ def main():
             print(f"⚡ BENCHMARK PROMPT {idx}/{len(prompts)}")
             print("=" * 60)
 
+            prompt_profiler = Node0Profiler()
             stats = generate(
                 prompt=prompt,
                 tokenizer=tokenizer,
@@ -318,10 +399,24 @@ def main():
                 temperature=0.0,
                 spec_k=args.spec_k,
                 eos_token_id=eos_id,
+                profiler=prompt_profiler,
             )
             if stats["tokens"] > 1:
                 tps_results.append(stats["tps"])
                 ttft_results.append(stats["ttft"])
+                for i in range(len(prompt_profiler.total_step_times)):
+                    global_profiler.record(
+                        prompt_profiler.embed_times[i],
+                        prompt_profiler.node0_fwd_times[i],
+                        prompt_profiler.cuda_sync_times[i],
+                        prompt_profiler.gpu_to_cpu_times[i],
+                        prompt_profiler.serialize_times[i],
+                        prompt_profiler.tcp_send_times[i],
+                        prompt_profiler.tcp_recv_wait_times[i],
+                        prompt_profiler.total_step_times[i],
+                    )
+
+            prompt_profiler.print_breakdown()
 
         if tps_results:
             print("\n" + "=" * 70)
@@ -332,6 +427,7 @@ def main():
             print(f"  Avg TTFT:              {statistics.mean(ttft_results)*1000:.1f} ms")
             print(f"  Transport:             Direct TCP Relay ({args.relay_host}:{args.relay_port})")
             print("=" * 70)
+            global_profiler.print_breakdown()
 
     finally:
         sock.close()

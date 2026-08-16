@@ -225,6 +225,69 @@ def send_tensor(
     sock.sendall(buf)
 
 
+def send_tensor_timed(
+    sock: socket.socket,
+    tensor: torch.Tensor,
+    draft_tokens: Optional[List[int]] = None,
+) -> dict:
+    """
+    Serialize and send a tensor while measuring exact CUDA sync, GPU->CPU, serialization, and TCP send times.
+    """
+    t_start = time.perf_counter()
+    if tensor.is_cuda:
+        t_sync_0 = time.perf_counter()
+        torch.cuda.synchronize(tensor.device)
+        t_sync_1 = time.perf_counter()
+
+        t_g2c_0 = time.perf_counter()
+        cpu_tensor = tensor.contiguous().cpu()
+        t_g2c_1 = time.perf_counter()
+    else:
+        t_sync_0 = t_sync_1 = t_g2c_0 = t_g2c_1 = time.perf_counter()
+        cpu_tensor = tensor.contiguous()
+
+    t_ser_0 = time.perf_counter()
+    tensor_bytes = cpu_tensor.view(torch.uint8).numpy().tobytes()
+    dtype_code = DTYPE_REVERSE.get(cpu_tensor.dtype, 0)
+    shape = list(cpu_tensor.shape)
+    ndim = len(shape)
+    drafts = draft_tokens or []
+    num_drafts = len(drafts)
+    payload_len = 1 + 2 + (8 * num_drafts) + 1 + (4 * ndim) + 1 + len(tensor_bytes)
+
+    buf = bytearray(LENGTH_PREFIX_SIZE + payload_len)
+    struct.pack_into(LENGTH_PREFIX_FMT, buf, 0, payload_len)
+    offset = LENGTH_PREFIX_SIZE
+    struct.pack_into(">B", buf, offset, MSG_TENSOR)
+    offset += 1
+    struct.pack_into(">H", buf, offset, num_drafts)
+    offset += 2
+    for d in drafts:
+        struct.pack_into(">q", buf, offset, int(d))
+        offset += 8
+    struct.pack_into(">B", buf, offset, ndim)
+    offset += 1
+    for dim in shape:
+        struct.pack_into(">I", buf, offset, int(dim))
+        offset += 4
+    struct.pack_into(">B", buf, offset, dtype_code)
+    offset += 1
+    buf[offset : offset + len(tensor_bytes)] = tensor_bytes
+    t_ser_1 = time.perf_counter()
+
+    t_send_0 = time.perf_counter()
+    sock.sendall(buf)
+    t_send_1 = time.perf_counter()
+
+    return {
+        "cuda_sync_ms": (t_sync_1 - t_sync_0) * 1000.0,
+        "gpu_to_cpu_ms": (t_g2c_1 - t_g2c_0) * 1000.0,
+        "serialize_ms": (t_ser_1 - t_ser_0) * 1000.0,
+        "tcp_send_ms": (t_send_1 - t_send_0) * 1000.0,
+        "total_send_ms": (t_send_1 - t_start) * 1000.0,
+    }
+
+
 def recv_tensor(
     sock: socket.socket,
     shape: Optional[Tuple[int, ...]] = None,
@@ -258,25 +321,72 @@ def recv_tensor(
 
     ndim = struct.unpack_from(">B", payload, offset)[0]
     offset += 1
-    decoded_shape = []
+    shape_dims = []
     for _ in range(ndim):
-        dim = struct.unpack_from(">I", payload, offset)[0]
-        decoded_shape.append(dim)
+        d = struct.unpack_from(">I", payload, offset)[0]
+        shape_dims.append(d)
         offset += 4
+
     dtype_code = struct.unpack_from(">B", payload, offset)[0]
     offset += 1
+    torch_dtype = dtype or DTYPE_MAP.get(dtype_code, torch.float16)
 
-    final_shape = shape if shape is not None else tuple(decoded_shape)
-    final_dtype = dtype if dtype is not None else DTYPE_MAP.get(dtype_code, torch.float16)
-
-    numel = 1
-    for dim in final_shape:
-        numel *= dim
-
-    tensor_data = bytearray(payload[offset:])
-    tensor = torch.frombuffer(tensor_data, dtype=final_dtype, count=numel).reshape(final_shape)
-
+    tensor_data = payload[offset:]
+    tensor = torch.frombuffer(tensor_data, dtype=torch_dtype).reshape(shape_dims).clone()
     return tensor, draft_tokens
+
+
+def recv_tensor_timed(
+    sock: socket.socket,
+    shape: Optional[Tuple[int, ...]] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> Tuple[torch.Tensor, List[int], dict]:
+    """
+    Receive a length-prefixed tensor while measuring exact TCP recv and deserialization times.
+    """
+    t_start = time.perf_counter()
+    len_bytes = recvall(sock, LENGTH_PREFIX_SIZE)
+    payload_len = struct.unpack(LENGTH_PREFIX_FMT, len_bytes)[0]
+    payload = recvall(sock, payload_len)
+    t_recv_1 = time.perf_counter()
+
+    t_deser_0 = time.perf_counter()
+    offset = 0
+    msg_type = struct.unpack_from(">B", payload, offset)[0]
+    offset += 1
+    if msg_type != MSG_TENSOR:
+        raise ValueError(f"Expected MSG_TENSOR (0x01), got msg_type={msg_type}")
+
+    num_drafts = struct.unpack_from(">H", payload, offset)[0]
+    offset += 2
+    draft_tokens: List[int] = []
+    for _ in range(num_drafts):
+        d = struct.unpack_from(">q", payload, offset)[0]
+        draft_tokens.append(d)
+        offset += 8
+
+    ndim = struct.unpack_from(">B", payload, offset)[0]
+    offset += 1
+    shape_dims = []
+    for _ in range(ndim):
+        d = struct.unpack_from(">I", payload, offset)[0]
+        shape_dims.append(d)
+        offset += 4
+
+    dtype_code = struct.unpack_from(">B", payload, offset)[0]
+    offset += 1
+    torch_dtype = dtype or DTYPE_MAP.get(dtype_code, torch.float16)
+
+    tensor_data = payload[offset:]
+    tensor = torch.frombuffer(tensor_data, dtype=torch_dtype).reshape(shape_dims).clone()
+    t_deser_1 = time.perf_counter()
+
+    timings = {
+        "tcp_recv_ms": (t_recv_1 - t_start) * 1000.0,
+        "deserialize_ms": (t_deser_1 - t_deser_0) * 1000.0,
+        "total_recv_ms": (t_deser_1 - t_start) * 1000.0,
+    }
+    return tensor, draft_tokens, timings
 
 
 def send_token(
@@ -303,6 +413,38 @@ def send_token(
     sock.sendall(buf)
 
 
+def send_token_timed(
+    sock: socket.socket,
+    token_id: int,
+    accepted_count: int = 1,
+    is_eos: bool = False,
+) -> dict:
+    """
+    Send a token response (Node 1 -> Node 0) with timing measurement.
+    """
+    t_start = time.perf_counter()
+    payload_len = 1 + 8 + 4 + 1
+    buf = bytearray(LENGTH_PREFIX_SIZE + payload_len)
+    struct.pack_into(LENGTH_PREFIX_FMT, buf, 0, payload_len)
+    struct.pack_into(
+        ">BqIB",
+        buf,
+        LENGTH_PREFIX_SIZE,
+        MSG_TOKEN,
+        int(token_id),
+        int(accepted_count),
+        1 if is_eos else 0,
+    )
+    t_ser_end = time.perf_counter()
+    sock.sendall(buf)
+    t_send_end = time.perf_counter()
+    return {
+        "serialize_ms": (t_ser_end - t_start) * 1000.0,
+        "tcp_send_ms": (t_send_end - t_ser_end) * 1000.0,
+        "total_ms": (t_send_end - t_start) * 1000.0,
+    }
+
+
 def recv_token(sock: socket.socket) -> Tuple[int, int, bool]:
     """
     Receive a token response from peer.
@@ -320,3 +462,28 @@ def recv_token(sock: socket.socket) -> Tuple[int, int, bool]:
 
     token_id, accepted_count, is_eos_val = struct.unpack_from(">qIB", payload, 1)
     return token_id, accepted_count, bool(is_eos_val)
+
+
+def recv_token_timed(sock: socket.socket) -> Tuple[int, int, bool, dict]:
+    """
+    Receive a token response from peer with timing measurement.
+    """
+    t_start = time.perf_counter()
+    len_bytes = recvall(sock, LENGTH_PREFIX_SIZE)
+    payload_len = struct.unpack(LENGTH_PREFIX_FMT, len_bytes)[0]
+    payload = recvall(sock, payload_len)
+    t_recv_end = time.perf_counter()
+
+    t_deser_0 = time.perf_counter()
+    msg_type = struct.unpack_from(">B", payload, 0)[0]
+    if msg_type != MSG_TOKEN:
+        raise ValueError(f"Expected MSG_TOKEN (0x02), got msg_type={msg_type}")
+
+    token_id, accepted_count, is_eos_val = struct.unpack_from(">qIB", payload, 1)
+    t_deser_1 = time.perf_counter()
+    timings = {
+        "tcp_recv_ms": (t_recv_end - t_start) * 1000.0,
+        "deserialize_ms": (t_deser_1 - t_deser_0) * 1000.0,
+        "total_recv_ms": (t_deser_1 - t_start) * 1000.0,
+    }
+    return token_id, accepted_count, bool(is_eos_val), timings

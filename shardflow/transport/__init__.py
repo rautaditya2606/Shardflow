@@ -7,9 +7,13 @@ from shardflow.transport.relay import (
     connect_to_relay,
     handshake,
     send_tensor,
+    send_tensor_timed,
     recv_tensor,
+    recv_tensor_timed,
     send_token,
+    send_token_timed,
     recv_token,
+    recv_token_timed,
     recvall,
 )
 
@@ -20,8 +24,12 @@ __all__ = [
     "connect_to_relay",
     "handshake",
     "send_tensor",
+    "send_tensor_timed",
     "recv_tensor",
+    "recv_tensor_timed",
     "send_token",
+    "send_token_timed",
     "recv_token",
+    "recv_token_timed",
     "recvall",
 ]
