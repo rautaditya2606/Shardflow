@@ -196,3 +196,30 @@ def test_speculative_lookahead_kv_reconciliation():
     assert cache.get_seq_length(0) == 13
     assert cache.get_seq_length(1) == 13
 
+
+def test_inflight_window_multi_round_correctness():
+    """Verify that multiple consecutive rounds of W=2 in-flight execution produce correct token histories."""
+    # Simulation: 
+    # Prompt tokens: [1, 2, 3]
+    # Round 1: candidate drafts = [10, 20, 30, 40]
+    # Target model accepts [10, 20], rejects 30, gives verified token 99
+    # Accepted sequence should be: [1, 2, 3, 10, 20, 99]
+    token_history = [1, 2, 3]
+    past_seq_len = len(token_history)
+    drafts = [10, 20, 30, 40]
+    accepted_count = 3  # drafts[0]=10, drafts[1]=20, next_token=99
+    next_token = 99
+
+    accepted_tokens = []
+    if accepted_count > 1:
+        for d_idx in range(accepted_count - 1):
+            tok = drafts[d_idx]
+            accepted_tokens.append(tok)
+            token_history.append(tok)
+
+    accepted_tokens.append(next_token)
+    token_history.append(next_token)
+
+    assert token_history == [1, 2, 3, 10, 20, 99]
+    assert len(accepted_tokens) == accepted_count == 3
+

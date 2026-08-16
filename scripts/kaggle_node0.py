@@ -373,72 +373,59 @@ def generate(
 
                 # Speculative Continuation during network flight
                 if enable_async_spec and (step + len(drafts) + 1 < max_tokens):
-                    # Speculatively predict continuation candidate from the final draft
-                    assumed_next = drafts[-1]
+                    # Speculatively predict bonus token and continuation candidate from the final draft
                     t_la_d0 = time.perf_counter()
-                    la_drafts = []
+                    la_candidates = []
                     if ngram_sampler and spec_k > 0:
-                        la_drafts = ngram_sampler.find_candidates(token_history + drafts, k=spec_k)
-                    elif async_drafter and spec_k > 0:
-                        la_drafts = async_drafter.sampler.generate_drafts(
-                            assumed_next,
-                            k=spec_k,
-                            temperature=temperature,
-                            top_k=top_k,
-                            top_p=top_p,
-                        )
-                    elif draft_sampler and spec_k > 0:
-                        la_drafts = draft_sampler.generate_drafts(
-                            assumed_next,
-                            k=spec_k,
-                            temperature=temperature,
-                            top_k=top_k,
-                            top_p=top_p,
-                        )
+                        la_candidates = ngram_sampler.find_candidates(token_history + drafts, k=spec_k + 1)
                     t_la_d1 = time.perf_counter()
                     la_draft_ms = (t_la_d1 - t_la_d0) * 1000.0
 
-                    la_cand_tokens = [assumed_next] + la_drafts
-                    la_cand_tensor = torch.tensor([la_cand_tokens], dtype=torch.long, device=node.model_slice.device)
-                    if node.model_slice.embed_tokens is not None:
-                        la_cand_hidden = node.model_slice.embed_tokens(la_cand_tensor)
-                    else:
-                        la_cand_hidden = la_cand_tensor
+                    if la_candidates:
+                        assumed_bonus_token = la_candidates[0]
+                        la_drafts = la_candidates[1:]
 
-                    la_past_seq_len = node._get_cache_seq_len(cache)
-                    t_la_fwd_0 = time.perf_counter()
-                    la_cand_output = node._forward(la_cand_hidden, session_id=session_id, compute_head=False)
-                    if la_cand_output.is_cuda:
-                        torch.cuda.synchronize(la_cand_output.device)
-                    t_la_fwd_1 = time.perf_counter()
+                        la_cand_tokens = [assumed_bonus_token] + la_drafts
+                        la_cand_tensor = torch.tensor([la_cand_tokens], dtype=torch.long, device=node.model_slice.device)
+                        if node.model_slice.embed_tokens is not None:
+                            la_cand_hidden = node.model_slice.embed_tokens(la_cand_tensor)
+                        else:
+                            la_cand_hidden = la_cand_tensor
 
-                    already_sent_la = False
-                    if spec_window >= 2 and la_drafts:
-                        # In-flight transmission of speculative child frame over WAN
-                        send_tensor_timed(
-                            sock,
-                            la_cand_output,
-                            draft_tokens=la_drafts,
-                            round_id=round_counter + 1,
-                            parent_round_id=round_counter,
-                        )
-                        already_sent_la = True
+                        la_past_seq_len = node._get_cache_seq_len(cache)
+                        t_la_fwd_0 = time.perf_counter()
+                        la_cand_output = node._forward(la_cand_hidden, session_id=session_id, compute_head=False)
+                        if la_cand_output.is_cuda:
+                            torch.cuda.synchronize(la_cand_output.device)
+                        t_la_fwd_1 = time.perf_counter()
 
-                    spec_pending = {
-                        "output": la_cand_output,
-                        "drafts": la_drafts,
-                        "cand_tokens": la_cand_tokens,
-                        "assumed_token": assumed_next,
-                        "assumed_accepted": len(drafts) + 1,
-                        "past_seq_len": la_past_seq_len,
-                        "draft_gen_ms": la_draft_ms,
-                        "t_fwd_0": t_la_fwd_0,
-                        "t_fwd_1": t_la_fwd_1,
-                        "valid": False,
-                        "already_sent": already_sent_la,
-                    }
+                        already_sent_la = False
+                        if spec_window >= 2 and la_drafts:
+                            # In-flight transmission of speculative child frame over WAN
+                            send_tensor_timed(
+                                sock,
+                                la_cand_output,
+                                draft_tokens=la_drafts,
+                                round_id=round_counter + 1,
+                                parent_round_id=round_counter,
+                            )
+                            already_sent_la = True
 
-                # Receive verification from Node 1
+                        spec_pending = {
+                            "output": la_cand_output,
+                            "drafts": la_drafts,
+                            "cand_tokens": la_cand_tokens,
+                            "assumed_token": assumed_bonus_token,
+                            "assumed_accepted": len(drafts) + 1,
+                            "past_seq_len": la_past_seq_len,
+                            "draft_gen_ms": la_draft_ms,
+                            "t_fwd_0": t_la_fwd_0,
+                            "t_fwd_1": t_la_fwd_1,
+                            "valid": False,
+                            "already_sent": already_sent_la,
+                        }
+
+                # Receive verification from Node 1 with frame reordering guard
                 while True:
                     if receiver is not None:
                         next_token, accepted_count, is_eos, recv_stats = receiver.get()
@@ -446,44 +433,37 @@ def generate(
                         next_token, accepted_count, is_eos, recv_stats = recv_token_timed(sock)
                     
                     if recv_stats.get("is_stale_discard", False):
-                        # Node 1 discarded stale speculative frame; wait for primary response
+                        # Node 1 discarded stale speculative frame; continue to active response
                         continue
                     break
 
                 total_accepted += max(0, accepted_count - 1)
 
                 # Reconcile speculation: atomic single-depth commit or rollback
+                is_full_hit = (accepted_count == len(drafts) + 1) and not is_eos
                 if spec_pending is not None:
-                    if accepted_count == spec_pending["assumed_accepted"] and not is_eos and next_token == spec_pending["assumed_token"]:
+                    if is_full_hit and (next_token == spec_pending["assumed_token"]):
                         # Full hit! Lookahead is confirmed valid
                         spec_pending["valid"] = True
                     else:
-                        # Partial hit or mismatch: rollback KV cache
+                        # Partial hit or mismatch: rollback KV cache to true committed length
+                        committed_len = past_seq_len + accepted_count
                         if cache is not None:
-                            rewind_kv_cache(cache, past_seq_len + accepted_count)
+                            rewind_kv_cache(cache, committed_len)
                         if async_drafter:
-                            async_drafter.rewind(past_seq_len + accepted_count)
+                            async_drafter.rewind(committed_len)
                             pending_draft_job = async_drafter.submit(next_token, k=spec_k, temperature=temperature, top_k=top_k, top_p=top_p)
                         elif draft_sampler:
                             draft_target = draft_sampler.seq_len - len(drafts) - len(spec_pending["drafts"]) + (accepted_count - 1)
                             draft_sampler.rewind(draft_target)
                         spec_pending = None
                 else:
+                    committed_len = past_seq_len + accepted_count
                     if cache is not None:
-                        rewind_kv_cache(cache, past_seq_len + accepted_count)
-                    if accepted_count == len(drafts) + 1 and not is_eos:
-                        # Full hit without spec_pending
-                        pass
-                    else:
-                        # Partial hit or mismatch: rewind draft model
+                        rewind_kv_cache(cache, committed_len)
+                    if not is_full_hit:
                         if async_drafter:
-                            async_drafter.rewind(past_seq_len + accepted_count)
-                            pending_draft_job = async_drafter.submit(next_token, k=spec_k, temperature=temperature, top_k=top_k, top_p=top_p)
-                        elif draft_sampler:
-                            draft_target = draft_sampler.seq_len - len(drafts) + (accepted_count - 1)
-                            draft_sampler.rewind(draft_target)
-                        if async_drafter:
-                            async_drafter.rewind(past_seq_len + accepted_count)
+                            async_drafter.rewind(committed_len)
                             pending_draft_job = async_drafter.submit(next_token, k=spec_k, temperature=temperature, top_k=top_k, top_p=top_p)
                         elif draft_sampler:
                             draft_target = draft_sampler.seq_len - len(drafts) + (accepted_count - 1)
