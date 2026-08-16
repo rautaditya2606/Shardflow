@@ -148,20 +148,38 @@ def connect_to_relay(
 
 def handshake(sock: socket.socket, timeout: float = 60.0) -> None:
     """
-    Execute symmetric two-way READY handshake with the peer node through the relay.
-
-    Both nodes send b"READY" and both nodes wait to receive b"READY".
-    Confirms that both Node 0 and Node 1 are paired and ready before inference starts.
+    Execute robust symmetric two-way READY handshake with the peer node through the relay.
+    Sends READY ping periodically until ACK is received from peer.
     """
     orig_timeout = sock.gettimeout()
-    sock.settimeout(timeout)
+    sock.settimeout(0.5)
+    t_start = time.perf_counter()
+    logger.info("Sending READY handshake to peer through relay...")
+
+    received = bytearray()
     try:
-        logger.info("Sending READY handshake to peer through relay...")
-        sock.sendall(b"READY")
-        ack = recvall(sock, 5)
-        if ack != b"READY":
-            raise ConnectionError(f"Handshake failed: expected b'READY', received {ack!r}")
-        logger.info("✅ Handshake successful: Peer node is READY!")
+        while (time.perf_counter() - t_start) < timeout:
+            try:
+                sock.sendall(b"READY")
+            except Exception:
+                pass
+
+            try:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    raise ConnectionError("Socket closed during handshake.")
+                received.extend(chunk)
+                if b"READY" in received:
+                    try:
+                        sock.sendall(b"READY")
+                    except Exception:
+                        pass
+                    logger.info("✅ Handshake successful: Peer node is READY!")
+                    return
+            except socket.timeout:
+                continue
+
+        raise TimeoutError(f"Handshake timed out after {timeout}s waiting for peer node.")
     finally:
         sock.settimeout(orig_timeout)
 
