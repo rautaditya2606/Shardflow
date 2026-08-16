@@ -14,15 +14,50 @@ A high-performance, general-purpose distributed LLM inference framework that par
 
 ShardFlow combines **neural speculative decoding ($K=8$ on dual-GPU nodes)**, **zero-copy binary tensor serialization**, and **high-throughput TCP relay transport** to overcome wide-area network latency (WAN) and deliver interactive LLM inference speeds across separate cloud data centers.
 
-> **Live Verified Benchmark (Trans-Continental WAN):** **14.31 TPS** peak (**11.91 TPS** average, **4.36 tokens/round**, **58.0% acceptance rate**) running `Qwen2.5-7B-Instruct` in native FP16 across two geographically separated Kaggle notebook instances (Iowa <-> Oregon) communicating through an AWS EC2 `t3.micro` instance (us-east-2, Ohio) running our zero-copy Rust TCP Relay over an **~86 ms public Internet RTT**.
+---
+
+### Quick Summary
+
+| Metric | Non-Speculative Baseline ($K=0$) | ShardFlow Speculative ($K=8$) | Improvement |
+|---|:---:|:---:|:---:|
+| **Peak Throughput** | 4.92 TPS | **14.31 TPS** | **2.91x** |
+| **Average Throughput** | 4.92 TPS | **11.91 TPS** | **2.42x** |
+| **Tokens per WAN Round-Trip** | 1.00 tok/round | **4.36 tok/round** | **4.36x** |
+| **Draft Model Accept Rate** | N/A | **58.0%** (Peak) / 44.5% (Avg) | - |
+| **Cluster Setup** | 2x Free Kaggle T4 Instances + AWS EC2 `t3.micro` Relay (`us-east-2` Ohio) | | |
+| **Target / Draft Models** | `Qwen2.5-7B-Instruct` (FP16) / `Qwen2.5-0.5B-Instruct` (FP16) | | |
+| **Network Link** | Public Internet WAN (Iowa <-> Ohio <-> Oregon, ~86 ms RTT) | | |
 
 ---
 
-## Live Verified Empirical Results
+## Table of Contents
 
-### 1. Speculative Decoding Sweeps across Public WAN ($K \in \{0, 5, 8, 10, 12\}$)
+1. [Empirical Benchmark Results (14.31 TPS Peak)](#1-empirical-benchmark-results)
+   - [Head-to-Head Comparison](#head-to-head-comparison)
+   - [Prompt-by-Prompt Breakdown](#prompt-by-prompt-breakdown)
+   - [Speculative Depth Scaling (K-Sweep)](#speculative-depth-scaling-k-sweep)
+2. [System Architecture](#2-system-architecture)
+   - [Data Flow Diagram](#data-flow-diagram)
+   - [Cluster Node Roles](#cluster-node-roles)
+3. [Key Technical Innovations](#3-key-technical-innovations)
+   - [Dual-GPU Pipelined Drafting](#1-dual-gpu-pipelined-draft-generation)
+   - [Exact KV Cache Synchronization and Rollback](#2-exact-kv-cache-synchronization--rollback)
+   - [AWS EC2 Zero-Copy TCP Relay Transport](#3-aws-ec2-tcp-relay-transport-t3micro-us-east-2-ohio)
+   - [Zero-RAM Meta-Device Model Slicing](#4-zero-ram-meta-device-model-slicing)
+4. [Quickstart: Reproduce on 2 Free Kaggle Instances](#4-quickstart-reproduce-live-cross-kaggle-benchmark)
+   - [Step 1: Start Node 1](#step-1-on-kaggle-instance-b-terminal-node-1)
+   - [Step 2: Start Node 0](#step-2-on-kaggle-instance-a-initiator-node-0--05b-drafter)
+5. [OpenAI-Compatible API Usage](#5-openai-compatible-api-usage)
+6. [Local Development & Test Suite](#6-local-development--test-suite)
+7. [License](#7-license)
 
-Live benchmark of **Qwen2.5-7B-Instruct (14 layers on Node 0, 14 layers + Head on Node 1)** drafted by **Qwen2.5-0.5B-Instruct ($K=8$)** across Google Cloud data centers:
+---
+
+## 1. Empirical Benchmark Results
+
+### Head-to-Head Comparison
+
+Live benchmark evaluating **Qwen2.5-7B-Instruct** partitioned across two separate Google Cloud regions (Iowa and Oregon) communicating through an AWS EC2 `t3.micro` TCP Relay in Ohio:
 
 ```
 ===================================================================================================================
@@ -34,17 +69,17 @@ Window |    TPS | TTFT (ms) | Tok/Round | Full Hit % | Bubble (ms) | N0 Fwd (ms)
 ===================================================================================================================
 ```
 
-#### Detailed Breakdown by Prompt Type:
+### Prompt-by-Prompt Breakdown
 
-| Prompt Topic | Domain | Accept Rate | Accepted Drafts | Total Tokens | Decode Time | Speed |
+| Test Prompt Topic | Domain | Draft Accept Rate | Accepted Drafts | Total Generated | Decode Time | Measured Speed |
 |---|---|:---:|:---:|:---:|:---:|:---:|
-| **Explain Quantum Entanglement** | Conceptual / Science | **58.0%** | 51 / 88 | 63 tokens | 4.33 s | **14.31 TPS** |
-| **Fibonacci Dynamic Programming** | Python Code Gen | **47.1%** | 49 / 104 | 63 tokens | 4.89 s | **12.67 TPS** |
+| **Explain Quantum Entanglement** | Conceptual / Physics | **58.0%** | 51 / 88 | 63 tokens | 4.33 s | **14.31 TPS** |
+| **Fibonacci Dynamic Programming** | Python Algorithm | **47.1%** | 49 / 104 | 63 tokens | 4.89 s | **12.67 TPS** |
 | **Pipeline Parallelism Advantages** | Technical LLM Systems | **28.5%** | 41 / 144 | 60 tokens | 6.73 s | **8.77 TPS** |
 
-#### Comparison against Autoregressive Baseline ($K=0$ vs $K=8$):
+### Speculative Depth Scaling (K-Sweep)
 
-| Configuration | Draft Model | Speculative $K$ | Avg Tok/Round | Avg RTT | Throughput | Speedup |
+| Configuration | Draft Model | Speculative $K$ | Avg Tok/Round | Avg Step RTT | Throughput | Speedup vs Baseline |
 |---|---|:---:|:---:|:---:|:---:|:---:|
 | **Non-Speculative Baseline** | None (Single token) | $K=0$ | 1.00 | 203 ms | **4.92 TPS** | 1.00x |
 | **N-gram Speculation** | N-gram Matcher | $K=4$ | 1.66 | 215 ms | **7.72 TPS** | 1.57x |
@@ -54,7 +89,9 @@ Window |    TPS | TTFT (ms) | Tok/Round | Full Hit % | Bubble (ms) | N0 Fwd (ms)
 
 ---
 
-## System Architecture
+## 2. System Architecture
+
+### Data Flow Diagram
 
 ```mermaid
 graph TD
@@ -107,9 +144,20 @@ graph TD
     N0_LAYERS -->|"7. Stream Output Tokens"| C
 ```
 
+### Cluster Node Roles
+
+- **Kaggle Node 0 (Iowa, GCP)**:
+  - `cuda:0`: Computes initial prompt embeddings and target model layers $[0, 14)$ in FP16 ($7.64\text{ GB}$ VRAM).
+  - `cuda:1`: Dedicated to `DraftSampler` (`Qwen2.5-0.5B-Instruct`) in FP16 ($0.98\text{ GB}$ VRAM), generating $K=8$ candidate tokens per step with zero VRAM contention.
+- **AWS EC2 TCP Relay (`t3.micro`, `us-east-2` Ohio)**:
+  - Low-latency Rust socket forwarder that pairs Node 0 and Node 1 across NAT firewalls with zero packet payload copies.
+- **Kaggle Node 1 (Oregon, GCP)**:
+  - `cuda:0`: Computes terminal target layers $[14, 28) + \text{RMSNorm} + \text{LM Head}$ in FP16 ($7.64\text{ GB}$ VRAM).
+  - Causal Verifier: Verifies all $K$ candidates in parallel via single-pass argmax and rolls back rejected KV states.
+
 ---
 
-## Core Technical Innovations
+## 3. Key Technical Innovations
 
 ### 1. Dual-GPU Pipelined Draft Generation
 On Node 0 (which has 2x T4 GPUs on Kaggle), we place the 7B target model slice on `cuda:0` and the 0.5B draft model (`Qwen2.5-0.5B-Instruct`) on `cuda:1`.
@@ -140,7 +188,7 @@ Cloud notebooks (Kaggle/Colab) do not expose public IP addresses or open inbound
 
 ---
 
-## Quickstart: Reproduce Live Cross-Kaggle Benchmark
+## 4. Quickstart: Reproduce Live Cross-Kaggle Benchmark
 
 Run a 7B parameter model in native FP16 across two separate Kaggle notebook instances using the AWS EC2 TCP relay:
 
@@ -190,7 +238,7 @@ os.environ["HF_HOME"] = "/kaggle/working/hf_home"
 
 ---
 
-## OpenAI-Compatible API Usage
+## 5. OpenAI-Compatible API Usage
 
 ShardFlow exposes standard OpenAI-compatible endpoints (`POST /v1/chat/completions`) for seamless integration with client applications:
 
@@ -218,7 +266,7 @@ print()
 
 ---
 
-## Local Development & Test Suite
+## 6. Local Development & Test Suite
 
 Run the full unit test suite (testing auto-partitioning, KV pool management, protocol framing, and speculative verification):
 
@@ -236,6 +284,6 @@ python -m pytest -p no:opik tests/unit
 
 ---
 
-## License
+## 7. License
 
 Distributed under the [MIT License](LICENSE).
