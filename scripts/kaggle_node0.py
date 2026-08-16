@@ -220,6 +220,7 @@ def generate(
     profiler: Optional[Node0Profiler] = None,
     receiver: Optional[AsyncTokenReceiver] = None,
     enable_async_spec: bool = False,
+    spec_window: int = 1,
 ) -> dict:
     """Generate tokens for a prompt through the distributed relay pipeline with error handling."""
     session_id = f"relay_session_{int(time.time()*1000)}"
@@ -282,6 +283,7 @@ def generate(
         # 2. Autoregressive Decode Loop
         step = 1
         spec_pending = None
+        round_counter = 1
 
         while step < max_tokens and not is_eos:
             if next_token == eos_token_id:
@@ -293,7 +295,7 @@ def generate(
             draft_wait_ms = 0.0
 
             if spec_pending is not None and spec_pending.get("valid", False):
-                # ponytail: Reuse speculative lookahead computed during previous network flight!
+                # Reuse speculative lookahead computed during previous network flight
                 cand_output = spec_pending["output"]
                 drafts = spec_pending["drafts"]
                 draft_gen_ms = spec_pending.get("draft_gen_ms", 0.0)
@@ -301,10 +303,15 @@ def generate(
                 t_fwd_0 = time.perf_counter()
                 t_fwd_1 = t_fwd_0
                 past_seq_len = spec_pending["past_seq_len"]
+                in_flight_already_sent = spec_pending.get("already_sent", False)
                 spec_pending = None
 
                 total_drafted += len(drafts)
-                send_stats = send_tensor_timed(sock, cand_output, draft_tokens=drafts)
+                round_counter += 1
+                if not in_flight_already_sent:
+                    send_stats = send_tensor_timed(sock, cand_output, draft_tokens=drafts, round_id=round_counter, parent_round_id=0)
+                else:
+                    send_stats = {"cuda_sync_ms": 0.0, "gpu_to_cpu_ms": 0.0, "serialize_ms": 0.0, "tcp_send_ms": 0.0, "total_send_ms": 0.0}
             else:
                 t_draft_0 = time.perf_counter()
                 if ngram_sampler and spec_k > 0:
@@ -351,7 +358,8 @@ def generate(
                         torch.cuda.synchronize(cand_output.device)
                     t_fwd_1 = time.perf_counter()
 
-                    send_stats = send_tensor_timed(sock, cand_output, draft_tokens=drafts)
+                    round_counter += 1
+                    send_stats = send_tensor_timed(sock, cand_output, draft_tokens=drafts, round_id=round_counter, parent_round_id=0)
                 else:
                     cand_output = None
 
@@ -363,18 +371,18 @@ def generate(
                     assumed_next = drafts[-1]
                     pending_draft_job = async_drafter.submit(assumed_next, k=spec_k, temperature=temperature, top_k=top_k, top_p=top_p)
 
-                # Phase 5A: Single Speculative Continuation (Depth = 1) during network flight
+                # Speculative Continuation during network flight
                 if enable_async_spec and (step + len(drafts) + 1 < max_tokens):
-                    # Speculatively predict exactly ONE continuation token E from the final draft
+                    # Speculatively predict continuation candidate from the final draft
                     assumed_next = drafts[-1]
                     t_la_d0 = time.perf_counter()
                     la_drafts = []
                     if ngram_sampler and spec_k > 0:
-                        la_drafts = ngram_sampler.find_candidates(token_history + drafts, k=1)
+                        la_drafts = ngram_sampler.find_candidates(token_history + drafts, k=spec_k)
                     elif async_drafter and spec_k > 0:
                         la_drafts = async_drafter.sampler.generate_drafts(
                             assumed_next,
-                            k=1,
+                            k=spec_k,
                             temperature=temperature,
                             top_k=top_k,
                             top_p=top_p,
@@ -382,7 +390,7 @@ def generate(
                     elif draft_sampler and spec_k > 0:
                         la_drafts = draft_sampler.generate_drafts(
                             assumed_next,
-                            k=1,
+                            k=spec_k,
                             temperature=temperature,
                             top_k=top_k,
                             top_p=top_p,
@@ -404,6 +412,18 @@ def generate(
                         torch.cuda.synchronize(la_cand_output.device)
                     t_la_fwd_1 = time.perf_counter()
 
+                    already_sent_la = False
+                    if spec_window >= 2 and la_drafts:
+                        # In-flight transmission of speculative child frame over WAN
+                        send_tensor_timed(
+                            sock,
+                            la_cand_output,
+                            draft_tokens=la_drafts,
+                            round_id=round_counter + 1,
+                            parent_round_id=round_counter,
+                        )
+                        already_sent_la = True
+
                     spec_pending = {
                         "output": la_cand_output,
                         "drafts": la_drafts,
@@ -415,22 +435,30 @@ def generate(
                         "t_fwd_0": t_la_fwd_0,
                         "t_fwd_1": t_la_fwd_1,
                         "valid": False,
+                        "already_sent": already_sent_la,
                     }
 
                 # Receive verification from Node 1
-                if receiver is not None:
-                    next_token, accepted_count, is_eos, recv_stats = receiver.get()
-                else:
-                    next_token, accepted_count, is_eos, recv_stats = recv_token_timed(sock)
+                while True:
+                    if receiver is not None:
+                        next_token, accepted_count, is_eos, recv_stats = receiver.get()
+                    else:
+                        next_token, accepted_count, is_eos, recv_stats = recv_token_timed(sock)
+                    
+                    if recv_stats.get("is_stale_discard", False):
+                        # Node 1 discarded stale speculative frame; wait for primary response
+                        continue
+                    break
+
                 total_accepted += max(0, accepted_count - 1)
 
                 # Reconcile speculation: atomic single-depth commit or rollback
                 if spec_pending is not None:
                     if accepted_count == spec_pending["assumed_accepted"] and not is_eos and next_token == spec_pending["assumed_token"]:
-                        # Full hit! Single continuation lookahead is valid
+                        # Full hit! Lookahead is confirmed valid
                         spec_pending["valid"] = True
                     else:
-                        # Partial hit or mismatch: single-slice rollback
+                        # Partial hit or mismatch: rollback KV cache
                         if cache is not None:
                             rewind_kv_cache(cache, past_seq_len + accepted_count)
                         if async_drafter:
@@ -444,10 +472,16 @@ def generate(
                     if cache is not None:
                         rewind_kv_cache(cache, past_seq_len + accepted_count)
                     if accepted_count == len(drafts) + 1 and not is_eos:
-                        # Full hit without spec_pending: background draft job on cuda:1 is valid!
+                        # Full hit without spec_pending
                         pass
                     else:
-                        # Partial hit or mismatch: rewind draft model and submit fresh job for verified next_token
+                        # Partial hit or mismatch: rewind draft model
+                        if async_drafter:
+                            async_drafter.rewind(past_seq_len + accepted_count)
+                            pending_draft_job = async_drafter.submit(next_token, k=spec_k, temperature=temperature, top_k=top_k, top_p=top_p)
+                        elif draft_sampler:
+                            draft_target = draft_sampler.seq_len - len(drafts) + (accepted_count - 1)
+                            draft_sampler.rewind(draft_target)
                         if async_drafter:
                             async_drafter.rewind(past_seq_len + accepted_count)
                             pending_draft_job = async_drafter.submit(next_token, k=spec_k, temperature=temperature, top_k=top_k, top_p=top_p)
@@ -596,9 +630,9 @@ def main():
     parser.add_argument("--cuda-graphs", action="store_true", default=False, help="Enable CUDA Graphs and Static KV cache")
     parser.add_argument("--no-cuda-graphs", action="store_false", dest="cuda_graphs", help="Disable CUDA Graphs and use DynamicCache fallback (default)")
     parser.add_argument("--static-kv", action="store_true", default=False, help="Enable Static KV cache on GPU")
-    parser.add_argument("--no-static-kv", action="store_false", dest="static_kv", help="Disable Static KV cache")
     parser.add_argument("--async-recv", action="store_true", default=False, help="Enable asynchronous token receiver thread")
     parser.add_argument("--async-spec", action="store_true", default=False, help="Enable one-step-ahead speculative execution during network flight")
+    parser.add_argument("--spec-window", type=int, default=1, help="In-flight speculative window depth (default: 1, e.g. 1, 2, 3)")
     args = parser.parse_args()
 
     model_path = args.model if os.path.exists(args.model) else args.model
@@ -726,6 +760,7 @@ def main():
                 profiler=prompt_profiler,
                 receiver=receiver,
                 enable_async_spec=args.async_spec,
+                spec_window=args.spec_window,
             )
             if stats["tokens"] > 1:
                 tps_results.append(stats["tps"])

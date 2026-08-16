@@ -202,6 +202,7 @@ def main():
 
             session_id = "relay_session"
             step = 0
+            last_verified_round_id = 0
 
             while True:
                 # 1. Receive activation tensor from Node 0 timed
@@ -211,12 +212,29 @@ def main():
                     logger.warning("Relay connection closed by peer. Waiting to reconnect...")
                     break
 
+                round_id = recv_stats.get("round_id", 0)
+                parent_round_id = recv_stats.get("parent_round_id", 0)
+
                 # If this is an initial prompt prefill (length > 1 and no drafts), reset KV cache and print profiler summary of previous prompt
                 if tensor.shape[1] > 1 and not drafts:
                     if step > 0:
                         profiler.print_breakdown()
                     node.kv_store.evict(session_id)
                     step = 0
+                    last_verified_round_id = 0
+
+                # Check if this in-flight child was predicated on a mismatched parent round
+                if parent_round_id > 0 and parent_round_id != last_verified_round_id:
+                    send_token_timed(
+                        sock,
+                        token_id=0,
+                        accepted_count=0,
+                        is_eos=False,
+                        compute_ms=0.0,
+                        round_id=round_id,
+                        is_stale_discard=True,
+                    )
+                    continue
 
                 t_step_0 = time.perf_counter()
 
@@ -271,11 +289,24 @@ def main():
                         past_seq_before = int(past_seq or 0) - (len(drafts) + 1)
                         rewind_kv_cache(cache, past_seq_before + accepted_count)
 
+                    if accepted_count == len(drafts) + 1:
+                        last_verified_round_id = round_id
+                    else:
+                        last_verified_round_id = 0
+
                     is_eos = (next_token == args.eos_token_id)
                     t_head_1 = time.perf_counter()
                     node1_compute_ms = (t_head_1 - t_c2g_0) * 1000.0
 
-                    send_stats = send_token_timed(sock, next_token, accepted_count=accepted_count, is_eos=is_eos, compute_ms=node1_compute_ms)
+                    send_stats = send_token_timed(
+                        sock,
+                        next_token,
+                        accepted_count=accepted_count,
+                        is_eos=is_eos,
+                        compute_ms=node1_compute_ms,
+                        round_id=round_id,
+                        is_stale_discard=False,
+                    )
                     t_step_1 = time.perf_counter()
                     step += accepted_count
 
