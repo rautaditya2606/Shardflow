@@ -362,9 +362,8 @@ def generate(
                 if cache is not None:
                     rewind_kv_cache(cache, committed_len)
 
-                draft_rewind_len = past_seq_len + accepted_count - 1
-                if draft_sampler:
-                    draft_sampler.rewind(draft_rewind_len)
+                if draft_sampler is not None:
+                    draft_sampler.rewind(committed_len)
 
                 if drafts and accepted_count > 1:
                     for d_idx in range(accepted_count - 1):
