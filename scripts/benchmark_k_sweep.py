@@ -37,7 +37,7 @@ from shardflow.transport.relay import (
     connect_to_relay,
     handshake,
 )
-from scripts.kaggle_node0 import Node0Profiler, generate
+from scripts.kaggle_node0 import Node0Profiler, generate, AsyncTokenReceiver
 
 
 # ponytail: concise benchmark runner that reuses loaded model across K configurations
