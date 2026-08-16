@@ -104,6 +104,8 @@ def main():
         model_path=model_path,
         layer_start=layer_start,
         layer_end=layer_end,
+        include_norm=(layer_end == total_layers),
+        include_lm_head=(layer_end == total_layers),
         device=args.device,
         dtype=target_dtype,
         load_in_4bit=getattr(args, "4bit", False),
@@ -122,8 +124,6 @@ def main():
             config=model_slice.config,
             device=model_slice.device,
             dtype=target_dtype,
-            max_sessions=4,
-            max_seq_len=2048,
         )
 
     # 3. Connect to Relay and enter compute loop with automatic reconnection
@@ -146,6 +146,11 @@ def main():
                 except (ConnectionError, EOFError):
                     logger.warning("Relay connection closed by peer. Waiting to reconnect...")
                     break
+
+                # If this is a prefill sequence (length > 1), reset KV cache for clean generation
+                if tensor.shape[1] > 1:
+                    node.kv_store.evict(session_id)
+                    step = 0
 
                 step += 1
                 t_fwd_start = time.perf_counter()

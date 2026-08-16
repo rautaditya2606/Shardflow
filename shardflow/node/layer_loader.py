@@ -354,6 +354,11 @@ def load_layer_slice(
     if layer_start == 0:
         include_embed = True
 
+    # Terminal node (layer_end == total_layers) owns final norm and LM head
+    if layer_end == total_layers:
+        include_norm = True
+        include_lm_head = True
+
     if layer_start < 0 or layer_end > total_layers or layer_start >= layer_end:
         raise ValueError(
             f"Invalid layer range [{layer_start}, {layer_end}) "

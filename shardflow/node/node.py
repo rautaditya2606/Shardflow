@@ -257,39 +257,33 @@ class PipelineNode:
             return None
 
     def _get_cache_seq_len(self, cache) -> int:
-        """Get sequence length for this node's slice layer_start."""
+        """Get sequence length for this node's layer slice cache."""
         if cache is None:
             return 0
-        l_idx = self.model_slice.layer_start
-        if hasattr(cache, "layers") and l_idx < len(cache.layers):
-            try:
-                seq = cache.layers[l_idx].get_seq_length()
-                if isinstance(seq, torch.Tensor):
-                    return int(seq.item())
-                if seq is not None:
-                    return int(seq)
-            except Exception:
-                pass
         if hasattr(cache, "get_seq_length"):
             try:
-                seq = cache.get_seq_length(l_idx)
+                seq = cache.get_seq_length()
                 if isinstance(seq, torch.Tensor):
                     return int(seq.item())
-                if seq is not None:
+                if seq is not None and int(seq) > 0:
                     return int(seq)
             except Exception:
                 pass
-            if l_idx == 0:
-                try:
-                    seq = cache.get_seq_length()
-                    if isinstance(seq, torch.Tensor):
-                        return int(seq.item())
-                    if seq is not None:
-                        return int(seq)
-                except Exception:
-                    pass
+            try:
+                seq = cache.get_seq_length(0)
+                if isinstance(seq, torch.Tensor):
+                    return int(seq.item())
+                if seq is not None and int(seq) > 0:
+                    return int(seq)
+            except Exception:
+                pass
         if hasattr(cache, "_seen_tokens") and cache._seen_tokens is not None:
             return int(cache._seen_tokens)
+        if hasattr(cache, "key_cache") and len(cache.key_cache) > 0:
+            try:
+                return int(cache.key_cache[0].shape[-2])
+            except Exception:
+                pass
         return 0
 
     async def _handle_message(self, msg: TensorMessage) -> Optional[TensorMessage]:

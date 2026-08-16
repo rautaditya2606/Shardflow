@@ -284,8 +284,6 @@ def main():
             config=model_slice.config,
             device=model_slice.device,
             dtype=target_dtype,
-            max_sessions=4,
-            max_seq_len=2048,
         )
 
     # 4. Connect to Relay and perform handshake with Node 1
