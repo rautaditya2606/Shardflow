@@ -1,0 +1,322 @@
+"""
+ShardFlow v2 — TCP Relay Transport Layer.
+
+Provides direct TCP transport through the Rust relay running on EC2 (or private host).
+Implements length-prefixed tensor framing, symmetric READY handshakes, socket buffer optimizations,
+socket timeout guards, and zero-copy tensor serialization.
+"""
+
+import socket
+import struct
+import logging
+from typing import Optional, Tuple, List, Union
+import torch
+
+logger = logging.getLogger(__name__)
+
+# Default EC2 Relay Configuration (AWS Elastic IP)
+RELAY_HOST = "3.23.174.207"
+RELAY_PORT = 9500
+AUTH_BYTE = bytes([0xAD])
+
+# Default Socket Timeout in seconds (prevents hanging if a Kaggle session dies)
+SOCKET_DATA_TIMEOUT = 30.0
+
+# Wire Framing Constants (8-byte big-endian unsigned 64-bit length prefix)
+LENGTH_PREFIX_FMT = ">Q"
+LENGTH_PREFIX_SIZE = 8
+
+# Message Types
+MSG_TENSOR = 0x01
+MSG_TOKEN = 0x02
+MSG_CONTROL = 0x03
+
+# Supported Dtypes Map
+DTYPE_MAP = {
+    0: torch.float16,
+    1: torch.bfloat16,
+    2: torch.float32,
+    3: torch.int64,
+    4: torch.int32,
+}
+DTYPE_REVERSE = {v: k for k, v in DTYPE_MAP.items()}
+
+
+def configure_socket(sock: socket.socket, data_timeout: float = SOCKET_DATA_TIMEOUT) -> None:
+    """Apply high-performance low-latency TCP socket configurations and data timeout."""
+    # Disable Nagle's algorithm for immediate transmission of ~10KB activation frames
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception as e:
+        logger.debug("Failed to set TCP_NODELAY: %s", e)
+
+    # Enable TCP Keepalive
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except Exception as e:
+        logger.debug("Failed to set SO_KEEPALIVE: %s", e)
+
+    # Linux-specific keepalive intervals
+    if hasattr(socket, "TCP_KEEPIDLE"):
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        except Exception:
+            pass
+
+    # Linux QUICKACK for eliminating delayed ACK pauses
+    if hasattr(socket, "TCP_QUICKACK"):
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+        except Exception:
+            pass
+
+    # Expand OS socket buffer sizes to 4MB to fit large prompt prefill activations in one write
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+    except Exception as e:
+        logger.debug("Failed to expand socket buffers: %s", e)
+
+    # Apply socket timeout
+    sock.settimeout(data_timeout)
+
+
+def recvall(sock: socket.socket, n: int) -> bytes:
+    """
+    Read exactly n bytes from a TCP socket.
+    Raises TimeoutError with actionable diagnostics if socket times out.
+    """
+    buf = bytearray(n)
+    view = memoryview(buf)
+    pos = 0
+    try:
+        while pos < n:
+            nbytes = sock.recv_into(view[pos:], n - pos)
+            if nbytes == 0:
+                raise ConnectionError(
+                    f"Socket connection closed unexpectedly after reading {pos}/{n} bytes. "
+                    "The remote node or relay connection was terminated."
+                )
+            pos += nbytes
+        return bytes(buf)
+    except socket.timeout as e:
+        raise TimeoutError(
+            f"Socket timed out while waiting for data ({pos}/{n} bytes read). "
+            f"The peer Kaggle session or relay may have died, timed out, or disconnected."
+        ) from e
+
+
+def connect_to_relay(
+    host: str = RELAY_HOST,
+    port: int = RELAY_PORT,
+    auth_byte: bytes = AUTH_BYTE,
+    connect_timeout: float = 30.0,
+    data_timeout: float = SOCKET_DATA_TIMEOUT,
+) -> socket.socket:
+    """
+    Create TCP socket, configure TCP_NODELAY, connect to relay, and send auth byte.
+
+    Args:
+        host: Relay IP address or hostname (default: 3.23.174.207)
+        port: Relay port (default: 9500)
+        auth_byte: 1-byte authorization token (default: 0xAD)
+        connect_timeout: Timeout for initial socket connection
+        data_timeout: Timeout for subsequent send/recv operations (default: 30s)
+
+    Returns:
+        Connected and configured socket.socket
+    """
+    logger.info("Connecting to TCP relay at %s:%d ...", host, port)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(connect_timeout)
+
+    try:
+        sock.connect((host, port))
+        # Send auth byte immediately to claim/pair slot on relay
+        sock.sendall(auth_byte)
+        # Apply full socket tuning + data timeout
+        configure_socket(sock, data_timeout=data_timeout)
+        logger.info("✅ Connected to relay at %s:%d (auth byte sent, timeout=%0.1fs)", host, port, data_timeout)
+        return sock
+    except Exception as e:
+        sock.close()
+        raise ConnectionError(f"Failed to connect to relay at {host}:{port}: {e}") from e
+
+
+def handshake(sock: socket.socket, timeout: float = 60.0) -> None:
+    """
+    Execute symmetric two-way READY handshake with the peer node through the relay.
+
+    Both nodes send b"READY" and both nodes wait to receive b"READY".
+    Confirms that both Node 0 and Node 1 are paired and ready before inference starts.
+    """
+    orig_timeout = sock.gettimeout()
+    sock.settimeout(timeout)
+    try:
+        logger.info("Sending READY handshake to peer through relay...")
+        sock.sendall(b"READY")
+        ack = recvall(sock, 5)
+        if ack != b"READY":
+            raise ConnectionError(f"Handshake failed: expected b'READY', received {ack!r}")
+        logger.info("✅ Handshake successful: Peer node is READY!")
+    finally:
+        sock.settimeout(orig_timeout)
+
+
+def send_tensor(
+    sock: socket.socket,
+    tensor: torch.Tensor,
+    draft_tokens: Optional[List[int]] = None,
+) -> None:
+    """
+    Serialize and send a tensor with 8-byte big-endian length prefix framing.
+
+    Wire layout:
+      [8 bytes: Total Payload Length (>Q)]
+      [1 byte:  MSG_TENSOR (0x01)]
+      [2 bytes: Number of draft tokens (>H)]
+      [8*K bytes: Draft token IDs (>q * K)]
+      [1 byte:  Number of dimensions (>B)]
+      [4*D bytes: Dimension sizes (>I * D)]
+      [1 byte:  Dtype code (>B)]
+      [N bytes: Raw tensor bytes]
+    """
+    if tensor.is_cuda:
+        torch.cuda.synchronize(tensor.device)
+        cpu_tensor = tensor.contiguous().cpu()
+    else:
+        cpu_tensor = tensor.contiguous()
+
+    tensor_bytes = cpu_tensor.view(torch.uint8).numpy().tobytes()
+
+    dtype_code = DTYPE_REVERSE.get(cpu_tensor.dtype, 0)
+    shape = list(cpu_tensor.shape)
+    ndim = len(shape)
+
+    drafts = draft_tokens or []
+    num_drafts = len(drafts)
+
+    payload_len = 1 + 2 + (8 * num_drafts) + 1 + (4 * ndim) + 1 + len(tensor_bytes)
+
+    buf = bytearray(LENGTH_PREFIX_SIZE + payload_len)
+    struct.pack_into(LENGTH_PREFIX_FMT, buf, 0, payload_len)
+    offset = LENGTH_PREFIX_SIZE
+
+    struct.pack_into(">B", buf, offset, MSG_TENSOR)
+    offset += 1
+
+    struct.pack_into(">H", buf, offset, num_drafts)
+    offset += 2
+    for d in drafts:
+        struct.pack_into(">q", buf, offset, int(d))
+        offset += 8
+
+    struct.pack_into(">B", buf, offset, ndim)
+    offset += 1
+    for dim in shape:
+        struct.pack_into(">I", buf, offset, int(dim))
+        offset += 4
+    struct.pack_into(">B", buf, offset, dtype_code)
+    offset += 1
+
+    buf[offset:offset + len(tensor_bytes)] = tensor_bytes
+    sock.sendall(buf)
+
+
+def recv_tensor(
+    sock: socket.socket,
+    shape: Optional[Tuple[int, ...]] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> Tuple[torch.Tensor, List[int]]:
+    """
+    Receive a length-prefixed tensor and any accompanying draft tokens.
+
+    Returns:
+        Tuple of (reconstructed torch.Tensor, list of draft_tokens)
+    """
+    len_bytes = recvall(sock, LENGTH_PREFIX_SIZE)
+    payload_len = struct.unpack(LENGTH_PREFIX_FMT, len_bytes)[0]
+
+    payload = recvall(sock, payload_len)
+    offset = 0
+
+    msg_type = struct.unpack_from(">B", payload, offset)[0]
+    offset += 1
+
+    if msg_type != MSG_TENSOR:
+        raise ValueError(f"Expected MSG_TENSOR (0x01), got msg_type={msg_type}")
+
+    num_drafts = struct.unpack_from(">H", payload, offset)[0]
+    offset += 2
+    draft_tokens: List[int] = []
+    for _ in range(num_drafts):
+        d = struct.unpack_from(">q", payload, offset)[0]
+        draft_tokens.append(d)
+        offset += 8
+
+    ndim = struct.unpack_from(">B", payload, offset)[0]
+    offset += 1
+    decoded_shape = []
+    for _ in range(ndim):
+        dim = struct.unpack_from(">I", payload, offset)[0]
+        decoded_shape.append(dim)
+        offset += 4
+    dtype_code = struct.unpack_from(">B", payload, offset)[0]
+    offset += 1
+
+    final_shape = shape if shape is not None else tuple(decoded_shape)
+    final_dtype = dtype if dtype is not None else DTYPE_MAP.get(dtype_code, torch.float16)
+
+    numel = 1
+    for dim in final_shape:
+        numel *= dim
+
+    tensor_data = bytearray(payload[offset:])
+    tensor = torch.frombuffer(tensor_data, dtype=final_dtype, count=numel).reshape(final_shape)
+
+    return tensor, draft_tokens
+
+
+def send_token(
+    sock: socket.socket,
+    token_id: int,
+    accepted_count: int = 1,
+    is_eos: bool = False,
+) -> None:
+    """
+    Send a token response (Node 1 -> Node 0) with 8-byte length prefix framing.
+    """
+    payload_len = 1 + 8 + 4 + 1
+    buf = bytearray(LENGTH_PREFIX_SIZE + payload_len)
+    struct.pack_into(LENGTH_PREFIX_FMT, buf, 0, payload_len)
+    struct.pack_into(
+        ">BqIB",
+        buf,
+        LENGTH_PREFIX_SIZE,
+        MSG_TOKEN,
+        int(token_id),
+        int(accepted_count),
+        1 if is_eos else 0,
+    )
+    sock.sendall(buf)
+
+
+def recv_token(sock: socket.socket) -> Tuple[int, int, bool]:
+    """
+    Receive a token response from peer.
+
+    Returns:
+        Tuple of (token_id: int, accepted_count: int, is_eos: bool)
+    """
+    len_bytes = recvall(sock, LENGTH_PREFIX_SIZE)
+    payload_len = struct.unpack(LENGTH_PREFIX_FMT, len_bytes)[0]
+    payload = recvall(sock, payload_len)
+
+    msg_type = struct.unpack_from(">B", payload, 0)[0]
+    if msg_type != MSG_TOKEN:
+        raise ValueError(f"Expected MSG_TOKEN (0x02), got msg_type={msg_type}")
+
+    token_id, accepted_count, is_eos_val = struct.unpack_from(">qIB", payload, 1)
+    return token_id, accepted_count, bool(is_eos_val)

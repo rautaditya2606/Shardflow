@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-ShardFlow Kaggle Remote Node 0 + Gateway Runner (Kaggle Instance A).
+ShardFlow v2 Kaggle Remote Node 0 Runner (Kaggle Instance A).
 
-Runs:
-1. Local FastAPI Gateway & Registry on http://127.0.0.1:8000
-2. Node 0 on cuda:0 (Layers 0..14 + Draft Model) connecting to remote Node 1 via HTTP URL
-3. Live Streaming Benchmark yielding remote distributed inference across separate Kaggle instances.
+Runs Node 0 (Layers 0..24 + Embeddings on Qwen2.5-14B, or Layers 0..14 on Qwen2.5-7B)
+connected directly to the AWS EC2 Rust TCP Relay without tunnels.
+
+Drives the distributed generation loop peer-to-peer across the relay:
+Node 0 (Embed + Layers 0..24) -> Relay -> Node 1 (Layers 24..48 + LM Head) -> Relay -> Node 0
 """
 
 import os
 import sys
 import time
-import json
 import socket
-import subprocess
-import requests
-import multiprocessing
+import argparse
+import logging
+import statistics
 from pathlib import Path
 
 # Add project root to sys.path
@@ -28,275 +28,315 @@ if os.path.exists("/kaggle"):
     os.environ["TRANSFORMERS_CACHE"] = "/kaggle/working/hf_home"
     os.environ["HF_HUB_CACHE"] = "/kaggle/working/hf_home"
 
+import torch
+from transformers import AutoConfig, AutoTokenizer
 
-def kill_ports(ports: list[int]):
-    """Kill any zombie processes from prior runs occupying our ports."""
-    import signal
-    for port in ports:
-        try:
-            subprocess.run(["fuser", "-k", "-n", "tcp", str(port)], capture_output=True, timeout=1.0)
-        except Exception:
-            pass
-        try:
-            res = subprocess.run(["lsof", "-t", f"-i:{port}"], capture_output=True, text=True, timeout=1.0)
-            if res.returncode == 0 and res.stdout.strip():
-                for pid_str in res.stdout.strip().split():
-                    try:
-                        pid = int(pid_str)
-                        if pid != os.getpid():
-                            os.kill(pid, signal.SIGKILL)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-    time.sleep(0.5)
+from shardflow.node.layer_loader import load_layer_slice
+from shardflow.node.node import PipelineNode
+from shardflow.node.draft_model import DraftSampler, rewind_kv_cache
+from shardflow.transport.relay import (
+    RELAY_HOST,
+    RELAY_PORT,
+    AUTH_BYTE,
+    connect_to_relay,
+    handshake,
+    send_tensor,
+    recv_tensor,
+    send_token,
+    recv_token,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("node0")
 
 
-def run_gateway_server(port: int = 8000, stream_port: int = 8001):
-    """Run Gateway + Embedded Registry FastAPI server."""
-    os.environ["SHARDFLOW_STREAM_HOST"] = "127.0.0.1"
-    os.environ["SHARDFLOW_STREAM_PORT"] = str(stream_port)
-    import uvicorn
-    from shardflow.gateway.app import app as gateway_app
-    uvicorn.run(gateway_app, host="127.0.0.1", port=port, log_level="warning")
+def generate(
+    prompt: str,
+    tokenizer,
+    node: PipelineNode,
+    sock: socket.socket,
+    max_tokens: int = 100,
+    temperature: float = 0.0,
+    top_k: int = 0,
+    top_p: float = 1.0,
+    spec_k: int = 0,
+    eos_token_id: int = 151643,
+) -> dict:
+    """Generate tokens for a prompt through the distributed relay pipeline with error handling."""
+    session_id = f"relay_session_{int(time.time()*1000)}"
+    prompt_tokens = tokenizer.encode(prompt)
+    prompt_len = len(prompt_tokens)
+
+    # Initialize draft sampler if speculative decoding is enabled
+    draft_sampler = node.draft_sampler if (spec_k > 0 and node.draft_sampler is not None) else None
+    if draft_sampler:
+        draft_sampler.prefill(prompt_tokens)
+
+    t_start = time.perf_counter()
+    t_first_token = None
+    generated_tokens = []
+    total_drafted = 0
+    total_accepted = 0
+
+    print(f"\nUser Prompt: \"{prompt}\"", flush=True)
+    print("Assistant: ", end="", flush=True)
+
+    try:
+        # 1. Prefill Phase
+        token_tensor = torch.tensor([prompt_tokens], dtype=torch.long, device=node.model_slice.device)
+        if node.model_slice.embed_tokens is not None:
+            hidden_states = node.model_slice.embed_tokens(token_tensor)
+        else:
+            hidden_states = token_tensor
+
+        # Forward pass on Node 0 (Layers 0..24)
+        output = node._forward(hidden_states, session_id=session_id, compute_head=False)
+
+        # Transmit activation to Node 1 via relay
+        send_tensor(sock, output)
+
+        # Receive prefill token from Node 1
+        next_token, _, is_eos = recv_token(sock)
+        t_first_token = time.perf_counter()
+        generated_tokens.append(next_token)
+
+        word = tokenizer.decode([next_token], skip_special_tokens=True)
+        print(word, end="", flush=True)
+
+        # 2. Autoregressive Decode Loop
+        step = 1
+        while step < max_tokens and not is_eos:
+            if next_token == eos_token_id:
+                break
+
+            if draft_sampler and spec_k > 0:
+                # Speculative decoding: propose K drafts locally on Node 0 GPU
+                drafts = draft_sampler.generate_drafts(
+                    next_token,
+                    k=spec_k,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                )
+                total_drafted += len(drafts)
+
+                candidate_tokens = [next_token] + drafts
+                cand_tensor = torch.tensor([candidate_tokens], dtype=torch.long, device=node.model_slice.device)
+
+                if node.model_slice.embed_tokens is not None:
+                    cand_hidden = node.model_slice.embed_tokens(cand_tensor)
+                else:
+                    cand_hidden = cand_tensor
+
+                cache = node.kv_store.get(session_id)
+                past_seq_len = node._get_cache_seq_len(cache)
+
+                # Forward candidate sequence through Node 0 layers
+                cand_output = node._forward(cand_hidden, session_id=session_id, compute_head=False)
+
+                # Send activation + draft token list to Node 1 for parallel verification
+                send_tensor(sock, cand_output, draft_tokens=drafts)
+
+                # Receive verification result
+                next_token, accepted_count, is_eos = recv_token(sock)
+                total_accepted += max(0, accepted_count - 1)
+
+                # Rewind Node 0 KV cache and draft sampler
+                if cache is not None:
+                    rewind_kv_cache(cache, past_seq_len + accepted_count)
+                draft_target = draft_sampler.seq_len - len(drafts) + accepted_count
+                draft_sampler.rewind(draft_target)
+
+                # Stream accepted tokens
+                if drafts and accepted_count > 1:
+                    for d_idx in range(accepted_count - 1):
+                        tok = drafts[d_idx]
+                        generated_tokens.append(tok)
+                        print(tokenizer.decode([tok], skip_special_tokens=True), end="", flush=True)
+
+                generated_tokens.append(next_token)
+                print(tokenizer.decode([next_token], skip_special_tokens=True), end="", flush=True)
+                step += accepted_count
+
+            else:
+                # Standard 1-token decode
+                tok_tensor = torch.tensor([[next_token]], dtype=torch.long, device=node.model_slice.device)
+                if node.model_slice.embed_tokens is not None:
+                    hidden = node.model_slice.embed_tokens(tok_tensor)
+                else:
+                    hidden = tok_tensor
+
+                output = node._forward(hidden, session_id=session_id, compute_head=False)
+                send_tensor(sock, output)
+
+                next_token, _, is_eos = recv_token(sock)
+                generated_tokens.append(next_token)
+                print(tokenizer.decode([next_token], skip_special_tokens=True), end="", flush=True)
+                step += 1
+
+    except TimeoutError as te:
+        print(f"\n❌ [TIMEOUT ERROR]: {te}", flush=True)
+        print("Kaggle Node 1 or EC2 Relay stopped responding. Please check Kaggle B status.", flush=True)
+    except ConnectionError as ce:
+        print(f"\n❌ [CONNECTION ERROR]: {ce}", flush=True)
+    except Exception as ex:
+        print(f"\n❌ [UNEXPECTED ERROR]: {ex}", flush=True)
+    finally:
+        node.kv_store.evict(session_id)
+
+    t_end = time.perf_counter()
+    total_time = t_end - t_start
+    ttft = (t_first_token - t_start) if t_first_token else total_time
+    decode_time = (t_end - t_first_token) if t_first_token else total_time
+    tok_count = len(generated_tokens)
+    tps = (tok_count - 1) / decode_time if (decode_time > 0 and tok_count > 1) else (tok_count / decode_time if decode_time > 0 else 0)
+
+    print("\n" + "-" * 55, flush=True)
+    stats_str = f"📊 Tokens: {tok_count} | TTFT: {ttft*1000:.1f} ms | Decode Time: {decode_time:.2f} s | Speed: {tps:.2f} TPS 🚀"
+    if total_drafted > 0:
+        accept_rate = (total_accepted / total_drafted) * 100.0
+        stats_str += f" | Draft Accept Rate: {accept_rate:.1f}% ({total_accepted}/{total_drafted})"
+    print(stats_str, flush=True)
+    print("-" * 55, flush=True)
+
+    return {
+        "tokens": tok_count,
+        "ttft": ttft,
+        "decode_time": decode_time,
+        "tps": tps,
+        "draft_accept_rate": (total_accepted / total_drafted * 100.0) if total_drafted > 0 else None,
+    }
 
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="ShardFlow Node 0 + Gateway (Kaggle A Remote Runner)")
-    parser.add_argument("--node1-url", required=True, help="Cloudflare tunnel URL of Node 1 on Kaggle B (e.g. https://*.trycloudflare.com)")
-    parser.add_argument("--model", default="/kaggle/working/models/Qwen2.5-7B-Instruct", help="Model path or HF ID")
-    parser.add_argument("--draft-model", default=None, help="Draft model path (only used if spec_k > 0)")
-    parser.add_argument("--spec-k", type=int, default=12, help="Speculative candidate tokens (default: 12, set 0 to disable)")
-    parser.add_argument("--layer-start", type=int, default=None, help="Starting layer index for Node 0 (default: 0)")
-    parser.add_argument("--layer-end", type=int, default=None, help="Ending layer index for Node 0 (default: half of total layers)")
+    parser = argparse.ArgumentParser(description="ShardFlow v2 Node 0 (Kaggle A TCP Relay Runner)")
+    parser.add_argument("--model", default="Qwen/Qwen2.5-14B-Instruct", help="Model path or HF ID (default: Qwen/Qwen2.5-14B-Instruct)")
+    parser.add_argument("--draft-model", default=None, help="Draft model path for speculative decoding (e.g. Qwen/Qwen2.5-0.5B-Instruct)")
+    parser.add_argument("--spec-k", type=int, default=0, help="Speculative candidate tokens (default: 0 to disable, 4 to test)")
+    parser.add_argument("--layer-start", type=int, default=0, help="Starting layer index (default: 0)")
+    parser.add_argument("--layer-end", type=int, default=None, help="Ending layer index (default: half of total layers, e.g. 24 for 14B)")
     parser.add_argument("--4bit", action="store_true", help="Enable 4-bit NF4 loading")
+    parser.add_argument("--relay-host", default=RELAY_HOST, help=f"EC2 Relay IP (default: {RELAY_HOST})")
+    parser.add_argument("--relay-port", type=int, default=RELAY_PORT, help=f"EC2 Relay Port (default: {RELAY_PORT})")
+    parser.add_argument("--device", default="cuda", help="Target device (default: cuda)")
+    parser.add_argument("--dtype", choices=["float16", "bfloat16"], default="float16", help="Precision (default: float16)")
+    parser.add_argument("--max-tokens", type=int, default=60, help="Max tokens per generation")
     parser.add_argument("--prompt", default=None, help="Single prompt to benchmark (optional)")
-    parser.add_argument("--max-tokens", type=int, default=50, help="Max tokens per generation")
-    parser.add_argument("--port", type=int, default=8000, help="Gateway port")
-    parser.add_argument("--stream-port", type=int, default=8001, help="P2P stream receiver port")
     parser.add_argument("--no-cuda-graphs", action="store_true", default=True, help="Disable CUDA Graphs in eager mode")
     args = parser.parse_args()
 
-    # Clean up any lingering processes from previous notebook runs
-    kill_ports([args.port, args.stream_port, 9500])
-
-    model_path = args.model if os.path.exists(args.model) else "Qwen/Qwen2.5-7B-Instruct"
-    
-    from transformers import AutoConfig
+    model_path = args.model if os.path.exists(args.model) else args.model
     config = AutoConfig.from_pretrained(model_path)
-    total_layers = getattr(config, "num_hidden_layers", 28)
-    
-    node0_start = args.layer_start if args.layer_start is not None else 0
-    node0_end = args.layer_end if args.layer_end is not None else (total_layers // 2)
+    total_layers = getattr(config, "num_hidden_layers", 48)
 
-    draft_path = None
-    if args.spec_k > 0:
-        if args.draft_model and os.path.exists(args.draft_model):
-            draft_path = args.draft_model
-        elif args.draft_model:
-            draft_path = args.draft_model
-        elif os.path.exists("/kaggle/working/models/Qwen2.5-0.5B-Instruct"):
-            draft_path = "/kaggle/working/models/Qwen2.5-0.5B-Instruct"
-        else:
-            draft_path = "Qwen/Qwen2.5-0.5B-Instruct"
+    layer_start = args.layer_start
+    layer_end = args.layer_end if args.layer_end is not None else (total_layers // 2)
+
+    target_dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
+    if target_dtype == torch.bfloat16 and torch.cuda.is_available():
+        major, _ = torch.cuda.get_device_capability()
+        if major < 8:
+            logger.warning("GPU does not support native BF16 (T4 is CC 7.5). Overriding to torch.float16.")
+            target_dtype = torch.float16
 
     print("=" * 70, flush=True)
-    print("🚀 SHARDFLOW REMOTE DISTRIBUTED INFERENCE PIPELINE (KAGGLE A)", flush=True)
-    print(f"Base Model:    {model_path} (Layers {node0_start}..{node0_end} on Kaggle A, Layers {node0_end}..{total_layers} on Kaggle B)")
-    print(f"Draft Model:   {draft_path or 'DISABLED (spec_k=0)'} (Speculative K={args.spec_k})")
-    print(f"Remote Node 1: {args.node1_url}")
-    print(f"Gateway:       http://127.0.0.1:{args.port}")
+    print("🚀 SHARDFLOW v2 REMOTE NODE 0 (KAGGLE INSTANCE A)", flush=True)
+    print(f"Base Model:    {model_path}")
+    print(f"Layer Range:   [{layer_start}..{layer_end}) -> Indices {layer_start}..{layer_end-1} ({layer_end - layer_start}/{total_layers} layers + Embeddings)")
+    print(f"Draft Model:   {args.draft_model or 'DISABLED (spec_k=0)'} (Speculative K={args.spec_k})")
+    print(f"Relay Target:  {args.relay_host}:{args.relay_port}")
+    print(f"Precision:     {target_dtype}")
+    print(f"Device:        {args.device}")
     print("=" * 70, flush=True)
 
-    # Check remote Node 1 health
-    print(f"\nChecking remote Node 1 health at {args.node1_url}...", flush=True)
-    try:
-        r = requests.get(f"{args.node1_url.rstrip('/')}/health", timeout=10.0)
-        if r.status_code == 200:
-            print("✅ Remote Node 1 is reachable and healthy!", flush=True)
-        else:
-            print(f"⚠️ Remote Node 1 returned HTTP {r.status_code}. Proceeding anyway...", flush=True)
-    except Exception as e:
-        print(f"❌ Failed to reach Node 1 at {args.node1_url}: {e}", flush=True)
-        print("Please verify that Kaggle B is still running and cloudflared tunnel is active.")
-        sys.exit(1)
+    # 1. Load Tokenizer
+    logger.info("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    eos_id = getattr(tokenizer, "eos_token_id", 151643)
 
-    # 1. Start Local Gateway & Registry
-    print("\n[1/3] Starting local Gateway & Registry with Stream Receiver...", flush=True)
-    gateway_proc = multiprocessing.Process(target=run_gateway_server, args=(args.port, args.stream_port), daemon=True)
-    gateway_proc.start()
+    # 2. Load Model Slice (Layers 0..layer_end + Embedding Table)
+    logger.info("Loading model shard (layers %d..%d + Embeddings)...", layer_start, layer_end)
+    t0 = time.perf_counter()
+    model_slice = load_layer_slice(
+        model_path=model_path,
+        layer_start=layer_start,
+        layer_end=layer_end,
+        device=args.device,
+        dtype=target_dtype,
+        load_in_4bit=getattr(args, "4bit", False),
+    )
+    logger.info("✅ Model slice loaded in %.2f s", time.perf_counter() - t0)
 
-    # Wait for Gateway
-    for _ in range(30):
-        try:
-            r = requests.get(f"http://127.0.0.1:{args.port}/topology", timeout=1.0)
-            if r.status_code == 200:
-                print("✅ Gateway is online!", flush=True)
-                break
-        except Exception:
-            time.sleep(0.5)
-    else:
-        raise RuntimeError("Gateway failed to boot within 15 seconds")
+    # 3. Initialize Pipeline Node & Draft Sampler
+    node = PipelineNode(
+        model_slice=model_slice,
+        is_first_node=True,
+        is_last_node=False,
+        draft_model=args.draft_model if args.spec_k > 0 else None,
+        spec_k=args.spec_k,
+        enable_cuda_graphs=not args.no_cuda_graphs,
+    )
+    if model_slice.config is not None:
+        node.kv_store.initialize_static_pool(
+            config=model_slice.config,
+            device=model_slice.device,
+            dtype=target_dtype,
+            max_sessions=4,
+            max_seq_len=2048,
+        )
 
-    # 2. Start Node 0
-    print(f"\n[2/3] Spawning Node 0 on cuda:0 (Layers {node0_start}..{node0_end} + Draft Model)...", flush=True)
-    node0_env = os.environ.copy()
-    node0_env["CUDA_VISIBLE_DEVICES"] = "0"
-    node0_cmd = [
-        sys.executable, "-m", "shardflow.node.node",
-        "--model", model_path,
-        "--layer-start", str(node0_start),
-        "--layer-end", str(node0_end),
-        "--next-node-url", args.node1_url.rstrip("/"),
-        "--host", "127.0.0.1",
-        "--port", "9500",
-        "--public-host", "127.0.0.1",
-        "--public-port", "9500",
-        "--registry-url", f"http://127.0.0.1:{args.port}",
-        "--reg-layer-start", str(node0_start),
-        "--reg-layer-end", str(total_layers),
-        "--expected-nodes", "1",
-        "--device", "cuda",
-        "--spec-k", str(args.spec_k),
+    # 4. Connect to Relay and perform handshake with Node 1
+    logger.info("Connecting to TCP relay at %s:%d ...", args.relay_host, args.relay_port)
+    sock = connect_to_relay(host=args.relay_host, port=args.relay_port, auth_byte=AUTH_BYTE)
+    logger.info("✅ Connected to relay. Executing READY handshake with Node 1...")
+    handshake(sock)
+    logger.info("🌟 HANDSHAKE COMPLETE! Cluster is paired and ready for inference.")
+
+    # 5. Run Live Inference Prompts
+    prompts = [args.prompt] if args.prompt else [
+        "Explain quantum entanglement in simple terms.",
+        "Write a Python function to compute Fibonacci numbers using dynamic programming.",
+        "What are the key advantages of pipeline parallelism for distributed LLM inference?",
     ]
-    if getattr(args, "4bit", False) or "nf4" in model_path.lower() or "4bit" in model_path.lower():
-        node0_cmd.append("--4bit")
-    if draft_path:
-        node0_cmd.extend(["--draft-model", draft_path])
-    if args.no_cuda_graphs:
-        node0_cmd.append("--no-cuda-graphs")
-    node0_proc = subprocess.Popen(node0_cmd, env=node0_env)
 
-    print("Waiting for Node 0 weights + Draft Model to load...", flush=True)
-    for _ in range(120):
-        if node0_proc.poll() is not None:
-            with open("/tmp/node0_remote.log", "r") as f:
-                logs = f.read()
-            raise RuntimeError(f"Node 0 failed to start (exit code {node0_proc.returncode}). Log:\n{logs}")
-        try:
-            with socket.create_connection(("127.0.0.1", 9500), timeout=1.0):
-                print("✅ Node 0 is online!", flush=True)
-                break
-        except Exception:
-            time.sleep(1.5)
-    else:
-        raise TimeoutError("Node 0 startup timed out after 120s")
-
-    # Wait for Node 0 to be registered in Gateway topology
-    print("Waiting for Node 0 to register in Gateway topology...", flush=True)
-    for _ in range(30):
-        try:
-            r = requests.get(f"http://127.0.0.1:{args.port}/topology", timeout=1.0)
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("cluster_ready") and len(data.get("nodes", [])) > 0:
-                    print("✅ Node 0 registered and cluster topology is ready!", flush=True)
-                    break
-        except Exception:
-            pass
-        time.sleep(1.0)
-    else:
-        print("⚠️ Topology wait timed out — proceeding with benchmark attempt...", flush=True)
-
-    # 3. Run Live Remote Inference Benchmark
-    print("\n" + "=" * 70, flush=True)
-    print("⚡ [3/3] RUNNING LIVE DISTRIBUTED INFERENCE BENCHMARK (CROSS-KAGGLE)", flush=True)
-    print("=" * 70, flush=True)
-
-    if args.prompt:
-        prompts = [args.prompt]
-    else:
-        prompts = [
-            "Explain the concept of quantum entanglement in simple terms.",
-            "Write a Python function to compute Fibonacci numbers using dynamic programming with memoization.",
-            "What are the key advantages of pipeline parallelism for distributed LLM inference?",
-        ]
-
-    chat_url = f"http://127.0.0.1:{args.port}/v1/chat/completions"
-    tps_list = []
-    ttft_list = []
+    tps_results = []
+    ttft_results = []
 
     try:
         for idx, prompt in enumerate(prompts, 1):
-            print(f"\n--- Benchmark Prompt {idx}/{len(prompts)} ---", flush=True)
-            print(f"User Prompt: \"{prompt}\"", flush=True)
-            print("Assistant Output: ", end="", flush=True)
+            print(f"\n" + "=" * 60)
+            print(f"⚡ BENCHMARK PROMPT {idx}/{len(prompts)}")
+            print("=" * 60)
 
-            payload = {
-                "model": model_path,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": args.max_tokens,
-                "temperature": 0.0,
-                "stream": True,
-            }
+            stats = generate(
+                prompt=prompt,
+                tokenizer=tokenizer,
+                node=node,
+                sock=sock,
+                max_tokens=args.max_tokens,
+                temperature=0.0,
+                spec_k=args.spec_k,
+                eos_token_id=eos_id,
+            )
+            if stats["tokens"] > 1:
+                tps_results.append(stats["tps"])
+                ttft_results.append(stats["ttft"])
 
-            t_start = time.perf_counter()
-            t_first_tok = None
-            tok_count = 0
-
-            resp = requests.post(chat_url, json=payload, stream=True, timeout=60.0)
-            if resp.status_code != 200:
-                print(f"\n❌ Error {resp.status_code}: {resp.text}", flush=True)
-                continue
-
-            for line in resp.iter_lines():
-                if not line:
-                    continue
-                s = line.decode("utf-8")
-                if s.startswith("data: "):
-                    d_str = s[6:].strip()
-                    if d_str == "[DONE]":
-                        break
-                    try:
-                        d = json.loads(d_str)
-                        delta = d["choices"][0].get("delta", {}).get("content", "")
-                        if delta:
-                            if t_first_tok is None:
-                                t_first_tok = time.perf_counter()
-                            tok_count += 1
-                            print(delta, end="", flush=True)
-                    except Exception:
-                        pass
-
-            t_end = time.perf_counter()
-            total_time = t_end - t_start
-            ttft = (t_first_tok - t_start) if t_first_tok else total_time
-            decode_time = (t_end - t_first_tok) if t_first_tok else total_time
-            tps = (tok_count - 1) / decode_time if decode_time > 0 and tok_count > 1 else (tok_count / decode_time if decode_time > 0 else 0)
-
-            if tok_count == 0:
-                print("\n⚠️ No tokens generated. Checking Node 0 log...", flush=True)
-                try:
-                    with open("/tmp/node0_remote.log", "r") as f0:
-                        lines0 = f0.readlines()[-15:]
-                        print(f"[Node 0 Log Tail]:\n{''.join(lines0)}", flush=True)
-                except Exception as ex:
-                    print(f"Could not read logs: {ex}", flush=True)
-
-            print("\n" + "-" * 50, flush=True)
-            print(f"📊 Tokens: {tok_count} | TTFT: {ttft*1000:.1f} ms | Decode Time: {decode_time:.2f} s | Throughput: {tps:.2f} TPS 🚀", flush=True)
-            print("-" * 50, flush=True)
-
-            if tok_count > 0:
-                tps_list.append(tps)
-                ttft_list.append(ttft)
-
-        if tps_list:
-            import statistics
-            print("\n" + "=" * 70, flush=True)
-            print("🏆 FINAL BENCHMARK SUMMARY (Remote Distributed 2x Kaggle T4)", flush=True)
-            print(f"  Avg Decode Throughput: {statistics.mean(tps_list):.2f} tokens/sec 🚀")
-            print(f"  Max Decode Throughput: {max(tps_list):.2f} tokens/sec")
-            print(f"  Avg TTFT:              {statistics.mean(ttft_list)*1000:.1f} ms")
-            print(f"  Total Cost:            $0.00 (Kaggle Free Tier)")
-            print("=" * 70, flush=True)
+        if tps_results:
+            print("\n" + "=" * 70)
+            print("🏆 FINAL BENCHMARK SUMMARY (ShardFlow v2 over Direct TCP Relay)")
+            print(f"  Model:                 {model_path}")
+            print(f"  Avg Decode Throughput: {statistics.mean(tps_results):.2f} tokens/sec 🚀")
+            print(f"  Max Decode Throughput: {max(tps_results):.2f} tokens/sec")
+            print(f"  Avg TTFT:              {statistics.mean(ttft_results)*1000:.1f} ms")
+            print(f"  Transport:             Direct TCP Relay ({args.relay_host}:{args.relay_port})")
+            print("=" * 70)
 
     finally:
-        print("\nCleaning up processes...", flush=True)
-        node0_proc.terminate()
-        gateway_proc.terminate()
-        print("Shutdown complete.")
+        sock.close()
 
 
 if __name__ == "__main__":
