@@ -21,7 +21,7 @@ RELAY_PORT = 9500
 AUTH_BYTE = bytes([0xAD])
 
 # Default Socket Timeout in seconds (prevents hanging if a Kaggle session dies)
-SOCKET_DATA_TIMEOUT = 30.0
+SOCKET_DATA_TIMEOUT = 120.0
 
 # Wire Framing Constants (8-byte big-endian unsigned 64-bit length prefix)
 LENGTH_PREFIX_FMT = ">Q"

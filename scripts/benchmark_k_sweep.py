@@ -108,6 +108,15 @@ def run_k_sweep(
     if draft_model and node.draft_sampler is None:
         raise RuntimeError(f"Draft model '{draft_model}' failed to load on Node 0 GPU. Please check path or HF model ID.")
 
+    if node.draft_sampler is not None:
+        print("\n⚡ Warming up torch.compile kernels on draft model before connecting to relay...")
+        t_w0 = time.perf_counter()
+        dummy_tokens = [151644, 872, 198, 100, 200, 300, 400, 500]
+        node.draft_sampler.prefill(dummy_tokens)
+        _ = node.draft_sampler.generate_drafts(dummy_tokens[-1], k=max_k)
+        node.draft_sampler.reset()
+        print(f"✅ Draft model warmup complete in {time.perf_counter() - t_w0:.2f}s")
+
     prompts = [
         "Explain quantum entanglement in simple terms.",
         "Write a Python function to compute Fibonacci numbers using dynamic programming.",
