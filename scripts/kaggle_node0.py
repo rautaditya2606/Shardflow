@@ -295,6 +295,10 @@ def generate(
                 else:
                     tok, acc, eos, stats = recv_token_timed(sock)
                 r_id = stats.get("round_id", 0)
+                is_stale = stats.get("is_stale_discard", False)
+                if r_id in invalidated_rounds or is_stale:
+                    invalidated_rounds.discard(r_id)
+                    continue
                 pending_responses[r_id] = (tok, acc, eos, stats)
             return pending_responses.pop(target_round_id)
 
