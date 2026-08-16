@@ -217,6 +217,8 @@ def main():
     parser.add_argument("--draft-model", default=None, help="Draft model path for neural speculative (optional)")
     parser.add_argument("--k-values", default="0,1,2,3,4,6,8", help="Comma-separated K values to test")
     parser.add_argument("--relay-host", default=RELAY_HOST, help="Relay IP")
+    parser.add_argument("--layer-start", type=int, default=0, help="Starting layer index (default: 0)")
+    parser.add_argument("--layer-end", type=int, default=None, help="Ending layer index (default: total_layers // 2)")
     parser.add_argument("--relay-port", type=int, default=RELAY_PORT, help="Relay port")
     parser.add_argument("--device", default="cuda", help="Target device")
     parser.add_argument("--dtype", choices=["float16", "bfloat16"], default="float16", help="Precision")
@@ -229,6 +231,8 @@ def main():
         model_path=args.model,
         k_list=k_list,
         draft_model=args.draft_model,
+        layer_start=args.layer_start,
+        layer_end=args.layer_end,
         relay_host=args.relay_host,
         relay_port=args.relay_port,
         device=args.device,
