@@ -131,9 +131,30 @@ class DraftSampler:
     ) -> List[int]:
         """
         Generate K candidate draft tokens locally.
-        Returns: list of K token IDs.
+        ponytail: GPU-resident argmax loop with zero per-token CPU-GPU synchronization.
         """
         k = k or self.spec_k
+        if k <= 0:
+            return []
+
+        # Greedy path: 100% GPU resident, single host extraction at the end
+        if temperature <= 0 or temperature < 1e-8:
+            cur_tensor = torch.tensor([[current_token]], dtype=torch.long, device=self.device)
+            gpu_drafts: List[torch.Tensor] = []
+
+            for _ in range(k):
+                outputs = self.model(
+                    input_ids=cur_tensor,
+                    past_key_values=self.cache,
+                    use_cache=True,
+                )
+                cur_tensor = outputs.logits[:, -1:, :].argmax(dim=-1)
+                gpu_drafts.append(cur_tensor)
+                self._seq_len += 1
+
+            return [int(t[0, 0].item()) for t in gpu_drafts]
+
+        # Sampling path (when temperature > 0)
         draft_tokens: List[int] = []
         next_tok = current_token
 
