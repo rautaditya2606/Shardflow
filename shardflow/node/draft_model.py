@@ -72,7 +72,7 @@ class DraftSampler:
         spec_k: int = 4,
     ):
         self.model_path = model_path
-        self.device = device
+        self.device = torch.device(device) if isinstance(device, str) else device
         self.dtype = dtype
         self.spec_k = spec_k
         self.cache = DynamicCache()
@@ -84,8 +84,17 @@ class DraftSampler:
         logger.info("Loading draft model %s on %s (dtype=%s, K=%d)...", model_path, device, dtype, spec_k)
         import os
         target_cache = "/kaggle/working/hf_home" if os.path.exists("/kaggle") else None
+        actual_path = model_path
+        if not os.path.exists(actual_path):
+            if "0.5B" in actual_path:
+                actual_path = "Qwen/Qwen2.5-0.5B-Instruct"
+            elif "1.5B" in actual_path:
+                actual_path = "Qwen/Qwen2.5-1.5B-Instruct"
+            elif "7B" in actual_path:
+                actual_path = "Qwen/Qwen2.5-7B-Instruct"
+
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
+            actual_path,
             torch_dtype=dtype,
             cache_dir=target_cache,
         ).to(device)
