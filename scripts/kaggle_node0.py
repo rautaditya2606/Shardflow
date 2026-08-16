@@ -250,8 +250,8 @@ def generate(
                 cand_output = spec_pending["output"]
                 drafts = spec_pending["drafts"]
                 draft_gen_ms = spec_pending.get("draft_gen_ms", 0.0)
-                t_fwd_0 = spec_pending.get("t_fwd_0", t_step_0)
-                t_fwd_1 = spec_pending.get("t_fwd_1", t_step_0)
+                t_fwd_0 = time.perf_counter()
+                t_fwd_1 = t_fwd_0
                 past_seq_len = spec_pending["past_seq_len"]
                 spec_pending = None
 
