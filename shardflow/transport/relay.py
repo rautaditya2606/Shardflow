@@ -149,23 +149,30 @@ def connect_to_relay(
 HANDSHAKE_MAGIC = b"SF_READY"  # Exactly 8 bytes
 
 
-def handshake(sock: socket.socket, timeout: float = 120.0) -> None:
+def handshake(sock: socket.socket, is_initiator: bool = True, timeout: float = 120.0) -> None:
     """
-    Execute symmetric two-way READY handshake with the peer node through the relay.
+    Execute clean two-way READY handshake through the EC2 relay.
 
-    Both nodes send exactly 8 bytes (b'SF_READY') and wait to receive exactly 8 bytes (b'SF_READY').
-    Because the length is fixed to 8 bytes, exactly 8 bytes are consumed from the TCP stream,
-    leaving the stream perfectly aligned for subsequent length-prefixed tensor frames.
+    Node 0 (is_initiator=True): sends SF_READY -> waits for SF_READY response.
+    Node 1 (is_initiator=False): waits for SF_READY -> sends SF_READY response.
     """
     orig_timeout = sock.gettimeout()
     sock.settimeout(timeout)
     try:
-        logger.info("Sending READY handshake to peer through relay...")
-        sock.sendall(HANDSHAKE_MAGIC)
-        ack = recvall(sock, len(HANDSHAKE_MAGIC))
-        if ack != HANDSHAKE_MAGIC:
-            raise ConnectionError(f"Handshake failed: expected {HANDSHAKE_MAGIC!r}, received {ack!r}")
-        logger.info("✅ Handshake successful: Peer node is READY!")
+        if is_initiator:
+            logger.info("Sending READY handshake to peer through relay...")
+            sock.sendall(HANDSHAKE_MAGIC)
+            ack = recvall(sock, len(HANDSHAKE_MAGIC))
+            if ack != HANDSHAKE_MAGIC:
+                raise ConnectionError(f"Handshake failed: expected {HANDSHAKE_MAGIC!r}, received {ack!r}")
+            logger.info("✅ Handshake successful: Peer node is READY!")
+        else:
+            logger.info("Waiting for READY handshake from Node 0 through relay...")
+            ping = recvall(sock, len(HANDSHAKE_MAGIC))
+            if ping != HANDSHAKE_MAGIC:
+                raise ConnectionError(f"Handshake failed: expected {HANDSHAKE_MAGIC!r}, received {ping!r}")
+            sock.sendall(HANDSHAKE_MAGIC)
+            logger.info("✅ Handshake successful: Peer node is READY!")
     finally:
         sock.settimeout(orig_timeout)
 

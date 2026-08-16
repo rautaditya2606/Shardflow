@@ -197,7 +197,7 @@ def main():
             sock = connect_to_relay(host=args.relay_host, port=args.relay_port, auth_byte=AUTH_BYTE)
             logger.info("✅ Connected to relay. Waiting for Node 0 to connect...")
 
-            handshake(sock)
+            handshake(sock, is_initiator=False)
             logger.info("🌟 HANDSHAKE COMPLETE! Entering pure compute decode loop...")
 
             session_id = "relay_session"
