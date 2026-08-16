@@ -41,6 +41,16 @@ class CUDAGraphRunner:
         self.rotary_emb = rotary_emb
         self.enabled = enabled and (self.device.type == "cuda" and torch.cuda.is_available())
 
+        # Inspect layer signature once for position_embeddings parameter compatibility
+        self._layer_accepts_pos_emb = False
+        if self.layers and len(self.layers) > 0:
+            import inspect
+            try:
+                sig = inspect.signature(self.layers[0].forward)
+                self._layer_accepts_pos_emb = "position_embeddings" in sig.parameters
+            except Exception:
+                self._layer_accepts_pos_emb = False
+
         # Graphs
         self._decode_graph: Optional[torch.cuda.CUDAGraph] = None
         self._verify_graph: Optional[torch.cuda.CUDAGraph] = None
@@ -250,7 +260,7 @@ class CUDAGraphRunner:
                 "use_cache": True,
                 "cache_position": cache_position,
             }
-            if pos_emb is not None:
+            if self._layer_accepts_pos_emb and pos_emb is not None:
                 kwargs["position_embeddings"] = pos_emb
 
             out = layer(h, **kwargs)

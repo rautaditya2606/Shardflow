@@ -117,7 +117,10 @@ def main():
     parser.add_argument("--top-k", type=int, default=0, help="Sampling top-k")
     parser.add_argument("--top-p", type=float, default=1.0, help="Sampling top-p")
     parser.add_argument("--eos-token-id", type=int, default=151643, help="EOS token ID")
-    parser.add_argument("--no-cuda-graphs", action="store_true", default=True, help="Disable CUDA Graphs in eager mode")
+    parser.add_argument("--cuda-graphs", action="store_true", default=True, help="Enable CUDA Graphs and Static KV cache (default: True)")
+    parser.add_argument("--no-cuda-graphs", action="store_false", dest="cuda_graphs", help="Disable CUDA Graphs and use DynamicCache fallback")
+    parser.add_argument("--static-kv", action="store_true", default=True, help="Enable Static KV cache on GPU (default: True)")
+    parser.add_argument("--no-static-kv", action="store_false", dest="static_kv", help="Disable Static KV cache")
     args = parser.parse_args()
 
     model_path = args.model if os.path.exists(args.model) else args.model
@@ -134,10 +137,16 @@ def main():
             logger.warning("GPU does not support native BF16 (T4 is CC 7.5). Overriding to torch.float16.")
             target_dtype = torch.float16
 
+    use_cuda = (args.device == "cuda" or (isinstance(args.device, str) and args.device.startswith("cuda"))) and torch.cuda.is_available()
+    enable_static_kv = args.static_kv and use_cuda
+    enable_cuda_graphs = args.cuda_graphs and enable_static_kv
+
     print("=" * 70, flush=True)
     print("🚀 SHARDFLOW v2 REMOTE NODE 1 (KAGGLE INSTANCE B)", flush=True)
     print(f"Base Model:    {model_path}")
     print(f"Layer Range:   [{layer_start}..{layer_end}) -> Indices {layer_start}..{layer_end-1} ({layer_end - layer_start}/{total_layers} layers + Final Norm + LM Head)")
+    print(f"CUDA Graphs:   {'ENABLED ⚡' if enable_cuda_graphs else 'DISABLED (eager mode)'}")
+    print(f"Static KV:     {'ENABLED (GPU StaticCache)' if enable_static_kv else 'DISABLED (DynamicCache)'}")
     print(f"Relay Target:  {args.relay_host}:{args.relay_port}")
     print(f"Precision:     {target_dtype}")
     print(f"Device:        {args.device}")
@@ -163,14 +172,21 @@ def main():
         model_slice=model_slice,
         is_first_node=False,
         is_last_node=True,
-        enable_cuda_graphs=not args.no_cuda_graphs,
+        enable_cuda_graphs=enable_cuda_graphs,
     )
-    if model_slice.config is not None:
+    node.kv_store.enable_static_cache = enable_static_kv
+
+    if model_slice.config is not None and enable_static_kv:
         node.kv_store.initialize_static_pool(
             config=model_slice.config,
             device=model_slice.device,
             dtype=target_dtype,
         )
+        if node.kv_store._static_slots and enable_cuda_graphs:
+            logger.info("Capturing CUDA Graphs on Node 1...")
+            captured = node.graph_runner.capture(node.kv_store._static_slots[0].cache)
+            if captured:
+                logger.info("✅ CUDA Graphs captured & active on Node 1!")
 
     # 3. Connect to Relay and enter compute loop with automatic reconnection
     profiler = Node1Profiler()

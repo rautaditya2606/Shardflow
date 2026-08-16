@@ -260,12 +260,22 @@ class PipelineNode:
         """Get sequence length for this node's layer slice cache."""
         if cache is None:
             return 0
+        if hasattr(cache, "_seen_tokens") and cache._seen_tokens is not None:
+            return int(cache._seen_tokens)
         if hasattr(cache, "get_seq_length"):
+            try:
+                seq = cache.get_seq_length(self.model_slice.layer_start)
+                if isinstance(seq, torch.Tensor):
+                    return int(seq.item())
+                if seq is not None and int(seq) >= 0:
+                    return int(seq)
+            except Exception:
+                pass
             try:
                 seq = cache.get_seq_length()
                 if isinstance(seq, torch.Tensor):
                     return int(seq.item())
-                if seq is not None and int(seq) > 0:
+                if seq is not None and int(seq) >= 0:
                     return int(seq)
             except Exception:
                 pass
@@ -273,12 +283,10 @@ class PipelineNode:
                 seq = cache.get_seq_length(0)
                 if isinstance(seq, torch.Tensor):
                     return int(seq.item())
-                if seq is not None and int(seq) > 0:
+                if seq is not None and int(seq) >= 0:
                     return int(seq)
             except Exception:
                 pass
-        if hasattr(cache, "_seen_tokens") and cache._seen_tokens is not None:
-            return int(cache._seen_tokens)
         if hasattr(cache, "key_cache") and len(cache.key_cache) > 0:
             try:
                 return int(cache.key_cache[0].shape[-2])
