@@ -110,6 +110,16 @@ class DraftSampler:
         self._cur_tensor = torch.zeros((1, 1), dtype=torch.long, device=self.device)
         self._pos_ids = torch.arange(8192, dtype=torch.long, device=self.device).unsqueeze(0)
 
+        # Optional compilation on raw decoder stack with cudagraphs backend
+        try:
+            self.transformer = torch.compile(
+                self.transformer,
+                backend="cudagraphs",
+            )
+            logger.info("DraftSampler: torch.compile(backend=cudagraphs) enabled on %s", self.device)
+        except Exception as e:
+            logger.warning("DraftSampler: torch.compile skipped (%s), running in direct eager mode", e)
+
     @property
     def seq_len(self) -> int:
         """Current absolute sequence length of the draft model's KV cache."""
