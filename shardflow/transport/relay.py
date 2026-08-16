@@ -146,40 +146,26 @@ def connect_to_relay(
         raise ConnectionError(f"Failed to connect to relay at {host}:{port}: {e}") from e
 
 
-def handshake(sock: socket.socket, timeout: float = 60.0) -> None:
+HANDSHAKE_MAGIC = b"SF_READY"  # Exactly 8 bytes
+
+
+def handshake(sock: socket.socket, timeout: float = 120.0) -> None:
     """
-    Execute robust symmetric two-way READY handshake with the peer node through the relay.
-    Sends READY ping periodically until ACK is received from peer.
+    Execute symmetric two-way READY handshake with the peer node through the relay.
+
+    Both nodes send exactly 8 bytes (b'SF_READY') and wait to receive exactly 8 bytes (b'SF_READY').
+    Because the length is fixed to 8 bytes, exactly 8 bytes are consumed from the TCP stream,
+    leaving the stream perfectly aligned for subsequent length-prefixed tensor frames.
     """
     orig_timeout = sock.gettimeout()
-    sock.settimeout(0.5)
-    t_start = time.perf_counter()
-    logger.info("Sending READY handshake to peer through relay...")
-
-    received = bytearray()
+    sock.settimeout(timeout)
     try:
-        while (time.perf_counter() - t_start) < timeout:
-            try:
-                sock.sendall(b"READY")
-            except Exception:
-                pass
-
-            try:
-                chunk = sock.recv(1024)
-                if not chunk:
-                    raise ConnectionError("Socket closed during handshake.")
-                received.extend(chunk)
-                if b"READY" in received:
-                    try:
-                        sock.sendall(b"READY")
-                    except Exception:
-                        pass
-                    logger.info("✅ Handshake successful: Peer node is READY!")
-                    return
-            except socket.timeout:
-                continue
-
-        raise TimeoutError(f"Handshake timed out after {timeout}s waiting for peer node.")
+        logger.info("Sending READY handshake to peer through relay...")
+        sock.sendall(HANDSHAKE_MAGIC)
+        ack = recvall(sock, len(HANDSHAKE_MAGIC))
+        if ack != HANDSHAKE_MAGIC:
+            raise ConnectionError(f"Handshake failed: expected {HANDSHAKE_MAGIC!r}, received {ack!r}")
+        logger.info("✅ Handshake successful: Peer node is READY!")
     finally:
         sock.settimeout(orig_timeout)
 
@@ -322,6 +308,10 @@ def recv_tensor_timed(
     t_start = time.perf_counter()
     len_bytes = recvall(sock, LENGTH_PREFIX_SIZE)
     payload_len = struct.unpack(LENGTH_PREFIX_FMT, len_bytes)[0]
+    if payload_len > 500_000_000 or payload_len <= 0:
+        raise ConnectionError(
+            f"Invalid tensor frame length ({payload_len} bytes). TCP stream desynchronized."
+        )
     payload = recvall(sock, payload_len)
     t_recv_1 = time.perf_counter()
 
@@ -459,6 +449,10 @@ def recv_token_timed(sock: socket.socket) -> Tuple[int, int, bool, dict]:
     t_start = time.perf_counter()
     len_bytes = recvall(sock, LENGTH_PREFIX_SIZE)
     payload_len = struct.unpack(LENGTH_PREFIX_FMT, len_bytes)[0]
+    if payload_len > 100_000 or payload_len <= 0:
+        raise ConnectionError(
+            f"Invalid token response frame length ({payload_len} bytes). TCP stream desynchronized."
+        )
     payload = recvall(sock, payload_len)
     t_recv_end = time.perf_counter()
 
