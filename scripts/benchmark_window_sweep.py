@@ -215,7 +215,8 @@ def run_window_sweep(
 
         # Print Final Comparison Table
         print("\n" + "=" * 115)
-        print(" IN-FLIGHT SPECULATIVE WINDOW EMPIRICAL RESULTS (K=4 N-gram)")
+        sampler_name = f"Neural Draft {draft_model}" if draft_model else "N-gram Draft"
+        print(f" IN-FLIGHT SPECULATIVE WINDOW EMPIRICAL RESULTS ({sampler_name}, K={spec_k})")
         print("=" * 115)
         header = f"{'Window':>6} | {'TPS':>6} | {'TTFT (ms)':>9} | {'Tok/Round':>9} | {'Full Hit %':>10} | {'Bubble (ms)':>11} | {'N0 Fwd (ms)':>11} | {'N1 Comp (ms)':>12} | {'Net RTT (ms)':>12}"
         print(header)
