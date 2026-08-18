@@ -53,6 +53,7 @@ def run_window_sweep(
     device: str = "cuda",
     dtype: str = "float16",
     max_tokens: int = 60,
+    load_in_4bit: bool = False,
 ):
     config = AutoConfig.from_pretrained(model_path)
     total_layers = getattr(config, "num_hidden_layers", 28)
@@ -87,6 +88,7 @@ def run_window_sweep(
         layer_end=layer_end,
         device=device,
         dtype=target_dtype,
+        load_in_4bit=load_in_4bit,
     )
     print(f"[OK] Model slice loaded in {time.perf_counter() - t0:.2f}s")
 
@@ -259,6 +261,7 @@ def main():
     parser.add_argument("--device", default="cuda", help="Target device (default: cuda)")
     parser.add_argument("--dtype", choices=["float16", "bfloat16"], default="float16", help="Precision (default: float16)")
     parser.add_argument("--max-tokens", type=int, default=60, help="Max tokens per generation")
+    parser.add_argument("--4bit", "--load-in-4bit", dest="4bit", action="store_true", help="Enable 4-bit NF4 loading")
     args = parser.parse_args()
 
     windows = [int(w.strip()) for w in args.windows.split(",") if w.strip()]
@@ -275,6 +278,7 @@ def main():
         device=args.device,
         dtype=args.dtype,
         max_tokens=args.max_tokens,
+        load_in_4bit=getattr(args, "4bit", False),
     )
 
 
