@@ -91,7 +91,7 @@ class PipelineNode:
         self._node_dtype = torch.float16
         if model_slice.layers and len(model_slice.layers) > 0:
             params = list(model_slice.layers[0].parameters())
-            if params:
+            if params and params[0].dtype in (torch.float16, torch.bfloat16, torch.float32):
                 self._node_dtype = params[0].dtype
 
         hidden_size = 2048

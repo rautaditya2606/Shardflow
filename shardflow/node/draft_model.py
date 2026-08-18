@@ -107,6 +107,8 @@ class DraftSampler:
     ):
         self.model_path = model_path
         self.device = torch.device(device) if isinstance(device, str) else device
+        if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            dtype = torch.float16
         self.dtype = dtype
         self.spec_k = spec_k
         self.max_cache_len = max_cache_len
