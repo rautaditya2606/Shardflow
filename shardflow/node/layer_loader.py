@@ -603,6 +603,15 @@ def load_layer_slice(
             logger.info("SHARD END %s | RSS=%.2f GB | available=%.2f GB | GPU alloc=%.2f GB | GPU reserved=%.2f GB", shard_name, rss, avail, gpu_alloc, gpu_res)
             gc.collect()
 
+            # Prune downloaded shard from disk on Kaggle/Colab to ensure models up to 70B fit in 20GB disk quota
+            if local_dir is None and (os.path.exists("/kaggle") or os.path.exists("/content")):
+                try:
+                    if os.path.exists(shard_path):
+                        os.remove(shard_path)
+                        logger.info("Pruned temporary shard %s from disk (disk freed)", shard_name)
+                except Exception as e:
+                    logger.debug("Could not prune temporary shard %s: %s", shard_name, e)
+
     else:
         # Single safetensors file or local directory
         single_path = None
