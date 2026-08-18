@@ -51,6 +51,7 @@ def main():
     parser.add_argument("--tailscale-authkey", default=None, help="Tailscale ephemeral auth key for direct P2P mesh WireGuard networking (<5ms latency)")
     parser.add_argument("--draft-model", default=None, help="Small draft model for speculative decoding on Node 0 (e.g. Qwen/Qwen2.5-0.5B-Instruct)")
     parser.add_argument("--spec-k", type=int, default=4, help="Number of speculative candidate draft tokens per verification step (default: 4)")
+    parser.add_argument("--is-last", action="store_true", help="Explicitly mark node as terminal node (optional)")
     args = parser.parse_args()
 
     logging.basicConfig(

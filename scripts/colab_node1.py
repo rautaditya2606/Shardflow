@@ -15,7 +15,6 @@ import time
 import socket
 import argparse
 import logging
-from typing import Optional, Tuple, List, Dict, Union
 from pathlib import Path
 
 # Add project root to sys.path
@@ -46,49 +45,16 @@ from shardflow.transport.relay import (
     AUTH_BYTE,
     connect_to_relay,
     handshake,
-    recv_tensor,
     recv_tensor_timed,
-    send_token,
     send_token_timed,
 )
+from scripts.kaggle_node1 import Node1Profiler
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("colab_node1")
-
-
-class Node1Profiler:
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.steps = 0
-        self.total_tokens = 0
-        self.accepted_drafts = 0
-        self.total_drafts = 0
-        self.node1_comp_times: List[float] = []
-
-    def record(self, comp_ms: float, accepted: int = 1, drafted: int = 0):
-        self.steps += 1
-        self.total_tokens += accepted
-        self.accepted_drafts += max(0, accepted - 1)
-        self.total_drafts += drafted
-        self.node1_comp_times.append(comp_ms)
-
-    def summary(self) -> Dict[str, float]:
-        if not self.node1_comp_times:
-            return {}
-        import numpy as np
-        return {
-            "steps": self.steps,
-            "total_tokens": self.total_tokens,
-            "avg_comp_ms": float(np.mean(self.node1_comp_times)),
-            "p50_comp_ms": float(np.percentile(self.node1_comp_times, 50)),
-            "p95_comp_ms": float(np.percentile(self.node1_comp_times, 95)),
-            "accept_rate": (self.accepted_drafts / max(1, self.total_drafts)) * 100.0,
-        }
 
 
 def main():
@@ -100,7 +66,11 @@ def main():
     parser.add_argument("--dtype", type=str, default="float16", choices=["float16", "bfloat16"])
     parser.add_argument("--relay-host", type=str, default=RELAY_HOST, help="AWS EC2 relay IP/hostname")
     parser.add_argument("--relay-port", type=int, default=RELAY_PORT, help="AWS EC2 relay port")
-    parser.add_argument("--max-sessions", type=int, default=1000, help="Max requests before restart")
+    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
+    parser.add_argument("--top-k", type=int, default=0, help="Top-K sampling (0=disabled)")
+    parser.add_argument("--top-p", type=float, default=1.0, help="Top-p nucleus sampling (1.0=disabled)")
+    parser.add_argument("--eos-token-id", type=int, default=151643, help="EOS token ID")
+    parser.add_argument("--load-in-4bit", action="store_true", help="Load weights in 4-bit NF4")
     args = parser.parse_args()
 
     config = AutoConfig.from_pretrained(args.model)
@@ -123,14 +93,17 @@ def main():
     print(f"Relay Target: {args.relay_host}:{args.relay_port}")
     print("=" * 70)
 
-    # 1. Load Model Slice
+    # 1. Load Model Slice (Layers layer_start..layer_end + Final Norm + LM Head)
     t0 = time.perf_counter()
     model_slice = load_layer_slice(
         model_path=args.model,
         layer_start=layer_start,
         layer_end=layer_end,
+        include_norm=(layer_end == total_layers),
+        include_lm_head=(layer_end == total_layers),
         device=args.device,
         dtype=target_dtype,
+        load_in_4bit=args.load_in_4bit,
     )
     t_load = time.perf_counter() - t0
     logger.info("Terminal model slice loaded in %0.2fs", t_load)
@@ -160,86 +133,174 @@ def main():
             last_verified_round_id = 0
 
             while True:
-                # Receive activation frame from Node 0
-                tensor, drafts, recv_stats = recv_tensor_timed(sock)
+                # 1. Receive activation tensor from Node 0 timed
+                try:
+                    tensor, drafts, recv_stats = recv_tensor_timed(sock)
+                except (ConnectionError, EOFError):
+                    logger.warning("Relay connection closed by peer. Waiting to reconnect...")
+                    break
+
                 round_id = recv_stats.get("round_id", 0)
+                parent_round_id = recv_stats.get("parent_round_id", 0)
 
-                t_comp_0 = time.perf_counter()
+                # Reset KV cache on prefill (length > 1 and no drafts)
+                if tensor.shape[1] > 1 and not drafts:
+                    if step > 0:
+                        profiler.print_breakdown()
+                    node.kv_store.evict(session_id)
+                    step = 0
+                    last_verified_round_id = 0
 
-                # Handle multi-token speculative verification
-                if drafts and len(drafts) > 0:
-                    num_candidates = tensor.shape[1]
-                    output = node.forward(tensor, session_id=session_id, compute_head=True)
+                # Check if this in-flight child was predicated on a mismatched parent round
+                if parent_round_id > 0 and parent_round_id != last_verified_round_id:
+                    send_token_timed(
+                        sock,
+                        token_id=0,
+                        accepted_count=0,
+                        is_eos=False,
+                        compute_ms=0.0,
+                        round_id=round_id,
+                        is_stale_discard=True,
+                    )
+                    continue
+
+                t_step_0 = time.perf_counter()
+
+                # 2. Move tensor to GPU
+                t_c2g_0 = time.perf_counter()
+                tensor_gpu = tensor.to(node.model_slice.device, non_blocking=False)
+                t_c2g_1 = time.perf_counter()
+
+                if drafts:
+                    # Speculative verification of K candidate tokens
+                    t_fwd_0 = time.perf_counter()
+                    output = node._forward(
+                        tensor_gpu,
+                        session_id=session_id,
+                        compute_head=True,
+                    )
                     if output.is_cuda:
                         torch.cuda.synchronize(output.device)
+                    t_fwd_1 = time.perf_counter()
 
-                    logits = output[0]  # [num_candidates, vocab_size]
-                    accepted_count = 0
-                    is_eos = False
-                    next_token = -1
-
-                    # Verify candidate tokens sequentially
-                    for k_idx in range(num_candidates):
-                        cand_logits = logits[k_idx]
-                        predicted_tok = int(cand_logits.argmax(dim=-1).item())
-
-                        if k_idx < len(drafts):
-                            draft_tok = drafts[k_idx]
-                            if predicted_tok == draft_tok:
-                                accepted_count += 1
-                                if predicted_tok in (151643, 151645):  # EOS
-                                    is_eos = True
-                                    next_token = predicted_tok
-                                    break
-                            else:
-                                next_token = predicted_tok
-                                accepted_count += 1
-                                break
+                    t_head_0 = time.perf_counter()
+                    accepted_tokens = []
+                    next_token = None
+                    for i in range(len(drafts)):
+                        cand = sample_next_token(
+                            output[0, i, :],
+                            temperature=args.temperature,
+                            top_k=args.top_k,
+                            top_p=args.top_p,
+                        )
+                        if cand == drafts[i]:
+                            accepted_tokens.append(drafts[i])
                         else:
-                            next_token = predicted_tok
-                            accepted_count += 1
+                            next_token = cand
                             break
 
-                    # Rollback KV cache on target model to accepted length
-                    past_len = node.get_session_seq_len(session_id)
-                    committed_len = past_len - (num_candidates - accepted_count)
-                    if session_id in node.kv_pools:
-                        rewind_kv_cache(node.kv_pools[session_id], committed_len)
+                    if next_token is None:
+                        # All drafts accepted; bonus sample from final candidate position
+                        next_token = sample_next_token(
+                            output[0, -1, :],
+                            temperature=args.temperature,
+                            top_k=args.top_k,
+                            top_p=args.top_p,
+                        )
 
-                    t_comp_1 = time.perf_counter()
-                    node1_comp_ms = (t_comp_1 - t_comp_0) * 1000.0
+                    accepted_count = len(accepted_tokens) + 1
 
-                    send_token_timed(
+                    # Rewind KV cache to exact accepted sequence length
+                    cache = node.kv_store.get(session_id)
+                    if cache is not None:
+                        past_seq = node._get_cache_seq_len(cache)
+                        past_seq_before = int(past_seq or 0) - (len(drafts) + 1)
+                        rewind_kv_cache(cache, past_seq_before + accepted_count)
+
+                    if accepted_count == len(drafts) + 1:
+                        last_verified_round_id = round_id
+                    else:
+                        last_verified_round_id = 0
+
+                    is_eos = (next_token == args.eos_token_id)
+                    t_head_1 = time.perf_counter()
+                    node1_compute_ms = (t_head_1 - t_c2g_0) * 1000.0
+
+                    send_stats = send_token_timed(
                         sock,
-                        token_id=next_token,
+                        next_token,
                         accepted_count=accepted_count,
                         is_eos=is_eos,
-                        node1_compute_ms=node1_comp_ms,
+                        compute_ms=node1_compute_ms,
+                        round_id=round_id,
+                        is_stale_discard=False,
                     )
-                    profiler.record(node1_comp_ms, accepted=accepted_count, drafted=len(drafts))
+                    t_step_1 = time.perf_counter()
+                    step += accepted_count
+
+                    profiler.record(
+                        recv_ms=recv_stats["tcp_recv_ms"],
+                        deser_ms=recv_stats["deserialize_ms"],
+                        c2g_ms=(t_c2g_1 - t_c2g_0) * 1000.0,
+                        fwd_ms=(t_fwd_1 - t_fwd_0) * 1000.0,
+                        head_ms=0.0,
+                        smpl_ms=(t_head_1 - t_head_0) * 1000.0,
+                        send_ms=send_stats["tcp_send_ms"],
+                        total_ms=(t_step_1 - t_step_0) * 1000.0,
+                    )
 
                 else:
-                    # Standard single-token autoregressive step
-                    output = node.forward(tensor, session_id=session_id, compute_head=True)
-                    if output.is_cuda:
-                        torch.cuda.synchronize(output.device)
+                    # Standard 1-token decode
+                    step += 1
+                    t_fwd_0 = time.perf_counter()
+                    hidden_out = node._forward(
+                        tensor_gpu,
+                        session_id=session_id,
+                        compute_head=False,
+                    )
+                    if hidden_out.is_cuda:
+                        torch.cuda.synchronize(hidden_out.device)
+                    t_fwd_1 = time.perf_counter()
 
-                    t_comp_1 = time.perf_counter()
-                    node1_comp_ms = (t_comp_1 - t_comp_0) * 1000.0
+                    t_head_0 = time.perf_counter()
+                    if node.model_slice.norm is not None:
+                        hidden_out = node.model_slice.norm(hidden_out)
+                    if node.model_slice.lm_head is not None:
+                        logits = node.model_slice.lm_head(hidden_out[:, -1:, :])
+                    else:
+                        logits = hidden_out[:, -1:, :]
 
-                    next_token = int(output[0, -1, :].argmax(dim=-1).item())
-                    is_eos = next_token in (151643, 151645)
+                    next_token = sample_next_token(
+                        logits[0, -1, :],
+                        temperature=args.temperature,
+                        top_k=args.top_k,
+                        top_p=args.top_p,
+                    )
+                    is_eos = (next_token == args.eos_token_id)
+                    t_head_1 = time.perf_counter()
+                    node1_compute_ms = (t_head_1 - t_c2g_0) * 1000.0
 
-                    send_token_timed(
+                    send_stats = send_token_timed(
                         sock,
-                        token_id=next_token,
+                        next_token,
                         accepted_count=1,
                         is_eos=is_eos,
-                        node1_compute_ms=node1_comp_ms,
+                        compute_ms=node1_compute_ms,
+                        round_id=round_id,
+                        is_stale_discard=False,
                     )
-                    profiler.record(node1_comp_ms, accepted=1, drafted=0)
+                    t_step_1 = time.perf_counter()
 
-                step += 1
+                    profiler.record(
+                        recv_ms=recv_stats["tcp_recv_ms"],
+                        deser_ms=recv_stats["deserialize_ms"],
+                        c2g_ms=(t_c2g_1 - t_c2g_0) * 1000.0,
+                        fwd_ms=(t_fwd_1 - t_fwd_0) * 1000.0,
+                        head_ms=(t_head_1 - t_head_0) * 1000.0,
+                        smpl_ms=0.0,
+                        send_ms=send_stats["tcp_send_ms"],
+                        total_ms=(t_step_1 - t_step_0) * 1000.0,
+                    )
 
         except (ConnectionError, TimeoutError, EOFError, socket.error) as e:
             logger.warning("Session ended or disconnected (%s). Re-entering connection loop in 2s...", e)
