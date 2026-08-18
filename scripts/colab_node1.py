@@ -6,7 +6,7 @@ Runs Node 1 (Layers 14..28 + LM Head on Qwen2.5-7B) on a Google Colab T4 GPU
 connected directly to the AWS EC2 TCP Relay.
 
 Usage on Colab (Notebook 1):
-  !python scripts/colab_node1.py --model Qwen/Qwen2.5-7B-Instruct --relay-host 3.23.174.207 --relay-port 9500
+  !python scripts/colab_node1.py --model Qwen/Qwen2.5-7B-Instruct --relay-host <YOUR_RELAY_IP> --relay-port 9500
 """
 
 import os

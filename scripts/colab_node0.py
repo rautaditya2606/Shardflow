@@ -6,7 +6,7 @@ Runs Node 0 (Layers 0..14 on Qwen2.5-7B) along with the Neural Draft Model (Qwen
 on a Google Colab T4 GPU (sharing cuda:0 in ~8.6 GB VRAM) connected to the AWS EC2 TCP Relay.
 
 Usage on Colab (Notebook 2):
-  !python scripts/colab_node0.py --model Qwen/Qwen2.5-7B-Instruct --draft-model Qwen/Qwen2.5-0.5B-Instruct --spec-k 8 --relay-host 3.23.174.207 --relay-port 9500
+  !python scripts/colab_node0.py --model Qwen/Qwen2.5-7B-Instruct --draft-model Qwen/Qwen2.5-0.5B-Instruct --spec-k 8 --relay-host <YOUR_RELAY_IP> --relay-port 9500
 """
 
 import os

@@ -13,11 +13,13 @@ import logging
 from typing import Optional, Tuple, List, Union
 import torch
 
+import os
+
 logger = logging.getLogger(__name__)
 
-# Default EC2 Relay Configuration (AWS Elastic IP)
-RELAY_HOST = "3.23.174.207"
-RELAY_PORT = 9500
+# Default Relay Configuration (overridable via SHARDFLOW_RELAY_HOST or RELAY_HOST env vars)
+RELAY_HOST = os.getenv("SHARDFLOW_RELAY_HOST", os.getenv("RELAY_HOST", "127.0.0.1"))
+RELAY_PORT = int(os.getenv("SHARDFLOW_RELAY_PORT", os.getenv("RELAY_PORT", "9500")))
 AUTH_BYTE = bytes([0xAD])
 
 # Default Socket Timeout in seconds (prevents hanging if a Kaggle session dies)
@@ -120,7 +122,7 @@ def connect_to_relay(
     Create TCP socket, configure TCP_NODELAY, connect to relay, and send auth byte.
 
     Args:
-        host: Relay IP address or hostname (default: 3.23.174.207)
+        host: Relay IP address or hostname (default: RELAY_HOST)
         port: Relay port (default: 9500)
         auth_byte: 1-byte authorization token (default: 0xAD)
         connect_timeout: Timeout for initial socket connection

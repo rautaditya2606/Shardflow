@@ -7,7 +7,7 @@ connected directly to the AWS EC2 Rust TCP Relay without tunnels.
 
 Startup Sequence:
 1. Start Node 1 first on Kaggle Instance B.
-2. Node 1 connects to relay (3.23.174.207:9500) and waits for Node 0.
+2. Node 1 connects to relay (<RELAY_IP>:9500) and waits for Node 0.
 3. When Node 0 starts, relay pairs them and they execute READY handshake.
 4. Node 1 enters pure compute decode loop (recv activation -> forward -> send token).
 """
