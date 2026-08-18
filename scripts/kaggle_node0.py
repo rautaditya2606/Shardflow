@@ -493,7 +493,7 @@ def main():
     parser.add_argument("--spec-k", type=int, default=0, help="Speculative candidate tokens (default: 0 to disable, 4 to test)")
     parser.add_argument("--layer-start", type=int, default=0, help="Starting layer index (default: 0)")
     parser.add_argument("--layer-end", type=int, default=None, help="Ending layer index (default: half of total layers, e.g. 24 for 14B)")
-    parser.add_argument("--4bit", action="store_true", help="Enable 4-bit NF4 loading")
+    parser.add_argument("--4bit", "--load-in-4bit", dest="4bit", action="store_true", help="Enable 4-bit NF4 loading")
     parser.add_argument("--relay-host", default=RELAY_HOST, help=f"EC2 Relay IP (default: {RELAY_HOST})")
     parser.add_argument("--relay-port", type=int, default=RELAY_PORT, help=f"EC2 Relay Port (default: {RELAY_PORT})")
     parser.add_argument("--device", default="cuda", help="Target device (default: cuda)")
