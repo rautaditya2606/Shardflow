@@ -17,7 +17,28 @@ import os
 
 logger = logging.getLogger(__name__)
 
-# Default Relay Configuration (overridable via SHARDFLOW_RELAY_HOST or RELAY_HOST env vars)
+
+def _load_dotenv_if_present() -> None:
+    """Lightweight .env loader without third-party dependencies."""
+    for candidate in [".env", "../.env", os.path.join(os.getcwd(), ".env")]:
+        if os.path.isfile(candidate):
+            try:
+                with open(candidate, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            k, v = k.strip(), v.strip().strip('"').strip("'")
+                            if k not in os.environ:
+                                os.environ[k] = v
+                break
+            except Exception:
+                pass
+
+
+_load_dotenv_if_present()
+
+# Default Relay Configuration (overridable via SHARDFLOW_RELAY_HOST or RELAY_HOST env vars, or .env)
 RELAY_HOST = os.getenv("SHARDFLOW_RELAY_HOST", os.getenv("RELAY_HOST", "127.0.0.1"))
 RELAY_PORT = int(os.getenv("SHARDFLOW_RELAY_PORT", os.getenv("RELAY_PORT", "9500")))
 AUTH_BYTE = bytes([0xAD])
