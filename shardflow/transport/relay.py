@@ -149,7 +149,7 @@ def connect_to_relay(
 HANDSHAKE_MAGIC = b"SF_READY"  # Exactly 8 bytes
 
 
-def handshake(sock: socket.socket, is_initiator: bool = True, timeout: float = 120.0) -> None:
+def handshake(sock: socket.socket, is_initiator: bool = True, timeout: float = 300.0) -> None:
     """
     Execute clean two-way READY handshake through the EC2 relay.
 
@@ -160,15 +160,27 @@ def handshake(sock: socket.socket, is_initiator: bool = True, timeout: float = 1
     sock.settimeout(timeout)
     try:
         if is_initiator:
-            logger.info("Sending READY handshake to peer through relay...")
+            logger.info("Sending READY handshake to peer through relay (waiting up to %0.0fs for Node 1)...", timeout)
             sock.sendall(HANDSHAKE_MAGIC)
-            ack = recvall(sock, len(HANDSHAKE_MAGIC))
+            try:
+                ack = recvall(sock, len(HANDSHAKE_MAGIC))
+            except TimeoutError as e:
+                raise TimeoutError(
+                    f"Handshake timed out after {timeout}s. Node 1 has not connected to the relay yet. "
+                    "Make sure Node 1 (scripts/colab_node1.py) is started and connected before running Node 0."
+                ) from e
             if ack != HANDSHAKE_MAGIC:
                 raise ConnectionError(f"Handshake failed: expected {HANDSHAKE_MAGIC!r}, received {ack!r}")
             logger.info("[OK] Handshake successful: Peer node is READY!")
         else:
-            logger.info("Waiting for READY handshake from Node 0 through relay...")
-            ping = recvall(sock, len(HANDSHAKE_MAGIC))
+            logger.info("Waiting up to %0.0fs for READY handshake from Node 0 through relay...", timeout)
+            try:
+                ping = recvall(sock, len(HANDSHAKE_MAGIC))
+            except TimeoutError as e:
+                raise TimeoutError(
+                    f"Handshake timed out after {timeout}s waiting for Node 0 to start. "
+                    "Make sure Node 0 (scripts/colab_node0.py) is launched."
+                ) from e
             if ping != HANDSHAKE_MAGIC:
                 raise ConnectionError(f"Handshake failed: expected {HANDSHAKE_MAGIC!r}, received {ping!r}")
             sock.sendall(HANDSHAKE_MAGIC)
