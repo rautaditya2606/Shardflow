@@ -18,24 +18,24 @@ ShardFlow combines **neural speculative decoding ($K=8$ on dual-GPU nodes)**, **
 
 ### Quick Summary
 
-| Metric | Non-Speculative Baseline ($K=0$) | ShardFlow Speculative ($K=8$) | Improvement |
+| Metric | Non-Speculative Baseline ($K=0$) | ShardFlow Speculative ($K=8$, CUDA Graphs) | Improvement |
 |---|:---:|:---:|:---:|
-| **Peak Throughput** | 4.92 TPS | **14.31 TPS** | **2.91x** |
-| **Average Throughput** | 4.92 TPS | **11.91 TPS** | **2.42x** |
-| **Tokens per WAN Round-Trip** | 1.00 tok/round | **4.36 tok/round** | **4.36x** |
-| **Draft Model Accept Rate** | N/A | **58.0%** (Peak) / 44.5% (Avg) | - |
+| **Peak Throughput** | 4.92 TPS | **27.08 TPS** | **5.50x** (11.9x vs v1) |
+| **Average Throughput** | 4.92 TPS | **19.96 TPS** | **4.06x** (8.8x vs v1) |
+| **Tokens per WAN Round-Trip** | 1.00 tok/round | **4.07 tok/round** | **4.07x** |
+| **Draft Model Accept Rate** | N/A | **65.0%** (Peak) / 42.9% (Avg) | - |
 | **Cluster Setup** | 2x Free Kaggle T4 Instances + AWS EC2 `t3.micro` Relay (`us-east-2` Ohio) | | |
-| **Target / Draft Models** | `Qwen2.5-7B-Instruct` (FP16) / `Qwen2.5-0.5B-Instruct` (FP16) | | |
+| **Target / Draft Models** | `Qwen2.5-7B-Instruct` (FP16) / `Qwen2.5-0.5B-Instruct` (FP16, StaticCache) | | |
 | **Network Link** | Public Internet WAN (Iowa <-> Ohio <-> Oregon, ~86 ms RTT) | | |
 
 ---
 
 ## Table of Contents
 
-1. [Empirical Benchmark Results (14.31 TPS Peak)](#1-empirical-benchmark-results)
+1. [Empirical Benchmark Results (27.08 TPS Peak)](#1-empirical-benchmark-results)
    - [Head-to-Head Comparison](#head-to-head-comparison)
    - [Prompt-by-Prompt Breakdown](#prompt-by-prompt-breakdown)
-   - [Speculative Depth Scaling (K-Sweep)](#speculative-depth-scaling-k-sweep)
+   - [ShardFlow System Evolution (v1 to v2.1)](#shardflow-system-evolution)
 2. [System Architecture](#2-system-architecture)
    - [Data Flow Diagram](#data-flow-diagram)
    - [Cluster Node Roles](#cluster-node-roles)
@@ -61,11 +61,11 @@ Live benchmark evaluating **Qwen2.5-7B-Instruct** partitioned across two separat
 
 ```
 ===================================================================================================================
-IN-FLIGHT SPECULATIVE WINDOW EMPIRICAL RESULTS (Qwen2.5-7B Target + Qwen2.5-0.5B Drafter)
+IN-FLIGHT SPECULATIVE WINDOW EMPIRICAL RESULTS (Qwen2.5-7B Target + Qwen2.5-0.5B CUDA Graph Drafter, K=8)
 ===================================================================================================================
 Window |    TPS | TTFT (ms) | Tok/Round | Full Hit % | Bubble (ms) | N0 Fwd (ms) | N1 Comp (ms) | Net RTT (ms)
 -------------------------------------------------------------------------------------------------------------------
-     1 |  11.91 |     242.7 |      4.36 |      19.0% |       36.03 |       36.03 |        42.20 |       337.68
+     1 |  19.96 |     378.6 |      4.07 |      15.6% |       36.63 |       36.63 |        42.84 |       175.78
 ===================================================================================================================
 ```
 
@@ -73,19 +73,19 @@ Window |    TPS | TTFT (ms) | Tok/Round | Full Hit % | Bubble (ms) | N0 Fwd (ms)
 
 | Test Prompt Topic | Domain | Draft Accept Rate | Accepted Drafts | Total Generated | Decode Time | Measured Speed |
 |---|---|:---:|:---:|:---:|:---:|:---:|
-| **Explain Quantum Entanglement** | Conceptual / Physics | **58.0%** | 51 / 88 | 63 tokens | 4.33 s | **14.31 TPS** |
-| **Fibonacci Dynamic Programming** | Python Algorithm | **47.1%** | 49 / 104 | 63 tokens | 4.89 s | **12.67 TPS** |
-| **Pipeline Parallelism Advantages** | Technical LLM Systems | **28.5%** | 41 / 144 | 60 tokens | 6.73 s | **8.77 TPS** |
+| **Explain Quantum Entanglement** | Conceptual / Physics | **65.0%** | 52 / 80 | 63 tokens | **2.29 s** | **27.08 TPS** 🔥 |
+| **Fibonacci Dynamic Programming** | Python Algorithm | **39.2%** | 47 / 120 | 63 tokens | **3.24 s** | **19.14 TPS** |
+| **Pipeline Parallelism Advantages** | Technical LLM Systems | **24.4%** | 39 / 160 | 60 tokens | **4.32 s** | **13.67 TPS** |
 
-### Speculative Depth Scaling (K-Sweep)
+### ShardFlow System Evolution
 
-| Configuration | Draft Model | Speculative $K$ | Avg Tok/Round | Avg Step RTT | Throughput | Speedup vs Baseline |
-|---|---|:---:|:---:|:---:|:---:|:---:|
-| **Non-Speculative Baseline** | None (Single token) | $K=0$ | 1.00 | 203 ms | **4.92 TPS** | 1.00x |
-| **N-gram Speculation** | N-gram Matcher | $K=4$ | 1.66 | 215 ms | **7.72 TPS** | 1.57x |
-| **Neural Draft $K=5$** | `Qwen2.5-0.5B` | $K=5$ | 2.83 | 259 ms | **9.55 TPS** | 1.94x |
-| **Neural Draft $K=8$ (Optimal)** | `Qwen2.5-0.5B` | **$K=8$** | **4.36** | **338 ms** | **11.91 TPS** (Peak: **14.31**) | **2.42x** |
-| **Neural Draft $K=10$** | `Qwen2.5-0.5B` | $K=10$ | 4.20 | 412 ms | **9.65 TPS** | 1.96x |
+| Version | Transport / Pipeline Architecture | Draft Engine | Speculative $K$ | Tok/Round | Quantum Decode (63 tok) | Measured Speed | Speedup vs Baseline |
+|---|---|---|:---:|:---:|:---:|:---:|:---:|
+| **v1.0** | REST Relay (Gateway in decode loop) | None | $K=0$ | 1.00 | ~27.7 s | **2.27 TPS** | 0.46x |
+| **v2.0 (Baseline)** | Direct Peer-to-Peer TCP Relay | None | $K=0$ | 1.00 | 12.8 s | **4.92 TPS** | 1.00x |
+| **v2.0 (N-gram)** | Direct Peer-to-Peer TCP Relay | N-gram Matcher | $K=4$ | 1.66 | 8.2 s | **7.72 TPS** | 1.57x |
+| **v2.0 (Eager Draft)** | Direct Peer-to-Peer TCP Relay | `Qwen2.5-0.5B` (Eager) | $K=8$ | 4.36 | 4.33 s | **11.91 TPS** (Peak: **14.31**) | 2.42x |
+| **v2.1 (CUDA Graphs)** | Direct Peer-to-Peer TCP Relay | `Qwen2.5-0.5B` (StaticCache) | **$K=8$** | **4.07** | **2.29 s** | **19.96 TPS** (Peak: **27.08**) | **4.06x** (Peak: **5.50x**) |
 
 ---
 
