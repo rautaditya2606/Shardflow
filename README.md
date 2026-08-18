@@ -89,6 +89,31 @@ Window |    TPS | TTFT (ms) | Tok/Round | Full Hit % | Bubble (ms) | N0 Fwd (ms)
 
 ---
 
+### 14.7B Parameter Model Scaling (`Qwen2.5-14B-Instruct`, 48 Layers)
+
+Live cross-region benchmark of **Qwen2.5-14B-Instruct** (48 layers, 4-bit NF4 weights) partitioned across 2 Kaggle nodes communicating over WAN:
+
+```
+===================================================================================================================
+ IN-FLIGHT SPECULATIVE WINDOW EMPIRICAL RESULTS (Qwen2.5-14B Target + Qwen2.5-0.5B Drafter, K=8)
+===================================================================================================================
+Window |    TPS | TTFT (ms) | Tok/Round | Full Hit % | Bubble (ms) | N0 Fwd (ms) | N1 Comp (ms) | Net RTT (ms)
+-------------------------------------------------------------------------------------------------------------------
+     1 |  14.43 |     423.8 |      4.31 |      26.2% |       84.34 |       84.34 |        84.15 |       235.25
+===================================================================================================================
+```
+
+| Test Prompt Topic | Target Model | Draft Model | Draft Accept Rate | Total Generated | Decode Time | Measured Speed |
+|---|---|---|:---:|:---:|:---:|:---:|
+| **Fibonacci Dynamic Programming** | `Qwen2.5-14B` (48L) | `Qwen2.5-0.5B` (K=8) | **65.0%** | 63 tokens | **3.07 s** | **20.17 TPS** 🔥 |
+| **Explain Quantum Entanglement** | `Qwen2.5-14B` (48L) | `Qwen2.5-0.5B` (K=8) | **41.1%** | 61 tokens | **4.82 s** | **12.45 TPS** |
+| **Pipeline Parallelism Advantages** | `Qwen2.5-14B` (48L) | `Qwen2.5-0.5B` (K=8) | **28.5%** | 60 tokens | **5.53 s** | **10.67 TPS** |
+
+> [!NOTE]
+> Even with a **$29.4\times$ parameter scale discrepancy** (0.5B drafter predicting for a 14.7B target), ShardFlow achieved **65.0% acceptance** and **20.17 TPS peak** over public internet WAN links on free cloud GPUs.
+
+---
+
 ## 2. System Architecture
 
 ### Data Flow Diagram
