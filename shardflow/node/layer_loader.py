@@ -266,14 +266,20 @@ def _get_safetensors_shards_map(model_path: str) -> tuple[Optional[Dict[str, str
 
     try:
         from huggingface_hub import hf_hub_download, try_to_load_from_cache
-        target_cache_dir = "/kaggle/working/hf_home" if os.path.exists("/kaggle") else None
+        target_cache_dir = None
+        if os.path.exists("/kaggle"):
+            target_cache_dir = "/kaggle/working/hf_home"
+        elif os.path.exists("/content"):
+            target_cache_dir = "/content/hf_home"
+
         hf_tok = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
-        index_file = try_to_load_from_cache(repo_id=model_path, filename="model.safetensors.index.json", cache_dir=target_cache_dir, token=hf_tok)
+        index_file = try_to_load_from_cache(repo_id=model_path, filename="model.safetensors.index.json", cache_dir=target_cache_dir)
         if not (isinstance(index_file, (str, Path)) and os.path.exists(index_file)):
             index_file = hf_hub_download(repo_id=model_path, filename="model.safetensors.index.json", cache_dir=target_cache_dir, token=hf_tok)
         with open(index_file) as f:
             return json.load(f)["weight_map"], local_dir
-    except Exception:
+    except Exception as e:
+        logger.warning("Could not resolve model.safetensors.index.json for %s: %s", model_path, e)
         return None, local_dir
 
 
@@ -490,7 +496,12 @@ def load_layer_slice(
                 shard_path = str(local_dir / shard_name)
             else:
                 from huggingface_hub import hf_hub_download, try_to_load_from_cache
-                target_cache_dir = "/kaggle/working/hf_home" if os.path.exists("/kaggle") else None
+                target_cache_dir = None
+                if os.path.exists("/kaggle"):
+                    target_cache_dir = "/kaggle/working/hf_home"
+                elif os.path.exists("/content"):
+                    target_cache_dir = "/content/hf_home"
+
                 hf_tok = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
                 cached = try_to_load_from_cache(repo_id=model_path, filename=shard_name, cache_dir=target_cache_dir)
                 if isinstance(cached, (str, Path)) and os.path.exists(cached):
@@ -608,36 +619,42 @@ def load_layer_slice(
             except Exception:
                 single_path = None
 
-        if single_path is not None:
-            logger.info("Loading single safetensors file %s...", single_path)
-            state_dict = load_file(single_path, device="cpu")
-            if load_in_4bit:
-                _load_state_dict_into_4bit_slice(
-                    extracted_layers=extracted_layers,
-                    state_dict=state_dict,
-                    layer_start=layer_start,
-                    layer_end=layer_end,
-                    device=target_device,
-                    compute_dtype=target_dtype,
-                    norm=norm,
-                    lm_head=lm_head,
-                    embed_tokens=embed_tokens,
-                )
-            else:
-                for idx, orig_idx in enumerate(range(layer_start, layer_end)):
-                    prefix = f"model.layers.{orig_idx}."
-                    layer_dev = get_layer_device(idx)
-                    layer_sd = {
-                        k[len(prefix):]: v.to(layer_dev, dtype=target_dtype)
-                        for k, v in state_dict.items() if k.startswith(prefix)
-                    }
-                    extracted_layers[idx].load_state_dict(layer_sd, strict=False)
-                if norm is not None:
-                    norm.load_state_dict({k[len("model.norm."):]: v.to(device_list[-1], dtype=target_dtype) for k, v in state_dict.items() if k.startswith("model.norm.")}, strict=False)
-                if lm_head is not None:
-                    lm_head.load_state_dict({k[len("lm_head."):]: v.to(device_list[-1], dtype=target_dtype) for k, v in state_dict.items() if k.startswith("lm_head.")}, strict=False)
-                if embed_tokens is not None:
-                    embed_tokens.load_state_dict({k[len("model.embed_tokens."):]: v.to(device_list[0], dtype=target_dtype) for k, v in state_dict.items() if k.startswith("model.embed_tokens.")}, strict=False)
+        if single_path is None:
+            raise RuntimeError(
+                f"Failed to load weights for {model_path}! "
+                "Neither safetensors index (model.safetensors.index.json) nor model.safetensors could be found. "
+                "Please verify model ID or ensure internet access to Hugging Face."
+            )
+
+        logger.info("Loading single safetensors file %s...", single_path)
+        state_dict = load_file(single_path, device="cpu")
+        if load_in_4bit:
+            _load_state_dict_into_4bit_slice(
+                extracted_layers=extracted_layers,
+                state_dict=state_dict,
+                layer_start=layer_start,
+                layer_end=layer_end,
+                device=target_device,
+                compute_dtype=target_dtype,
+                norm=norm,
+                lm_head=lm_head,
+                embed_tokens=embed_tokens,
+            )
+        else:
+            for idx, orig_idx in enumerate(range(layer_start, layer_end)):
+                prefix = f"model.layers.{orig_idx}."
+                layer_dev = get_layer_device(idx)
+                layer_sd = {
+                    k[len(prefix):]: v.to(layer_dev, dtype=target_dtype)
+                    for k, v in state_dict.items() if k.startswith(prefix)
+                }
+                extracted_layers[idx].load_state_dict(layer_sd, strict=False)
+            if norm is not None:
+                norm.load_state_dict({k[len("model.norm."):]: v.to(device_list[-1], dtype=target_dtype) for k, v in state_dict.items() if k.startswith("model.norm.")}, strict=False)
+            if lm_head is not None:
+                lm_head.load_state_dict({k[len("lm_head."):]: v.to(device_list[-1], dtype=target_dtype) for k, v in state_dict.items() if k.startswith("lm_head.")}, strict=False)
+            if embed_tokens is not None:
+                embed_tokens.load_state_dict({k[len("model.embed_tokens."):]: v.to(device_list[0], dtype=target_dtype) for k, v in state_dict.items() if k.startswith("model.embed_tokens.")}, strict=False)
             del state_dict
 
     del model
