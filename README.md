@@ -178,7 +178,7 @@ Speculative decoding requires the draft model and the target model to maintain i
 
 ### 3. AWS EC2 TCP Relay Transport (t3.micro, us-east-2 Ohio)
 Cloud notebooks (Kaggle/Colab) do not expose public IP addresses or open inbound ports.
-- **Zero-Tunnel TCP Bridging**: Both nodes connect outbound to an AWS EC2 `t3.micro` instance running in `us-east-2` (Ohio) hosting our low-latency Rust TCP relay (`3.23.174.207:9500`).
+- **Zero-Tunnel TCP Bridging**: Both nodes connect outbound to an AWS EC2 `t3.micro` instance running in `us-east-2` (Ohio) hosting our low-latency Rust TCP relay (`<your-relay-ip>:9500`).
 - **Framed Binary Protocol**: Binary activations are serialized as raw float16 buffers with 8-byte big-endian length prefixing (`>Q`), minimizing CPU serialization time to $<1.5\text{ ms}$.
 - **Initiator-Listener Magic Handshake**: Nodes exchange an exact 8-byte handshake token (`b"SF_READY"`) using an initiator/listener protocol that prevents socket buffer pollution and race conditions upon startup.
 
@@ -205,7 +205,7 @@ os.environ["HF_HOME"] = "/kaggle/working/hf_home"
     --model /kaggle/working/models/Qwen2.5-7B-Instruct \
     --layer-start 14 \
     --device cuda \
-    --relay-host 3.23.174.207 \
+    --relay-host <your-relay-ip> \
     --relay-port 9500 \
     --dtype float16
 ```
@@ -231,7 +231,7 @@ os.environ["HF_HOME"] = "/kaggle/working/hf_home"
     --device cuda:0 \
     --spec-k 8 \
     --windows 1 \
-    --relay-host 3.23.174.207 \
+    --relay-host <your-relay-ip> \
     --relay-port 9500 \
     --dtype float16
 ```

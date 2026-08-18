@@ -68,6 +68,8 @@ class DraftSampler:
     """
     Lightweight draft model sampler running on Node 0.
     Generates K candidate tokens locally at high throughput (~80+ TPS).
+    ponytail: Uses StaticCache + CUDA Graph capture on CUDA devices for zero-allocation
+    kernel dispatch, falling back to DynamicCache on CPU.
     """
 
     def __init__(
@@ -76,15 +78,19 @@ class DraftSampler:
         device: torch.device,
         dtype: torch.dtype = torch.float16,
         spec_k: int = 4,
+        max_cache_len: int = 1024,
+        enable_cuda_graphs: bool = True,
     ):
         self.model_path = model_path
         self.device = torch.device(device) if isinstance(device, str) else device
         self.dtype = dtype
         self.spec_k = spec_k
-        self.cache = DynamicCache()
+        self.max_cache_len = max_cache_len
         self._seq_len: int = 0
+        self._is_cuda = (self.device.type == "cuda" and torch.cuda.is_available())
+        self.use_cuda_graphs = self._is_cuda and enable_cuda_graphs
 
-        logger.info("Loading draft model %s on %s (dtype=%s, K=%d)...", model_path, device, dtype, spec_k)
+        logger.info("Loading draft model %s on %s (dtype=%s, K=%d, cuda_graphs=%s)...", model_path, device, dtype, spec_k, self.use_cuda_graphs)
         import os
         target_cache = "/kaggle/working/hf_home" if os.path.exists("/kaggle") else None
         actual_path = model_path
@@ -106,8 +112,81 @@ class DraftSampler:
         self.transformer = getattr(self.model, "model", self.model)
         self.lm_head = getattr(self.model, "lm_head", None)
 
-        # Pre-allocated single-token buffer to avoid GPU tensor allocations in decode loop
-        self._cur_tensor = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+        self._decode_graph: Optional[torch.cuda.CUDAGraph] = None
+        self._static_input_ids: Optional[torch.Tensor] = None
+        self._static_pos_ids: Optional[torch.Tensor] = None
+        self._static_cache_pos: Optional[torch.Tensor] = None
+        self._static_argmax: Optional[torch.Tensor] = None
+        self.static_cache: Optional[StaticCache] = None
+        self.cache: Optional[DynamicCache] = None
+
+        if self.use_cuda_graphs:
+            try:
+                self._init_cuda_graphs()
+            except Exception as e:
+                logger.warning("DraftSampler: CUDA Graph capture failed (%s), falling back to DynamicCache eager mode.", e)
+                self.use_cuda_graphs = False
+                self._decode_graph = None
+
+        if not self.use_cuda_graphs:
+            self.cache = DynamicCache()
+            self._cur_tensor = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+
+    def _init_cuda_graphs(self) -> None:
+        """ponytail: Pre-allocate StaticCache and capture single-token decode graph."""
+        self.static_cache = StaticCache(
+            config=self.model.config,
+            max_batch_size=1,
+            max_cache_len=self.max_cache_len,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self._static_input_ids = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+        self._static_pos_ids = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+        self._static_cache_pos = torch.zeros((1,), dtype=torch.long, device=self.device)
+        self._static_argmax = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+
+        # Warmup and capture on dedicated CUDA stream
+        s = torch.cuda.Stream(device=self.device)
+        s.wait_stream(torch.cuda.current_stream(device=self.device))
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                out = self.transformer(
+                    input_ids=self._static_input_ids,
+                    past_key_values=self.static_cache,
+                    position_ids=self._static_pos_ids,
+                    cache_position=self._static_cache_pos,
+                    use_cache=True,
+                    return_dict=False,
+                )
+                h = out[0] if isinstance(out, (tuple, list)) else out
+                if self.lm_head is not None:
+                    logits = self.lm_head(h[:, -1:, :])
+                else:
+                    logits = h[:, -1:, :]
+                self._static_argmax.copy_(logits.argmax(dim=-1))
+        torch.cuda.current_stream(device=self.device).wait_stream(s)
+
+        self._decode_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._decode_graph, stream=s):
+            out = self.transformer(
+                input_ids=self._static_input_ids,
+                past_key_values=self.static_cache,
+                position_ids=self._static_pos_ids,
+                cache_position=self._static_cache_pos,
+                use_cache=True,
+                return_dict=False,
+            )
+            h = out[0] if isinstance(out, (tuple, list)) else out
+            if self.lm_head is not None:
+                logits = self.lm_head(h[:, -1:, :])
+            else:
+                logits = h[:, -1:, :]
+            self._static_argmax.copy_(logits.argmax(dim=-1))
+
+        # Reset static cache seen tokens after warmup
+        rewind_static_cache(self.static_cache, 0)
+        logger.info("DraftSampler: Successfully captured CUDA Graph for single-token decode on %s", self.device)
 
     @property
     def seq_len(self) -> int:
@@ -115,8 +194,11 @@ class DraftSampler:
         return self._seq_len
 
     def reset(self) -> None:
-        """Reset draft model KV cache for a new session. """
-        self.cache = DynamicCache()
+        """Reset draft model KV cache for a new session."""
+        if self.use_cuda_graphs and self.static_cache is not None:
+            rewind_static_cache(self.static_cache, 0)
+        else:
+            self.cache = DynamicCache()
         self._seq_len = 0
 
     @torch.inference_mode()
@@ -129,17 +211,32 @@ class DraftSampler:
         if not prompt_tokens:
             return
         input_ids = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
-        self.transformer(
-            input_ids=input_ids,
-            past_key_values=self.cache,
-            use_cache=True,
-            return_dict=False,
-        )
+        if self.use_cuda_graphs and self.static_cache is not None:
+            pos_ids = torch.arange(len(prompt_tokens), dtype=torch.long, device=self.device).unsqueeze(0)
+            cache_pos = torch.arange(len(prompt_tokens), dtype=torch.long, device=self.device)
+            self.transformer(
+                input_ids=input_ids,
+                past_key_values=self.static_cache,
+                position_ids=pos_ids,
+                cache_position=cache_pos,
+                use_cache=True,
+                return_dict=False,
+            )
+        else:
+            self.transformer(
+                input_ids=input_ids,
+                past_key_values=self.cache,
+                use_cache=True,
+                return_dict=False,
+            )
         self._seq_len = len(prompt_tokens)
 
     def rewind(self, target_seq_len: int) -> None:
         """Rewind draft model KV cache after speculative rejection."""
-        rewind_dynamic_cache(self.cache, target_seq_len)
+        if self.use_cuda_graphs and self.static_cache is not None:
+            rewind_static_cache(self.static_cache, target_seq_len)
+        elif self.cache is not None:
+            rewind_dynamic_cache(self.cache, target_seq_len)
         self._seq_len = target_seq_len
 
     @torch.inference_mode()
@@ -153,13 +250,27 @@ class DraftSampler:
     ) -> List[int]:
         """
         Generate K candidate draft tokens locally.
-        ponytail: GPU-resident argmax loop with zero per-token CPU-GPU synchronization.
+        ponytail: Replays captured CUDA Graph with zero CPU kernel launches when greedy and on CUDA.
         """
         k = k or self.spec_k
         if k <= 0:
             return []
 
-        # Greedy path: 100% GPU resident, direct forward on compiled transformer
+        # CUDA Graph fast path for greedy decode
+        if (temperature <= 0 or temperature < 1e-8) and self.use_cuda_graphs and self._decode_graph is not None:
+            curr_tok = current_token
+            draft_tokens: List[int] = []
+            for _ in range(k):
+                self._static_input_ids.fill_(curr_tok)
+                self._static_pos_ids.fill_(self._seq_len)
+                self._static_cache_pos.fill_(self._seq_len)
+                self._decode_graph.replay()
+                curr_tok = self._static_argmax[0, 0].item()
+                draft_tokens.append(curr_tok)
+                self._seq_len += 1
+            return draft_tokens
+
+        # Eager greedy path (fallback for CPU or non-graph mode)
         if temperature <= 0 or temperature < 1e-8:
             self._cur_tensor.fill_(current_token)
             gpu_drafts: List[torch.Tensor] = []
@@ -191,7 +302,7 @@ class DraftSampler:
             input_tensor = torch.tensor([[next_tok]], dtype=torch.long, device=self.device)
             outputs = self.model(
                 input_ids=input_tensor,
-                past_key_values=self.cache,
+                past_key_values=self.cache if not self.use_cuda_graphs else self.static_cache,
                 use_cache=True,
             )
             logits = outputs.logits[0, -1, :]
