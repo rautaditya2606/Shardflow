@@ -71,6 +71,8 @@ def main():
     parser.add_argument("--relay-port", type=int, default=RELAY_PORT, help="AWS EC2 relay port")
     parser.add_argument("--max-tokens", type=int, default=60, help="Maximum generated tokens per prompt")
     parser.add_argument("--load-in-4bit", action="store_true", help="Load weights in 4-bit NF4")
+    parser.add_argument("--enable-cuda-graphs", action="store_true", default=False, help="Enable CUDA Graphs for drafter (default: False for Colab shared single-GPU)")
+    parser.add_argument("--no-cuda-graphs", action="store_true", help="Disable CUDA Graphs and run in high-accuracy eager draft mode")
     args = parser.parse_args()
 
     target_dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
@@ -106,8 +108,9 @@ def main():
     )
     print(f"[OK] Model slice loaded in {time.perf_counter() - t0:.2f}s")
 
-    # 3. Initialize Node with Neural Drafter (StaticCache CUDA Graphs)
-    print(f"\n[3/3] Initializing Node with spec_k={args.spec_k}...")
+    # 3. Initialize Node with Neural Drafter
+    use_graphs = args.enable_cuda_graphs and not args.no_cuda_graphs
+    print(f"\n[3/3] Initializing Node with spec_k={args.spec_k} (cuda_graphs={use_graphs})...")
     node = PipelineNode(
         model_slice=model_slice,
         is_first_node=True,
@@ -115,6 +118,7 @@ def main():
         draft_model=args.draft_model,
         draft_device=args.draft_device,
         spec_k=args.spec_k,
+        enable_cuda_graphs=use_graphs,
     )
 
     if args.draft_model and node.draft_sampler is None:

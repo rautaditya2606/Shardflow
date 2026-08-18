@@ -124,6 +124,7 @@ class PipelineNode:
                     device=target_draft_device,
                     dtype=self._node_dtype,
                     spec_k=spec_k,
+                    enable_cuda_graphs=enable_cuda_graphs,
                 )
                 logger.info("DraftSampler initialized on Node 0 (draft_model=%s, device=%s, K=%d)", draft_model, target_draft_device, spec_k)
                 self.async_draft_sampler = None

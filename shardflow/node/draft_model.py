@@ -18,16 +18,40 @@ logger = logging.getLogger(__name__)
 
 
 def rewind_dynamic_cache(cache: DynamicCache, target_seq_len: int) -> None:
-    """Rewind DynamicCache to target_seq_len by slicing key/value tensors in place."""
-    # ponytail: native cache.crop() truncates dynamic cache in a single standard call
+    """Rewind DynamicCache to target_seq_len across all HuggingFace Transformers versions."""
+    if hasattr(cache, "_seen_tokens"):
+        cache._seen_tokens = target_seq_len
+
+    # Try native crop if available
     if hasattr(cache, "crop"):
-        cache.crop(target_seq_len)
-    elif hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
+        try:
+            cache.crop(target_seq_len)
+            return
+        except Exception:
+            pass
+
+    # Legacy key_cache / value_cache
+    if hasattr(cache, "key_cache") and hasattr(cache, "value_cache") and cache.key_cache:
         for layer_idx in range(len(cache.key_cache)):
             if cache.key_cache[layer_idx] is not None:
                 cache.key_cache[layer_idx] = cache.key_cache[layer_idx][:, :, :target_seq_len, :]
             if cache.value_cache[layer_idx] is not None:
                 cache.value_cache[layer_idx] = cache.value_cache[layer_idx][:, :, :target_seq_len, :]
+        return
+
+    # Modern transformers (DynamicLayer objects in cache.layers)
+    if hasattr(cache, "layers"):
+        for layer in cache.layers:
+            for attr in ("keys", "key_states", "k"):
+                if hasattr(layer, attr) and getattr(layer, attr) is not None:
+                    t = getattr(layer, attr)
+                    if t.shape[2] > target_seq_len:
+                        setattr(layer, attr, t[:, :, :target_seq_len, :])
+            for attr in ("values", "value_states", "v"):
+                if hasattr(layer, attr) and getattr(layer, attr) is not None:
+                    t = getattr(layer, attr)
+                    if t.shape[2] > target_seq_len:
+                        setattr(layer, attr, t[:, :, :target_seq_len, :])
 
 
 def rewind_static_cache(cache: StaticCache, target_seq_len: int) -> None:
