@@ -911,14 +911,6 @@ class PipelineNode:
                 causal_mask[:, past_seq_len : past_seq_len + seq_len] = current_chunk_mask
                 causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
 
-            # Compute rotary position embeddings
-            position_embeddings = None
-            if self.model_slice.rotary_emb is not None:
-                try:
-                    position_embeddings = self.model_slice.rotary_emb(hidden_states, position_ids)
-                except Exception as e:
-                    logger.debug("rotary_emb compute fallback: %s", e)
-
             # Check layer signature once to avoid inner-loop TypeError exception overhead
             if not hasattr(self, "_layer_accepts_pos_emb"):
                 self._layer_accepts_pos_emb = False
@@ -929,6 +921,35 @@ class PipelineNode:
                         self._layer_accepts_pos_emb = "position_embeddings" in sig.parameters
                     except Exception:
                         self._layer_accepts_pos_emb = False
+
+            # Compute rotary position embeddings
+            position_embeddings = None
+            if self.model_slice.rotary_emb is not None:
+                try:
+                    position_embeddings = self.model_slice.rotary_emb(hidden_states, position_ids)
+                except Exception as e:
+                    logger.debug("rotary_emb compute fallback: %s", e)
+
+            # Fallback if position_embeddings is None but layer accepts/requires it
+            if position_embeddings is None and self._layer_accepts_pos_emb:
+                for l in self.model_slice.layers:
+                    attn = getattr(l, "self_attn", getattr(l, "linear_attn", None))
+                    if attn is not None and hasattr(attn, "rotary_emb") and attn.rotary_emb is not None:
+                        try:
+                            position_embeddings = attn.rotary_emb(hidden_states, position_ids)
+                            break
+                        except Exception:
+                            pass
+
+                if position_embeddings is None:
+                    head_dim = getattr(getattr(self.model_slice.config, "text_config", self.model_slice.config), "head_dim", 128) if self.model_slice.config else 128
+                    inv_freq = 1.0 / (1000000.0 ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim))
+                    t = position_ids.squeeze(0).to(torch.float32)
+                    freqs = torch.outer(t, inv_freq)
+                    emb = torch.cat((freqs, freqs), dim=-1).unsqueeze(0)
+                    cos = emb.cos().to(hidden_states.dtype)
+                    sin = emb.sin().to(hidden_states.dtype)
+                    position_embeddings = (cos, sin)
 
             cache_position = position_ids.squeeze(0)
 

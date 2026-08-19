@@ -523,18 +523,18 @@ def load_layer_slice(
     embed_tokens = getattr(base_model, "embed_tokens", getattr(model, "embed_tokens", None)) if include_embed else None
 
     rotary_emb = None
-    if hasattr(base_model, "rotary_emb") and base_model.rotary_emb is not None:
-        try:
-            rotary_cls = type(base_model.rotary_emb)
-            rotary_emb = rotary_cls(config).to(target_device)
-        except Exception:
-            rotary_emb = None
-    elif hasattr(model, "rotary_emb") and model.rotary_emb is not None:
-        try:
-            rotary_cls = type(model.rotary_emb)
-            rotary_emb = rotary_cls(config).to(target_device)
-        except Exception:
-            rotary_emb = None
+    tc = getattr(config, "text_config", config)
+    for source in [base_model, model]:
+        if hasattr(source, "rotary_emb") and source.rotary_emb is not None:
+            try:
+                rotary_cls = type(source.rotary_emb)
+                try:
+                    rotary_emb = rotary_cls(tc).to(target_device)
+                except Exception:
+                    rotary_emb = rotary_cls(config).to(target_device)
+                break
+            except Exception:
+                pass
 
     # 3. Handle 4-Bit In-Place Quantization vs FP16/BF16 Allocation
     if load_in_4bit:
