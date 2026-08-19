@@ -658,14 +658,40 @@ def load_layer_slice(
             logger.info("SHARD END %s | RSS=%.2f GB | available=%.2f GB | GPU alloc=%.2f GB | GPU reserved=%.2f GB", shard_name, rss, avail, gpu_alloc, gpu_res)
             gc.collect()
 
-            # Prune downloaded shard from disk on Kaggle/Colab to ensure models up to 70B fit in 20GB disk quota
+            # Prune downloaded shard and underlying blobs from disk on Kaggle/Colab to ensure models up to 70B fit in 20GB disk quota
             if local_dir is None and (os.path.exists("/kaggle") or os.path.exists("/content")):
                 try:
-                    if os.path.exists(shard_path):
-                        os.remove(shard_path)
-                        logger.info("Pruned temporary shard %s from disk (disk freed)", shard_name)
+                    # 1. Resolve real file path to delete underlying blob if symlinked by HF hub
+                    real_file = os.path.realpath(shard_path) if (os.path.exists(shard_path) or os.path.islink(shard_path)) else None
+                    if real_file and os.path.isfile(real_file):
+                        try:
+                            os.remove(real_file)
+                        except Exception:
+                            pass
+                    if os.path.exists(shard_path) or os.path.islink(shard_path):
+                        try:
+                            os.remove(shard_path)
+                        except Exception:
+                            pass
+
+                    # 2. Aggressively clean up any blobs or .incomplete download files in the cache directory
+                    cache_dir_root = Path(target_cache_dir) if target_cache_dir else None
+                    if cache_dir_root and cache_dir_root.exists():
+                        for blob_path in cache_dir_root.glob("**/blobs/*"):
+                            try:
+                                if blob_path.is_file() or blob_path.is_symlink():
+                                    blob_path.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                        for inc_path in cache_dir_root.glob("**/*.incomplete"):
+                            try:
+                                if inc_path.is_file():
+                                    inc_path.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                    logger.info("Pruned temporary shard %s and underlying blobs from disk (disk freed)", shard_name)
                 except Exception as e:
-                    logger.debug("Could not prune temporary shard %s: %s", shard_name, e)
+                    logger.warning("Could not prune temporary shard %s: %s", shard_name, e)
 
     else:
         # Single safetensors file or local directory
