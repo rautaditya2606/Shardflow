@@ -113,8 +113,14 @@ def _load_state_dict_into_4bit_slice(
     grouped_modules: Dict[Any, Dict[str, torch.Tensor]] = {}
 
     for key, tensor in list(state_dict.items()):
+        norm_key = key
+        for prefix in ["model.language_model.", "language_model.model.", "language_model."]:
+            if norm_key.startswith(prefix):
+                norm_key = "model." + norm_key[len(prefix):]
+                break
+
         # Final RMSNorm
-        if key.startswith("model.norm.") and norm is not None:
+        if norm_key.startswith("model.norm.") and norm is not None:
             norm.weight = nn.Parameter(
                 tensor.to(device=device, dtype=compute_dtype),
                 requires_grad=False,
@@ -122,7 +128,7 @@ def _load_state_dict_into_4bit_slice(
             continue
 
         # Token Embedding
-        if key.startswith("model.embed_tokens.") and embed_tokens is not None:
+        if norm_key.startswith("model.embed_tokens.") and embed_tokens is not None:
             embed_tokens.weight = nn.Parameter(
                 tensor.to(device=device, dtype=compute_dtype),
                 requires_grad=False,
@@ -130,16 +136,16 @@ def _load_state_dict_into_4bit_slice(
             continue
 
         # LM Head
-        if key.startswith("lm_head.") and lm_head is not None:
-            subpath = key[len("lm_head."):]
+        if norm_key.startswith("lm_head.") and lm_head is not None:
+            subpath = norm_key[len("lm_head."):]
             if lm_head not in grouped_modules:
                 grouped_modules[lm_head] = {}
             grouped_modules[lm_head][subpath] = tensor
             continue
 
         # Transformer layers
-        if key.startswith("model.layers."):
-            parts = key.split(".")
+        if norm_key.startswith("model.layers."):
+            parts = norm_key.split(".")
             orig_idx = int(parts[2])
             if orig_idx < layer_start or orig_idx >= layer_end:
                 continue
@@ -410,7 +416,15 @@ def load_layer_slice(
     # 1. Instantiate meta shell (0 MB RAM footprint)
     logger.info("Initializing meta device model shell (0 MB RAM footprint)...")
     with init_empty_weights():
-        model = AutoModelForCausalLM.from_config(config, dtype=target_dtype)
+        try:
+            model = AutoModelForCausalLM.from_config(config, dtype=target_dtype, trust_remote_code=True)
+        except Exception:
+            try:
+                from transformers import AutoModelForImageTextToText
+                model = AutoModelForImageTextToText.from_config(config, dtype=target_dtype, trust_remote_code=True)
+            except Exception:
+                from transformers import AutoModel
+                model = AutoModel.from_config(config, dtype=target_dtype, trust_remote_code=True)
 
     logger.info(
         "AFTER MODEL SHELL: allocated=%.2f GB | reserved=%.2f GB",
@@ -419,17 +433,27 @@ def load_layer_slice(
     )
 
     # 2. Extract requested layers on meta device
+    base_model = getattr(model, "model", getattr(model, "language_model", getattr(model, "transformer", model)))
+    if hasattr(base_model, "model"):
+        base_model = base_model.model
+    if hasattr(base_model, "language_model"):
+        base_model = base_model.language_model
+
+    layers_attr = getattr(base_model, "layers", getattr(model, "layers", None))
+    if layers_attr is None:
+        raise AttributeError(f"Could not locate 'layers' attribute in {type(model)} or {type(base_model)}")
+
     extracted_layers = nn.ModuleList([
-        model.model.layers[i] for i in range(layer_start, layer_end)
+        layers_attr[i] for i in range(layer_start, layer_end)
     ])
-    norm = model.model.norm if include_norm else None
-    lm_head = model.lm_head if include_lm_head else None
-    embed_tokens = model.model.embed_tokens if include_embed else None
+    norm = getattr(base_model, "norm", getattr(model, "norm", None)) if include_norm else None
+    lm_head = getattr(model, "lm_head", None) if include_lm_head else None
+    embed_tokens = getattr(base_model, "embed_tokens", getattr(model, "embed_tokens", None)) if include_embed else None
 
     rotary_emb = None
-    if hasattr(model.model, "rotary_emb") and model.model.rotary_emb is not None:
+    if hasattr(base_model, "rotary_emb") and base_model.rotary_emb is not None:
         try:
-            rotary_cls = type(model.model.rotary_emb)
+            rotary_cls = type(base_model.rotary_emb)
             rotary_emb = rotary_cls(config).to(target_device)
         except Exception:
             rotary_emb = None
@@ -477,12 +501,14 @@ def load_layer_slice(
 
     weight_map, local_dir = _get_safetensors_shards_map(model_path)
     target_prefixes = [f"model.layers.{i}." for i in range(layer_start, layer_end)]
+    target_prefixes.extend([f"model.language_model.layers.{i}." for i in range(layer_start, layer_end)])
+    target_prefixes.extend([f"language_model.model.layers.{i}." for i in range(layer_start, layer_end)])
     if include_norm:
-        target_prefixes.append("model.norm.")
+        target_prefixes.extend(["model.norm.", "model.language_model.norm.", "language_model.norm."])
     if include_lm_head:
         target_prefixes.append("lm_head.")
     if include_embed:
-        target_prefixes.append("model.embed_tokens.")
+        target_prefixes.extend(["model.embed_tokens.", "model.language_model.embed_tokens.", "language_model.embed_tokens."])
 
     if weight_map is not None:
         needed_shards = sorted({
