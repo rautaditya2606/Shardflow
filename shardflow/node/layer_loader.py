@@ -66,6 +66,48 @@ def get_num_hidden_layers(config: Any, default: int = 64) -> int:
     return default
 
 
+def _download_shard_direct(model_path: str, shard_name: str, dest_path: str) -> str:
+    """
+    Downloads a single safetensors shard directly to dest_path without HF Hub blob duplication.
+    Guarantees zero hidden cache build-up.
+    """
+    import urllib.request
+    from huggingface_hub import hf_hub_url
+
+    url = hf_hub_url(repo_id=model_path, filename=shard_name)
+    hf_tok = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    headers = {"User-Agent": "ShardFlow/2.1"}
+    if hf_tok:
+        headers["Authorization"] = f"Bearer {hf_tok}"
+
+    req = urllib.request.Request(url, headers=headers)
+    logger.info("Downloading shard %s directly (clean single-file stream)...", shard_name)
+
+    t0 = time.perf_counter()
+    with urllib.request.urlopen(req, timeout=300) as response, open(dest_path, "wb") as out_file:
+        total_size = int(response.headers.get("Content-Length", 0))
+        downloaded = 0
+        chunk_size = 16 * 1024 * 1024  # 16 MB chunks for max throughput
+        last_log = time.perf_counter()
+
+        while True:
+            chunk = response.read(chunk_size)
+            if not chunk:
+                break
+            out_file.write(chunk)
+            downloaded += len(chunk)
+            if time.perf_counter() - last_log > 3.0:
+                mb = downloaded / (1024 * 1024)
+                tot_mb = total_size / (1024 * 1024)
+                pct = (downloaded / total_size * 100.0) if total_size > 0 else 0.0
+                speed = mb / max(0.1, time.perf_counter() - t0)
+                logger.info("  [%s] %.1f / %.1f MB (%.1f%%) - %.1f MB/s", shard_name, mb, tot_mb, pct, speed)
+                last_log = time.perf_counter()
+
+    logger.info("[OK] Shard %s downloaded (%.2f GB) in %.1f s", shard_name, downloaded / 1024**3, time.perf_counter() - t0)
+    return dest_path
+
+
 def _replace_linear_with_4bit_meta(
     module: nn.Module,
     compute_dtype: torch.dtype = torch.float16,
@@ -547,23 +589,19 @@ def load_layer_slice(
         logger.info("Matched %d targeted safetensors shards: %s", len(needed_shards), needed_shards)
 
         for shard_name in needed_shards:
+            is_temp_download = False
             if local_dir is not None and (local_dir / shard_name).exists():
                 shard_path = str(local_dir / shard_name)
             else:
-                from huggingface_hub import hf_hub_download, try_to_load_from_cache
-                target_cache_dir = None
                 if os.path.exists("/kaggle"):
-                    target_cache_dir = "/kaggle/working/hf_home"
+                    dest_file = f"/kaggle/working/{shard_name}"
                 elif os.path.exists("/content"):
-                    target_cache_dir = "/content/hf_home"
-
-                hf_tok = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
-                cached = try_to_load_from_cache(repo_id=model_path, filename=shard_name, cache_dir=target_cache_dir)
-                if isinstance(cached, (str, Path)) and os.path.exists(cached):
-                    shard_path = str(cached)
+                    dest_file = f"/content/{shard_name}"
                 else:
-                    logger.info("Downloading targeted shard %s from HuggingFace Hub (cache_dir=%s)...", shard_name, target_cache_dir)
-                    shard_path = hf_hub_download(repo_id=model_path, filename=shard_name, cache_dir=target_cache_dir, token=hf_tok)
+                    dest_file = f"/tmp/{shard_name}"
+
+                shard_path = _download_shard_direct(model_path, shard_name, dest_file)
+                is_temp_download = True
 
             logger.info("Streaming and loading weights from shard %s ...", shard_name)
             import psutil
@@ -577,7 +615,13 @@ def load_layer_slice(
             from safetensors.torch import load_file
             shard_dict = load_file(shard_path, device="cpu")
             for key, tensor in shard_dict.items():
-                if not any(key.startswith(p) for p in target_prefixes):
+                norm_key = key
+                for prefix in ["model.language_model.", "language_model.model.", "language_model."]:
+                    if norm_key.startswith(prefix):
+                        norm_key = "model." + norm_key[len(prefix):]
+                        break
+
+                if not any(norm_key.startswith(p) or key.startswith(p) for p in target_prefixes):
                     continue
 
                 if load_in_4bit:
@@ -594,8 +638,8 @@ def load_layer_slice(
                     )
                 else:
                     # Direct in-place FP16/BF16 loading to avoid doubling VRAM allocation
-                    if key.startswith("model.layers."):
-                        parts = key.split(".")
+                    if norm_key.startswith("model.layers."):
+                        parts = norm_key.split(".")
                         orig_idx = int(parts[2])
                         if layer_start <= orig_idx < layer_end:
                             local_idx = orig_idx - layer_start
@@ -616,7 +660,7 @@ def load_layer_slice(
                                 )
                                 setattr(submod, param_name, param)
 
-                    elif key.startswith("model.norm.") and norm is not None:
+                    elif norm_key.startswith("model.norm.") and norm is not None:
                         norm_dev = device_list[-1]
                         if hasattr(norm, "weight") and norm.weight is not None and norm.weight.device == norm_dev:
                             norm.weight.data.copy_(tensor, non_blocking=False)
@@ -625,7 +669,7 @@ def load_layer_slice(
                                 tensor.to(device=norm_dev, dtype=target_dtype, non_blocking=False),
                                 requires_grad=False,
                             )
-                    elif key.startswith("lm_head.") and lm_head is not None:
+                    elif norm_key.startswith("lm_head.") and lm_head is not None:
                         head_dev = device_list[-1]
                         if hasattr(lm_head, "weight") and lm_head.weight is not None and lm_head.weight.device == head_dev:
                             lm_head.weight.data.copy_(tensor, non_blocking=False)
@@ -634,7 +678,7 @@ def load_layer_slice(
                                 tensor.to(device=head_dev, dtype=target_dtype, non_blocking=False),
                                 requires_grad=False,
                             )
-                    elif key.startswith("model.embed_tokens.") and embed_tokens is not None:
+                    elif norm_key.startswith("model.embed_tokens.") and embed_tokens is not None:
                         embed_dev = device_list[0]
                         if hasattr(embed_tokens, "weight") and embed_tokens.weight is not None and embed_tokens.weight.device == embed_dev:
                             embed_tokens.weight.data.copy_(tensor, non_blocking=False)
@@ -658,38 +702,12 @@ def load_layer_slice(
             logger.info("SHARD END %s | RSS=%.2f GB | available=%.2f GB | GPU alloc=%.2f GB | GPU reserved=%.2f GB", shard_name, rss, avail, gpu_alloc, gpu_res)
             gc.collect()
 
-            # Prune downloaded shard and underlying blobs from disk on Kaggle/Colab to ensure models up to 70B fit in 20GB disk quota
-            if local_dir is None and (os.path.exists("/kaggle") or os.path.exists("/content")):
+            # Prune downloaded shard from disk on Kaggle/Colab
+            if is_temp_download:
                 try:
-                    # 1. Resolve real file path to delete underlying blob if symlinked by HF hub
-                    real_file = os.path.realpath(shard_path) if (os.path.exists(shard_path) or os.path.islink(shard_path)) else None
-                    if real_file and os.path.isfile(real_file):
-                        try:
-                            os.remove(real_file)
-                        except Exception:
-                            pass
-                    if os.path.exists(shard_path) or os.path.islink(shard_path):
-                        try:
-                            os.remove(shard_path)
-                        except Exception:
-                            pass
-
-                    # 2. Aggressively clean up any blobs or .incomplete download files in the cache directory
-                    cache_dir_root = Path(target_cache_dir) if target_cache_dir else None
-                    if cache_dir_root and cache_dir_root.exists():
-                        for blob_path in cache_dir_root.glob("**/blobs/*"):
-                            try:
-                                if blob_path.is_file() or blob_path.is_symlink():
-                                    blob_path.unlink(missing_ok=True)
-                            except Exception:
-                                pass
-                        for inc_path in cache_dir_root.glob("**/*.incomplete"):
-                            try:
-                                if inc_path.is_file():
-                                    inc_path.unlink(missing_ok=True)
-                            except Exception:
-                                pass
-                    logger.info("Pruned temporary shard %s and underlying blobs from disk (disk freed)", shard_name)
+                    if os.path.exists(shard_path):
+                        os.remove(shard_path)
+                        logger.info("Pruned temporary shard %s from disk (disk freed, 0 cache residual)", shard_name)
                 except Exception as e:
                     logger.warning("Could not prune temporary shard %s: %s", shard_name, e)
 
