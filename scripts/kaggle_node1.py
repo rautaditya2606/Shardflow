@@ -34,7 +34,7 @@ if os.path.exists("/kaggle"):
 import torch
 from transformers import AutoConfig
 
-from shardflow.node.layer_loader import load_layer_slice
+from shardflow.node.layer_loader import load_layer_slice, get_num_hidden_layers
 from shardflow.node.node import PipelineNode
 from shardflow.node.draft_model import rewind_kv_cache
 from shardflow.orchestrator.sampler import sample_next_token
@@ -125,7 +125,7 @@ def main():
 
     model_path = args.model if os.path.exists(args.model) else args.model
     config = AutoConfig.from_pretrained(model_path)
-    total_layers = getattr(config, "num_hidden_layers", 48)
+    total_layers = get_num_hidden_layers(config, default=48)
 
     layer_start = args.layer_start if args.layer_start is not None else (total_layers // 2)
     layer_end = args.layer_end if args.layer_end is not None else total_layers

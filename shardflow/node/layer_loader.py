@@ -37,6 +37,35 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 logger = logging.getLogger(__name__)
 
 
+def get_num_hidden_layers(config: Any, default: int = 64) -> int:
+    """Safely extract the number of transformer layers across all model families and architectures."""
+    if config is None:
+        return default
+    try:
+        if hasattr(config, "text_config") and config.text_config is not None:
+            tc = config.text_config
+            if hasattr(tc, "num_hidden_layers") and tc.num_hidden_layers is not None:
+                return int(tc.num_hidden_layers)
+    except Exception:
+        pass
+
+    try:
+        val = getattr(config, "num_hidden_layers", None)
+        if val is not None:
+            return int(val)
+    except Exception:
+        pass
+
+    try:
+        val = getattr(config, "num_layers", None)
+        if val is not None:
+            return int(val)
+    except Exception:
+        pass
+
+    return default
+
+
 def _replace_linear_with_4bit_meta(
     module: nn.Module,
     compute_dtype: torch.dtype = torch.float16,
@@ -359,8 +388,8 @@ def load_layer_slice(
         include_norm, include_lm_head, include_embed, load_in_4bit,
     )
 
-    config = AutoConfig.from_pretrained(model_path)
-    total_layers = config.num_hidden_layers
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    total_layers = get_num_hidden_layers(config, default=64)
 
     # Node 0 (layer_start == 0) always owns token embedding matrix
     if layer_start == 0:
@@ -752,14 +781,15 @@ def load_tokenizer(model_path: str) -> AutoTokenizer:
 
 def get_model_info(model_path: str) -> dict:
     """Get model metadata without loading weights."""
-    config = AutoConfig.from_pretrained(model_path)
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    tc = getattr(config, "text_config", config)
     return {
-        "model_type": config.model_type,
-        "num_layers": config.num_hidden_layers,
-        "hidden_size": config.hidden_size,
-        "num_attention_heads": config.num_attention_heads,
-        "num_kv_heads": getattr(config, "num_key_value_heads", config.num_attention_heads),
-        "vocab_size": config.vocab_size,
-        "max_position_embeddings": config.max_position_embeddings,
-        "torch_dtype": str(config.torch_dtype),
+        "model_type": getattr(config, "model_type", "unknown"),
+        "num_layers": get_num_hidden_layers(config),
+        "hidden_size": getattr(tc, "hidden_size", getattr(config, "hidden_size", 4096)),
+        "num_attention_heads": getattr(tc, "num_attention_heads", getattr(config, "num_attention_heads", 32)),
+        "num_kv_heads": getattr(tc, "num_key_value_heads", getattr(config, "num_key_value_heads", getattr(tc, "num_attention_heads", 32))),
+        "vocab_size": getattr(tc, "vocab_size", getattr(config, "vocab_size", 152064)),
+        "max_position_embeddings": getattr(tc, "max_position_embeddings", getattr(config, "max_position_embeddings", 32768)),
+        "torch_dtype": str(getattr(config, "torch_dtype", torch.float16)),
     }

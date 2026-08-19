@@ -27,7 +27,7 @@ if os.path.exists("/kaggle"):
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from shardflow.node.layer_loader import load_layer_slice
+from shardflow.node.layer_loader import load_layer_slice, get_num_hidden_layers
 from shardflow.node.node import PipelineNode
 from shardflow.node.ngram_draft import NGramDraftSampler
 from shardflow.transport.relay import (
@@ -55,8 +55,8 @@ def run_window_sweep(
     max_tokens: int = 60,
     load_in_4bit: bool = False,
 ):
-    config = AutoConfig.from_pretrained(model_path)
-    total_layers = getattr(config, "num_hidden_layers", 28)
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    total_layers = get_num_hidden_layers(config, default=64)
     layer_end = layer_end if layer_end is not None else (total_layers // 2)
 
     target_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
