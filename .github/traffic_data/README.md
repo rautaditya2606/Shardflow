@@ -2,14 +2,14 @@
 
 This directory stores historical GitHub traffic statistics for **[rautaditya2606/Shardflow](https://github.com/rautaditya2606/Shardflow)**.
 
-**Last Updated**: `2026-08-30 01:30:56 UTC`
+**Last Updated**: `2026-08-31 01:30:50 UTC`
 
 ### 🚀 Lifetime Totals
 
 | Metric | Total Count | Total Uniques |
 | :--- | :--- | :--- |
-| **Git Clones** | **1,036** | **561** |
-| **Repository Views** | **74** | **43** |
+| **Git Clones** | **1,044** | **569** |
+| **Repository Views** | **91** | **46** |
 
 ### 📁 Data Files
 
@@ -22,6 +22,8 @@ This directory stores historical GitHub traffic statistics for **[rautaditya2606
 
 | Date | Clones | Unique Cloners |
 | :--- | :--- | :--- |
+| 2026-08-29 | 3 | 3 |
+| 2026-08-28 | 5 | 5 |
 | 2026-08-27 | 5 | 5 |
 | 2026-08-26 | 0 | 0 |
 | 2026-08-25 | 20 | 12 |
@@ -34,6 +36,4 @@ This directory stores historical GitHub traffic statistics for **[rautaditya2606
 | 2026-08-18 | 79 | 37 |
 | 2026-08-17 | 7 | 5 |
 | 2026-08-16 | 162 | 71 |
-| 2026-08-15 | 0 | 0 |
-| 2026-08-14 | 128 | 62 |
 
