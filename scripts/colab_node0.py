@@ -47,7 +47,18 @@ from shardflow.transport.relay import (
     connect_to_relay,
     handshake,
 )
-from scripts.kaggle_node0 import Node0Profiler, generate, AsyncTokenReceiver
+from scripts.kaggle_node0 import (
+    Node0Profiler,
+    generate,
+    AsyncTokenReceiver,
+    launch_gradio_ui,
+    run_interactive_cli,
+)
+
+try:
+    import gradio as gr
+except ImportError:
+    gr = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,7 +80,15 @@ def main():
     parser.add_argument("--dtype", type=str, default="float16", choices=["float16", "bfloat16"])
     parser.add_argument("--relay-host", type=str, default=RELAY_HOST, help="AWS EC2 relay IP/hostname")
     parser.add_argument("--relay-port", type=int, default=RELAY_PORT, help="AWS EC2 relay port")
-    parser.add_argument("--max-tokens", type=int, default=60, help="Maximum generated tokens per prompt")
+    parser.add_argument("--max-tokens", type=int, default=256, help="Maximum generated tokens per prompt (default: 256)")
+    parser.add_argument("--prompt", default=None, help="Single prompt to execute directly (optional)")
+    parser.add_argument("--benchmark", action="store_true", default=False, help="Run fixed 3-prompt window benchmark evaluation suite")
+    parser.add_argument("--web-ui", action="store_true", default=False, help="Launch Gradio Web Chat UI")
+    parser.add_argument("--cli", action="store_true", default=False, help="Run in interactive CLI terminal mode")
+    parser.add_argument("--share", action="store_true", default=True, help="Enable public gradio.live link (default: True)")
+    parser.add_argument("--no-share", action="store_false", dest="share", help="Disable public gradio.live link")
+    parser.add_argument("--ui-port", type=int, default=7860, help="Gradio server port (default: 7860)")
+    parser.add_argument("--system-prompt", default="You are a helpful and concise AI assistant.", help="Default system prompt for chat")
     parser.add_argument("--load-in-4bit", action="store_true", help="Load weights in 4-bit NF4")
     parser.add_argument("--enable-cuda-graphs", action="store_true", default=False, help="Enable CUDA Graphs for drafter (default: False for Colab shared single-GPU)")
     parser.add_argument("--no-cuda-graphs", action="store_true", help="Disable CUDA Graphs and run in high-accuracy eager draft mode")
@@ -134,133 +153,188 @@ def main():
         node.draft_sampler.reset()
         print(f"[OK] Draft model warmup complete in {time.perf_counter() - t_w0:.2f}s")
 
-    prompts = [
-        "Explain quantum entanglement in simple terms.",
-        "Write a Python function to compute Fibonacci numbers using dynamic programming.",
-        "What are the key advantages of pipeline parallelism for distributed LLM inference?",
-    ]
-
-    results_table = []
-
     print("\nConnecting to relay...")
     sock = connect_to_relay(host=args.relay_host, port=args.relay_port, auth_byte=AUTH_BYTE)
     receiver = AsyncTokenReceiver(sock)
 
+    ngram_sampler = None
+    if args.spec_k > 0 and not args.draft_model:
+        ngram_sampler = NGramDraftSampler(max_ngram_size=3, min_ngram_size=1, spec_k=args.spec_k)
+
     try:
         handshake(sock, is_initiator=True)
-        print("Handshake successful! Beginning benchmark iterations...\n")
+        print("Handshake successful! Cluster is paired and ready.\n")
 
-        ngram_sampler = None
-        if args.spec_k > 0 and not args.draft_model:
-            ngram_sampler = NGramDraftSampler(max_ngram_size=3, min_ngram_size=1, spec_k=args.spec_k)
+        config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+        total_layers = getattr(config, "num_hidden_layers", 28)
 
-        for w in args.windows:
-            print("=" * 75)
-            print(f" RUNNING BENCHMARK WITH SPECULATIVE WINDOW W = {w} (K={args.spec_k})")
-            print("=" * 75)
-
-            w_profiler = Node0Profiler()
-            tps_list = []
-            ttft_list = []
-
-            for p_idx, prompt_text in enumerate(prompts, 1):
-                prompt_prof = Node0Profiler()
-                stats = generate(
-                    prompt=prompt_text,
-                    tokenizer=tokenizer,
-                    node=node,
-                    sock=sock,
-                    max_tokens=args.max_tokens,
-                    temperature=0.0,
-                    spec_k=args.spec_k,
-                    ngram_sampler=ngram_sampler,
-                    eos_token_id=eos_id,
-                    profiler=prompt_prof,
-                    receiver=receiver,
-                    enable_async_spec=True,
-                    spec_window=w,
-                )
-
-                if stats["tokens"] > 1:
-                    tps_list.append(stats["tps"])
-                    ttft_list.append(stats["ttft"])
-                    for i in range(len(prompt_prof.total_step_times)):
-                        w_profiler.record(
-                            embed_ms=prompt_prof.embed_times[i],
-                            gpu_fwd_ms=prompt_prof.node0_gpu_times[i],
-                            g2c_ms=prompt_prof.gpu_to_cpu_times[i],
-                            ser_ms=prompt_prof.serialize_times[i],
-                            send_ms=prompt_prof.tcp_send_times[i],
-                            recv_ms=prompt_prof.tcp_recv_wait_times[i],
-                            total_ms=prompt_prof.total_step_times[i],
-                            draft_gen_ms=prompt_prof.draft_gen_times[i],
-                            draft_wait_ms=prompt_prof.draft_wait_times[i] if prompt_prof.draft_wait_times else 0.0,
-                            gpu0_ms=prompt_prof.gpu0_fwd_times[i] if prompt_prof.gpu0_fwd_times else 0.0,
-                            pcie_ms=prompt_prof.pcie_transfer_times[i] if prompt_prof.pcie_transfer_times else 0.0,
-                            gpu1_ms=prompt_prof.gpu1_fwd_times[i] if prompt_prof.gpu1_fwd_times else 0.0,
-                            node1_compute_ms=prompt_prof.node1_compute_times[i] if prompt_prof.node1_compute_times else 0.0,
-                            network_rtt_ms=prompt_prof.pure_network_rtt_times[i] if prompt_prof.pure_network_rtt_times else 0.0,
-                            bubble_ms=prompt_prof.inter_round_bubble_times[i] if prompt_prof.inter_round_bubble_times else 0.0,
-                            accepted=prompt_prof.accepted_per_round[i],
-                            drafted=prompt_prof.drafted_per_round[i],
-                            is_spec=prompt_prof.is_spec_step[i],
-                        )
-
-            avg_tps = statistics.mean(tps_list) if tps_list else 0.0
-            avg_ttft = statistics.mean(ttft_list) * 1000.0 if ttft_list else 0.0
-            avg_fwd = statistics.mean(w_profiler.node0_gpu_times) if w_profiler.node0_gpu_times else 0.0
-            avg_wait = statistics.mean(w_profiler.tcp_recv_wait_times) if w_profiler.tcp_recv_wait_times else 0.0
-            avg_bubble = statistics.mean(w_profiler.inter_round_bubble_times) if w_profiler.inter_round_bubble_times else 0.0
-            avg_net_rtt = statistics.mean(w_profiler.pure_network_rtt_times) if w_profiler.pure_network_rtt_times else 0.0
-            avg_n1_comp = statistics.mean(w_profiler.node1_compute_times) if w_profiler.node1_compute_times else 0.0
-
-            spec_acc = [acc for acc, is_s in zip(w_profiler.accepted_per_round, w_profiler.is_spec_step) if is_s]
-            spec_drf = [drf for drf, is_s in zip(w_profiler.drafted_per_round, w_profiler.is_spec_step) if is_s]
-
-            tok_per_round = (sum(spec_acc) / len(spec_acc)) if spec_acc else 1.0
-            acc_rate = (sum(max(0, a - 1) for a in spec_acc) / sum(spec_drf) * 100.0) if (spec_drf and sum(spec_drf) > 0) else 0.0
-            full_hits = sum(1 for acc, drf in zip(spec_acc, spec_drf) if acc == drf + 1)
-            full_hit_rate = (full_hits / len(spec_acc) * 100.0) if spec_acc else 0.0
-
-            results_table.append({
-                "window": w,
-                "tps": avg_tps,
-                "ttft_ms": avg_ttft,
-                "tokens_per_round": tok_per_round,
-                "accept_rate": acc_rate,
-                "full_hit_rate": full_hit_rate,
-                "bubble_ms": avg_bubble,
-                "fwd_ms": avg_fwd,
-                "wait_ms": avg_wait,
-                "n1_comp_ms": avg_n1_comp,
-                "net_rtt_ms": avg_net_rtt,
-            })
-
-        # Print Final Comparison Table
-        print("\n" + "=" * 115)
-        sampler_name = f"Neural Draft {args.draft_model}" if args.draft_model else "N-gram Draft"
-        print(f" SHARDFLOW COLAB SPECULATIVE RESULTS ({sampler_name}, K={args.spec_k})")
-        print("=" * 115)
-        header = f"{'Window':>6} | {'TPS':>6} | {'TTFT (ms)':>9} | {'Tok/Round':>9} | {'Full Hit %':>10} | {'Bubble (ms)':>11} | {'N0 Fwd (ms)':>11} | {'N1 Comp (ms)':>12} | {'Net RTT (ms)':>12}"
-        print(header)
-        print("-" * 115)
-        for row in results_table:
-            print(
-                f"{row['window']:6d} | "
-                f"{row['tps']:6.2f} | "
-                f"{row['ttft_ms']:9.1f} | "
-                f"{row['tokens_per_round']:9.2f} | "
-                f"{row['full_hit_rate']:9.1f}% | "
-                f"{row['bubble_ms']:11.2f} | "
-                f"{row['fwd_ms']:11.2f} | "
-                f"{row['n1_comp_ms']:12.2f} | "
-                f"{row['net_rtt_ms']:12.2f}"
+        if args.prompt is not None:
+            # Mode A: Single Prompt Execution
+            print(f"\n" + "=" * 60)
+            print(" EXECUTING SINGLE PROMPT")
+            print("=" * 60)
+            generate(
+                prompt=args.prompt,
+                tokenizer=tokenizer,
+                node=node,
+                sock=sock,
+                max_tokens=args.max_tokens,
+                temperature=0.0,
+                spec_k=args.spec_k,
+                ngram_sampler=ngram_sampler,
+                eos_token_id=eos_id,
+                profiler=Node0Profiler(),
+                receiver=receiver,
+                enable_async_spec=True,
+                spec_window=1,
+                print_output=True,
             )
-        print("=" * 115)
 
-        if results_table:
-            best = max(results_table, key=lambda r: r["tps"])
-            print(f"\n[BEST] Optimal In-Flight Window: W={best['window']} with {best['tps']:.2f} TPS ({best['tokens_per_round']:.2f} tokens/round, {best['full_hit_rate']:.1f}% full hits)")
+        elif args.benchmark:
+            # Mode B: Window Benchmark Sweep Mode
+            prompts = [
+                "Explain quantum entanglement in simple terms.",
+                "Write a Python function to compute Fibonacci numbers using dynamic programming.",
+                "What are the key advantages of pipeline parallelism for distributed LLM inference?",
+            ]
+            results_table = []
+
+            for w in args.windows:
+                print("=" * 75)
+                print(f" RUNNING BENCHMARK WITH SPECULATIVE WINDOW W = {w} (K={args.spec_k})")
+                print("=" * 75)
+
+                w_profiler = Node0Profiler()
+                tps_list = []
+                ttft_list = []
+
+                for p_idx, prompt_text in enumerate(prompts, 1):
+                    prompt_prof = Node0Profiler()
+                    stats = generate(
+                        prompt=prompt_text,
+                        tokenizer=tokenizer,
+                        node=node,
+                        sock=sock,
+                        max_tokens=args.max_tokens,
+                        temperature=0.0,
+                        spec_k=args.spec_k,
+                        ngram_sampler=ngram_sampler,
+                        eos_token_id=eos_id,
+                        profiler=prompt_prof,
+                        receiver=receiver,
+                        enable_async_spec=True,
+                        spec_window=w,
+                        print_output=True,
+                    )
+
+                    if stats["tokens"] > 1:
+                        tps_list.append(stats["tps"])
+                        ttft_list.append(stats["ttft"])
+                        for i in range(len(prompt_prof.total_step_times)):
+                            w_profiler.record(
+                                embed_ms=prompt_prof.embed_times[i],
+                                gpu_fwd_ms=prompt_prof.node0_gpu_times[i],
+                                g2c_ms=prompt_prof.gpu_to_cpu_times[i],
+                                ser_ms=prompt_prof.serialize_times[i],
+                                send_ms=prompt_prof.tcp_send_times[i],
+                                recv_ms=prompt_prof.tcp_recv_wait_times[i],
+                                total_ms=prompt_prof.total_step_times[i],
+                                draft_gen_ms=prompt_prof.draft_gen_times[i],
+                                draft_wait_ms=prompt_prof.draft_wait_times[i] if prompt_prof.draft_wait_times else 0.0,
+                                gpu0_ms=prompt_prof.gpu0_fwd_times[i] if prompt_prof.gpu0_fwd_times else 0.0,
+                                pcie_ms=prompt_prof.pcie_transfer_times[i] if prompt_prof.pcie_transfer_times else 0.0,
+                                gpu1_ms=prompt_prof.gpu1_fwd_times[i] if prompt_prof.gpu1_fwd_times else 0.0,
+                                node1_compute_ms=prompt_prof.node1_compute_times[i] if prompt_prof.node1_compute_times else 0.0,
+                                network_rtt_ms=prompt_prof.pure_network_rtt_times[i] if prompt_prof.pure_network_rtt_times else 0.0,
+                                bubble_ms=prompt_prof.inter_round_bubble_times[i] if prompt_prof.inter_round_bubble_times else 0.0,
+                                accepted=prompt_prof.accepted_per_round[i],
+                                drafted=prompt_prof.drafted_per_round[i],
+                                is_spec=prompt_prof.is_spec_step[i],
+                            )
+
+                avg_tps = statistics.mean(tps_list) if tps_list else 0.0
+                avg_ttft = statistics.mean(ttft_list) * 1000.0 if ttft_list else 0.0
+                avg_fwd = statistics.mean(w_profiler.node0_gpu_times) if w_profiler.node0_gpu_times else 0.0
+                avg_wait = statistics.mean(w_profiler.tcp_recv_wait_times) if w_profiler.tcp_recv_wait_times else 0.0
+                avg_bubble = statistics.mean(w_profiler.inter_round_bubble_times) if w_profiler.inter_round_bubble_times else 0.0
+                avg_net_rtt = statistics.mean(w_profiler.pure_network_rtt_times) if w_profiler.pure_network_rtt_times else 0.0
+                avg_n1_comp = statistics.mean(w_profiler.node1_compute_times) if w_profiler.node1_compute_times else 0.0
+
+                spec_acc = [acc for acc, is_s in zip(w_profiler.accepted_per_round, w_profiler.is_spec_step) if is_s]
+                spec_drf = [drf for drf, is_s in zip(w_profiler.drafted_per_round, w_profiler.is_spec_step) if is_s]
+
+                tok_per_round = (sum(spec_acc) / len(spec_acc)) if spec_acc else 1.0
+                acc_rate = (sum(max(0, a - 1) for a in spec_acc) / sum(spec_drf) * 100.0) if (spec_drf and sum(spec_drf) > 0) else 0.0
+                full_hits = sum(1 for acc, drf in zip(spec_acc, spec_drf) if acc == drf + 1)
+                full_hit_rate = (full_hits / len(spec_acc) * 100.0) if spec_acc else 0.0
+
+                results_table.append({
+                    "window": w,
+                    "tps": avg_tps,
+                    "ttft_ms": avg_ttft,
+                    "tokens_per_round": tok_per_round,
+                    "accept_rate": acc_rate,
+                    "full_hit_rate": full_hit_rate,
+                    "bubble_ms": avg_bubble,
+                    "fwd_ms": avg_fwd,
+                    "wait_ms": avg_wait,
+                    "n1_comp_ms": avg_n1_comp,
+                    "net_rtt_ms": avg_net_rtt,
+                })
+
+            # Print Final Comparison Table
+            print("\n" + "=" * 115)
+            sampler_name = f"Neural Draft {args.draft_model}" if args.draft_model else "N-gram Draft"
+            print(f" SHARDFLOW COLAB SPECULATIVE RESULTS ({sampler_name}, K={args.spec_k})")
+            print("=" * 115)
+            header = f"{'Window':>6} | {'TPS':>6} | {'TTFT (ms)':>9} | {'Tok/Round':>9} | {'Full Hit %':>10} | {'Bubble (ms)':>11} | {'N0 Fwd (ms)':>11} | {'N1 Comp (ms)':>12} | {'Net RTT (ms)':>12}"
+            print(header)
+            print("-" * 115)
+            for row in results_table:
+                print(
+                    f"{row['window']:6d} | "
+                    f"{row['tps']:6.2f} | "
+                    f"{row['ttft_ms']:9.1f} | "
+                    f"{row['tokens_per_round']:9.2f} | "
+                    f"{row['full_hit_rate']:9.1f}% | "
+                    f"{row['bubble_ms']:11.2f} | "
+                    f"{row['fwd_ms']:11.2f} | "
+                    f"{row['n1_comp_ms']:12.2f} | "
+                    f"{row['net_rtt_ms']:12.2f}"
+                )
+            print("=" * 115)
+
+            if results_table:
+                best = max(results_table, key=lambda r: r["tps"])
+                print(f"\n[BEST] Optimal In-Flight Window: W={best['window']} with {best['tps']:.2f} TPS ({best['tokens_per_round']:.2f} tokens/round, {best['full_hit_rate']:.1f}% full hits)")
+
+        elif args.cli or (gr is None and not args.web_ui):
+            # Mode C: Interactive Terminal CLI
+            run_interactive_cli(
+                tokenizer=tokenizer,
+                node=node,
+                sock=sock,
+                args=args,
+                eos_id=eos_id,
+                receiver=receiver,
+                ngram_sampler=ngram_sampler,
+            )
+
+        else:
+            # Mode D: Interactive Gradio Chat Web UI (Default)
+            launch_gradio_ui(
+                tokenizer=tokenizer,
+                node=node,
+                sock=sock,
+                args=args,
+                eos_id=eos_id,
+                receiver=receiver,
+                ngram_sampler=ngram_sampler,
+                model_path=args.model,
+                layer_start=args.layer_start,
+                layer_end=args.layer_end,
+                total_layers=total_layers,
+            )
 
     finally:
         if receiver is not None:

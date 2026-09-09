@@ -375,3 +375,19 @@ def get_metrics():
     """Return runtime metrics summary."""
     from shardflow.orchestrator.metrics import metrics
     return metrics.get_summary()
+
+
+def main():
+    import uvicorn
+    import argparse
+    parser = argparse.ArgumentParser(description="ShardFlow OpenAI API Gateway")
+    parser.add_argument("--host", default="0.0.0.0", help="Listen host")
+    parser.add_argument("--port", type=int, default=8000, help="Listen port")
+    args = parser.parse_args()
+
+    uvicorn.run("shardflow.gateway.app:app", host=args.host, port=args.port, reload=False)
+
+
+if __name__ == "__main__":
+    main()
+

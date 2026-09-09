@@ -25,6 +25,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+ui = [
+    "gradio>=4.0.0",
+]
 quantization = [
     "bitsandbytes>=0.41.0",
     "auto-gptq>=0.5.0",

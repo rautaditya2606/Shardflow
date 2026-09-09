@@ -16,8 +16,15 @@ import socket
 import argparse
 import logging
 import statistics
-from typing import Optional, Tuple, List, Dict, Union
+import queue
+import threading
+from typing import Optional, Tuple, List, Dict, Union, Callable
 from pathlib import Path
+
+try:
+    import gradio as gr
+except ImportError:
+    gr = None
 
 # Add project root to sys.path
 repo_root = str(Path(__file__).resolve().parent.parent)
@@ -221,6 +228,8 @@ def generate(
     receiver: Optional[AsyncTokenReceiver] = None,
     enable_async_spec: bool = False,
     spec_window: int = 1,
+    token_callback: Optional[Callable[[str, dict], None]] = None,
+    print_output: bool = True,
 ) -> dict:
     """Generate tokens for a prompt through the distributed relay pipeline with error handling."""
     session_id = f"relay_session_{int(time.time()*1000)}"
@@ -236,7 +245,8 @@ def generate(
         draft_sampler.prefill(prompt_tokens)
 
     if spec_k > 0 and draft_sampler is None and ngram_sampler is None and async_drafter is None:
-        print(f"\n[WARNING] [WARNING] spec_k={spec_k} but neither draft_sampler nor ngram_sampler is active! Running 1-token decode.", flush=True)
+        if print_output:
+            print(f"\n[WARNING] spec_k={spec_k} but neither draft_sampler nor ngram_sampler is active! Running 1-token decode.", flush=True)
 
     t_start = time.perf_counter()
     t_first_token = None
@@ -245,8 +255,9 @@ def generate(
     total_drafted = 0
     total_accepted = 0
 
-    print(f"\nUser Prompt: \"{prompt}\"", flush=True)
-    print("Assistant: ", end="", flush=True)
+    if print_output:
+        print(f"\nUser Prompt: \"{prompt}\"", flush=True)
+        print("Assistant: ", end="", flush=True)
 
     try:
         # 1. Prefill Phase
@@ -273,7 +284,17 @@ def generate(
         token_history.append(next_token)
 
         word = tokenizer.decode([next_token], skip_special_tokens=True)
-        print(word, end="", flush=True)
+        if print_output:
+            print(word, end="", flush=True)
+
+        if token_callback is not None:
+            token_callback(word, {
+                "tokens": 1,
+                "ttft_ms": (t_first_token - t_start) * 1000.0,
+                "tps": 0.0,
+                "total_drafted": 0,
+                "total_accepted": 0,
+            })
 
         # Kick off first background draft job on cuda:1 immediately
         pending_draft_job = None
@@ -282,12 +303,9 @@ def generate(
 
         # 2. Autoregressive Decode Loop
         step = 1
-        spec_pending = None
         current_round_counter = 1
-        expected_round_id = 1
         pending_responses = {}
         invalidated_rounds = set()
-        pending_drafts: List[int] = []
 
         def fetch_response(target_round_id: int):
             while target_round_id not in pending_responses:
@@ -370,11 +388,40 @@ def generate(
                         tok = drafts[d_idx]
                         generated_tokens.append(tok)
                         token_history.append(tok)
-                        print(tokenizer.decode([tok], skip_special_tokens=True), end="", flush=True)
+                        w = tokenizer.decode([tok], skip_special_tokens=True)
+                        if print_output:
+                            print(w, end="", flush=True)
+                        if token_callback is not None:
+                            cur_time = time.perf_counter()
+                            cur_decode = (cur_time - t_first_token) if t_first_token else 0.0
+                            cur_count = len(generated_tokens)
+                            cur_tps = (cur_count - 1) / cur_decode if (cur_decode > 0 and cur_count > 1) else 0.0
+                            token_callback(w, {
+                                "tokens": cur_count,
+                                "ttft_ms": (t_first_token - t_start) * 1000.0 if t_first_token else 0.0,
+                                "tps": cur_tps,
+                                "total_drafted": total_drafted,
+                                "total_accepted": total_accepted,
+                            })
 
                 generated_tokens.append(next_token)
                 token_history.append(next_token)
-                print(tokenizer.decode([next_token], skip_special_tokens=True), end="", flush=True)
+                w = tokenizer.decode([next_token], skip_special_tokens=True)
+                if print_output:
+                    print(w, end="", flush=True)
+                if token_callback is not None:
+                    cur_time = time.perf_counter()
+                    cur_decode = (cur_time - t_first_token) if t_first_token else 0.0
+                    cur_count = len(generated_tokens)
+                    cur_tps = (cur_count - 1) / cur_decode if (cur_decode > 0 and cur_count > 1) else 0.0
+                    token_callback(w, {
+                        "tokens": cur_count,
+                        "ttft_ms": (t_first_token - t_start) * 1000.0 if t_first_token else 0.0,
+                        "tps": cur_tps,
+                        "total_drafted": total_drafted,
+                        "total_accepted": total_accepted,
+                    })
+
                 step += accepted_count
                 t_step_1 = time.perf_counter()
                 if profiler is not None:
@@ -422,7 +469,21 @@ def generate(
                 
                 generated_tokens.append(next_token)
                 token_history.append(next_token)
-                print(tokenizer.decode([next_token], skip_special_tokens=True), end="", flush=True)
+                w = tokenizer.decode([next_token], skip_special_tokens=True)
+                if print_output:
+                    print(w, end="", flush=True)
+                if token_callback is not None:
+                    cur_time = time.perf_counter()
+                    cur_decode = (cur_time - t_first_token) if t_first_token else 0.0
+                    cur_count = len(generated_tokens)
+                    cur_tps = (cur_count - 1) / cur_decode if (cur_decode > 0 and cur_count > 1) else 0.0
+                    token_callback(w, {
+                        "tokens": cur_count,
+                        "ttft_ms": (t_first_token - t_start) * 1000.0 if t_first_token else 0.0,
+                        "tps": cur_tps,
+                        "total_drafted": total_drafted,
+                        "total_accepted": total_accepted,
+                    })
                 
                 t_step_1 = time.perf_counter()
                 step += 1
@@ -450,12 +511,15 @@ def generate(
                     )
 
     except TimeoutError as te:
-        print(f"\n[ERROR] [TIMEOUT ERROR]: {te}", flush=True)
-        print("Kaggle Node 1 or EC2 Relay stopped responding. Please check Kaggle B status.", flush=True)
+        if print_output:
+            print(f"\n[ERROR] [TIMEOUT ERROR]: {te}", flush=True)
+            print("Kaggle Node 1 or EC2 Relay stopped responding. Please check Kaggle B status.", flush=True)
     except ConnectionError as ce:
-        print(f"\n[ERROR] [CONNECTION ERROR]: {ce}", flush=True)
+        if print_output:
+            print(f"\n[ERROR] [CONNECTION ERROR]: {ce}", flush=True)
     except Exception as ex:
-        print(f"\n[ERROR] [UNEXPECTED ERROR]: {ex}", flush=True)
+        if print_output:
+            print(f"\n[ERROR] [UNEXPECTED ERROR]: {ex}", flush=True)
     finally:
         node.kv_store.evict(session_id)
 
@@ -466,13 +530,14 @@ def generate(
     tok_count = len(generated_tokens)
     tps = (tok_count - 1) / decode_time if (decode_time > 0 and tok_count > 1) else (tok_count / decode_time if decode_time > 0 else 0)
 
-    print("\n" + "-" * 55, flush=True)
-    stats_str = f" Tokens: {tok_count} | TTFT: {ttft*1000:.1f} ms | Decode Time: {decode_time:.2f} s | Speed: {tps:.2f} TPS "
-    if total_drafted > 0:
-        accept_rate = (total_accepted / total_drafted) * 100.0
-        stats_str += f" | Draft Accept Rate: {accept_rate:.1f}% ({total_accepted}/{total_drafted})"
-    print(stats_str, flush=True)
-    print("-" * 55, flush=True)
+    if print_output:
+        print("\n" + "-" * 55, flush=True)
+        stats_str = f" Tokens: {tok_count} | TTFT: {ttft*1000:.1f} ms | Decode Time: {decode_time:.2f} s | Speed: {tps:.2f} TPS "
+        if total_drafted > 0:
+            accept_rate = (total_accepted / total_drafted) * 100.0
+            stats_str += f" | Draft Accept Rate: {accept_rate:.1f}% ({total_accepted}/{total_drafted})"
+        print(stats_str, flush=True)
+        print("-" * 55, flush=True)
 
     return {
         "tokens": tok_count,
@@ -483,6 +548,309 @@ def generate(
         "total_drafted": total_drafted,
         "total_accepted": total_accepted,
     }
+
+
+def format_chat_prompt(tokenizer, message: str, history: list, system_prompt: str = "") -> str:
+    """Format conversation turns and system prompt using model's chat template or ChatML fallback."""
+    messages = []
+    if system_prompt and system_prompt.strip():
+        messages.append({"role": "system", "content": system_prompt.strip()})
+
+    if history:
+        for item in history:
+            if isinstance(item, dict):
+                if "role" in item and "content" in item and item["content"]:
+                    messages.append({"role": item["role"], "content": item["content"]})
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                u, a = item
+                if u:
+                    messages.append({"role": "user", "content": str(u)})
+                if a:
+                    messages.append({"role": "assistant", "content": str(a)})
+
+    messages.append({"role": "user", "content": message})
+
+    if hasattr(tokenizer, "apply_chat_template"):
+        try:
+            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            pass
+
+    # ChatML fallback
+    prompt_parts = []
+    for m in messages:
+        prompt_parts.append(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>")
+    prompt_parts.append("<|im_start|>assistant\n")
+    return "\n".join(prompt_parts)
+
+
+def launch_gradio_ui(
+    tokenizer,
+    node: PipelineNode,
+    sock: socket.socket,
+    args,
+    eos_id: int,
+    receiver: Optional[AsyncTokenReceiver],
+    ngram_sampler: Optional[NGramDraftSampler],
+    model_path: str,
+    layer_start: int,
+    layer_end: int,
+    total_layers: int,
+):
+    """Launch interactive real-time streaming Gradio Chat Web UI."""
+    if gr is None:
+        print("\n[ERROR] Gradio is not installed. Please run 'pip install gradio' or pass --cli for terminal mode.")
+        return
+
+    logger.info("Initializing Gradio Web Chat UI...")
+
+    def chat_fn(
+        message: str,
+        history: list,
+        system_prompt: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        spec_k: int,
+    ):
+        if not message or not message.strip():
+            return
+
+        formatted_prompt = format_chat_prompt(tokenizer, message.strip(), history, system_prompt)
+
+        token_q = queue.Queue()
+        done_event = threading.Event()
+
+        def _callback(token_str: str, stats: dict):
+            token_q.put((token_str, stats))
+
+        def _worker():
+            try:
+                generate(
+                    prompt=formatted_prompt,
+                    tokenizer=tokenizer,
+                    node=node,
+                    sock=sock,
+                    max_tokens=int(max_tokens),
+                    temperature=float(temperature),
+                    top_p=float(top_p),
+                    spec_k=int(spec_k),
+                    ngram_sampler=ngram_sampler,
+                    eos_token_id=eos_id,
+                    profiler=None,
+                    receiver=receiver,
+                    enable_async_spec=args.async_spec,
+                    spec_window=args.spec_window,
+                    token_callback=_callback,
+                    print_output=True,
+                )
+            except Exception as e:
+                logger.error("Generation error: %s", e)
+                token_q.put((f"\n\n[Generation Error: {e}]", {}))
+            finally:
+                done_event.set()
+
+        worker_thread = threading.Thread(target=_worker, daemon=True)
+        worker_thread.start()
+
+        accumulated_text = ""
+        while not done_event.is_set() or not token_q.empty():
+            try:
+                token_str, stats = token_q.get(timeout=0.03)
+                accumulated_text += token_str
+                yield accumulated_text
+            except queue.Empty:
+                continue
+
+        worker_thread.join(timeout=1.0)
+
+    # Styling
+    custom_theme = gr.themes.Soft(
+        primary_hue="blue",
+        neutral_hue="slate",
+    )
+
+    title = "⚡ ShardFlow Distributed LLM Chat"
+    description = f"""
+**Distributed Topology Active:**
+- **Model:** `{model_path}` ({total_layers} total layers)
+- **Node 0 Layers:** `[{layer_start}..{layer_end})` + Embeddings
+- **Transport:** Direct TCP Relay (`{args.relay_host}:{args.relay_port}`)
+- **Speculative Acceleration:** Active (K={args.spec_k})
+"""
+
+    additional_inputs = [
+        gr.Textbox(
+            value=getattr(args, "system_prompt", None) or "You are a helpful and concise AI assistant.",
+            label="System Prompt",
+            lines=2,
+        ),
+        gr.Slider(
+            minimum=16,
+            maximum=2048,
+            value=args.max_tokens or 256,
+            step=16,
+            label="Max Tokens",
+        ),
+        gr.Slider(
+            minimum=0.0,
+            maximum=1.5,
+            value=0.0,
+            step=0.05,
+            label="Temperature (0.0 = Greedy)",
+        ),
+        gr.Slider(
+            minimum=0.1,
+            maximum=1.0,
+            value=1.0,
+            step=0.05,
+            label="Top-P (Nucleus Sampling)",
+        ),
+        gr.Slider(
+            minimum=0,
+            maximum=8,
+            value=args.spec_k,
+            step=1,
+            label="Speculative Draft Depth (K)",
+        ),
+    ]
+
+    demo = gr.ChatInterface(
+        fn=chat_fn,
+        title=title,
+        description=description,
+        additional_inputs=additional_inputs,
+        additional_inputs_accordion=gr.Accordion("⚙️ Inference & Speculative Settings", open=False),
+        theme=custom_theme,
+    )
+
+    print("\n" + "=" * 70)
+    print("🚀 Launching ShardFlow Gradio Chat Web UI...")
+    print("=" * 70, flush=True)
+
+    demo.queue().launch(
+        share=getattr(args, "share", True),
+        server_name="0.0.0.0",
+        server_port=getattr(args, "ui_port", 7860),
+        inline=True,
+    )
+
+
+def run_interactive_cli(
+    tokenizer,
+    node: PipelineNode,
+    sock: socket.socket,
+    args,
+    eos_id: int,
+    receiver: Optional[AsyncTokenReceiver],
+    ngram_sampler: Optional[NGramDraftSampler],
+):
+    """Run interactive continuous prompt CLI loop in terminal."""
+    print("\n" + "=" * 70)
+    print("💬 SHARDFLOW INTERACTIVE CHAT CONSOLE")
+    print("Type your prompt and press Enter. Commands: /clear, /chat, /tokens <N>, /temp <T>, /spec <K>, /stats, /exit")
+    print("=" * 70 + "\n", flush=True)
+
+    history = []
+    multiturn = True
+    max_tokens = args.max_tokens or 256
+    temperature = 0.0
+    top_p = 1.0
+    spec_k = args.spec_k
+    show_stats = False
+    system_prompt = getattr(args, "system_prompt", None) or "You are a helpful and concise AI assistant."
+
+    while True:
+        try:
+            mode_tag = "Multi-Turn" if multiturn else "Single-Turn"
+            user_input = input(f"\n[{mode_tag}] You > ").strip()
+            if not user_input:
+                continue
+
+            if user_input.lower() in ("/exit", "/quit", "/q", "exit", "quit"):
+                print("Exiting ShardFlow chat. Goodbye!")
+                break
+            elif user_input.lower() in ("/clear", "/reset"):
+                history = []
+                print("[OK] Conversation history and session KV cache cleared.")
+                continue
+            elif user_input.lower() == "/chat":
+                multiturn = not multiturn
+                print(f"[OK] Multi-turn chat mode: {'ENABLED' if multiturn else 'DISABLED (Single-turn QA)'}")
+                continue
+            elif user_input.lower() == "/stats":
+                show_stats = not show_stats
+                print(f"[OK] Detailed latency breakdown: {'ENABLED' if show_stats else 'DISABLED'}")
+                continue
+            elif user_input.lower().startswith("/tokens"):
+                parts = user_input.split()
+                if len(parts) > 1 and parts[1].isdigit():
+                    max_tokens = int(parts[1])
+                    print(f"[OK] Max tokens updated to {max_tokens}.")
+                else:
+                    print(f"Current max tokens: {max_tokens}. Usage: /tokens <N>")
+                continue
+            elif user_input.lower().startswith("/temp"):
+                parts = user_input.split()
+                try:
+                    temperature = float(parts[1])
+                    print(f"[OK] Temperature updated to {temperature:.2f}.")
+                except Exception:
+                    print(f"Current temperature: {temperature}. Usage: /temp <float>")
+                continue
+            elif user_input.lower().startswith("/spec"):
+                parts = user_input.split()
+                if len(parts) > 1 and parts[1].isdigit():
+                    spec_k = int(parts[1])
+                    print(f"[OK] Speculative K updated to {spec_k}.")
+                else:
+                    print(f"Current Speculative K: {spec_k}. Usage: /spec <K>")
+                continue
+            elif user_input.lower() == "/help":
+                print("\nAvailable Commands:")
+                print("  /clear, /reset   : Clear conversation history and reset KV cache")
+                print("  /chat            : Toggle between Multi-Turn and Single-Turn mode")
+                print("  /tokens <N>      : Set max generation tokens (e.g. /tokens 256)")
+                print("  /temp <T>        : Set sampling temperature (e.g. /temp 0.7)")
+                print("  /spec <K>        : Set speculative draft lookahead (e.g. /spec 4)")
+                print("  /stats           : Toggle detailed per-token profiler breakdown")
+                print("  /exit, /quit, /q : Disconnect and exit")
+                continue
+
+            current_history = history if multiturn else []
+            formatted_prompt = format_chat_prompt(tokenizer, user_input, current_history, system_prompt)
+
+            prompt_prof = Node0Profiler() if show_stats else None
+            stats = generate(
+                prompt=formatted_prompt,
+                tokenizer=tokenizer,
+                node=node,
+                sock=sock,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                spec_k=spec_k,
+                ngram_sampler=ngram_sampler,
+                eos_token_id=eos_id,
+                profiler=prompt_prof,
+                receiver=receiver,
+                enable_async_spec=args.async_spec,
+                spec_window=args.spec_window,
+                print_output=True,
+            )
+
+            if show_stats and prompt_prof:
+                prompt_prof.print_breakdown()
+
+            if multiturn:
+                history.append({"role": "user", "content": user_input})
+                # We can track assistant response if needed
+
+        except KeyboardInterrupt:
+            print("\n[Interrupted generation]")
+            continue
+        except Exception as e:
+            print(f"\n[Error during interaction: {e}]")
 
 
 def main():
@@ -498,8 +866,15 @@ def main():
     parser.add_argument("--relay-port", type=int, default=RELAY_PORT, help=f"EC2 Relay Port (default: {RELAY_PORT})")
     parser.add_argument("--device", default="cuda", help="Target device (default: cuda)")
     parser.add_argument("--dtype", choices=["float16", "bfloat16"], default="float16", help="Precision (default: float16)")
-    parser.add_argument("--max-tokens", type=int, default=60, help="Max tokens per generation")
-    parser.add_argument("--prompt", default=None, help="Single prompt to benchmark (optional)")
+    parser.add_argument("--max-tokens", type=int, default=256, help="Max tokens per generation (default: 256)")
+    parser.add_argument("--prompt", default=None, help="Single prompt to execute directly (optional)")
+    parser.add_argument("--benchmark", action="store_true", default=False, help="Run fixed 3-prompt benchmark evaluation suite")
+    parser.add_argument("--web-ui", action="store_true", default=False, help="Launch Gradio Web Chat UI")
+    parser.add_argument("--cli", action="store_true", default=False, help="Run in interactive CLI terminal mode")
+    parser.add_argument("--share", action="store_true", default=True, help="Enable public gradio.live link (default: True)")
+    parser.add_argument("--no-share", action="store_false", dest="share", help="Disable public gradio.live link")
+    parser.add_argument("--ui-port", type=int, default=7860, help="Gradio server port (default: 7860)")
+    parser.add_argument("--system-prompt", default="You are a helpful and concise AI assistant.", help="Default system prompt for chat")
     parser.add_argument("--cuda-graphs", action="store_true", default=False, help="Enable CUDA Graphs and Static KV cache")
     parser.add_argument("--no-cuda-graphs", action="store_false", dest="cuda_graphs", help="Disable CUDA Graphs and use DynamicCache fallback (default)")
     parser.add_argument("--static-kv", action="store_true", default=False, help="Enable Static KV cache on GPU")
@@ -602,26 +977,15 @@ def main():
 
     receiver = AsyncTokenReceiver(sock) if use_async_recv else None
 
-    # 5. Run Live Inference Prompts
-    prompts = [args.prompt] if args.prompt else [
-        "Explain quantum entanglement in simple terms.",
-        "Write a Python function to compute Fibonacci numbers using dynamic programming.",
-        "What are the key advantages of pipeline parallelism for distributed LLM inference?",
-    ]
-
-    tps_results = []
-    ttft_results = []
-    global_profiler = Node0Profiler()
-
+    # 5. Determine Execution Mode
     try:
-        for idx, prompt in enumerate(prompts, 1):
+        if args.prompt is not None:
+            # Mode A: Single Prompt Execution
             print(f"\n" + "=" * 60)
-            print(f" BENCHMARK PROMPT {idx}/{len(prompts)}")
+            print(" EXECUTING SINGLE PROMPT")
             print("=" * 60)
-
-            prompt_profiler = Node0Profiler()
-            stats = generate(
-                prompt=prompt,
+            generate(
+                prompt=args.prompt,
                 tokenizer=tokenizer,
                 node=node,
                 sock=sock,
@@ -630,41 +994,104 @@ def main():
                 spec_k=args.spec_k,
                 ngram_sampler=ngram_sampler,
                 eos_token_id=eos_id,
-                profiler=prompt_profiler,
+                profiler=Node0Profiler(),
                 receiver=receiver,
                 enable_async_spec=args.async_spec,
                 spec_window=args.spec_window,
+                print_output=True,
             )
-            if stats["tokens"] > 1:
-                tps_results.append(stats["tps"])
-                ttft_results.append(stats["ttft"])
-                for i in range(len(prompt_profiler.total_step_times)):
-                    global_profiler.record(
-                        embed_ms=prompt_profiler.embed_times[i],
-                        gpu_fwd_ms=prompt_profiler.node0_gpu_times[i],
-                        g2c_ms=prompt_profiler.gpu_to_cpu_times[i],
-                        ser_ms=prompt_profiler.serialize_times[i],
-                        send_ms=prompt_profiler.tcp_send_times[i],
-                        recv_ms=prompt_profiler.tcp_recv_wait_times[i],
-                        total_ms=prompt_profiler.total_step_times[i],
-                        draft_gen_ms=prompt_profiler.draft_gen_times[i],
-                        accepted=prompt_profiler.accepted_per_round[i],
-                        drafted=prompt_profiler.drafted_per_round[i],
-                        is_spec=prompt_profiler.is_spec_step[i],
-                    )
 
-            prompt_profiler.print_breakdown()
+        elif args.benchmark:
+            # Mode B: Automated Benchmark Mode
+            prompts = [
+                "Explain quantum entanglement in simple terms.",
+                "Write a Python function to compute Fibonacci numbers using dynamic programming.",
+                "What are the key advantages of pipeline parallelism for distributed LLM inference?",
+            ]
+            tps_results = []
+            ttft_results = []
+            global_profiler = Node0Profiler()
 
-        if tps_results:
-            print("\n" + "=" * 70)
-            print("[BEST] FINAL BENCHMARK SUMMARY (ShardFlow v2 over Direct TCP Relay)")
-            print(f"  Model:                 {model_path}")
-            print(f"  Avg Decode Throughput: {statistics.mean(tps_results):.2f} tokens/sec ")
-            print(f"  Max Decode Throughput: {max(tps_results):.2f} tokens/sec")
-            print(f"  Avg TTFT:              {statistics.mean(ttft_results)*1000:.1f} ms")
-            print(f"  Transport:             Direct TCP Relay ({args.relay_host}:{args.relay_port})")
-            print("=" * 70)
-            global_profiler.print_breakdown()
+            for idx, prompt in enumerate(prompts, 1):
+                print(f"\n" + "=" * 60)
+                print(f" BENCHMARK PROMPT {idx}/{len(prompts)}")
+                print("=" * 60)
+
+                prompt_profiler = Node0Profiler()
+                stats = generate(
+                    prompt=prompt,
+                    tokenizer=tokenizer,
+                    node=node,
+                    sock=sock,
+                    max_tokens=args.max_tokens,
+                    temperature=0.0,
+                    spec_k=args.spec_k,
+                    ngram_sampler=ngram_sampler,
+                    eos_token_id=eos_id,
+                    profiler=prompt_profiler,
+                    receiver=receiver,
+                    enable_async_spec=args.async_spec,
+                    spec_window=args.spec_window,
+                    print_output=True,
+                )
+                if stats["tokens"] > 1:
+                    tps_results.append(stats["tps"])
+                    ttft_results.append(stats["ttft"])
+                    for i in range(len(prompt_profiler.total_step_times)):
+                        global_profiler.record(
+                            embed_ms=prompt_profiler.embed_times[i],
+                            gpu_fwd_ms=prompt_profiler.node0_gpu_times[i],
+                            g2c_ms=prompt_profiler.gpu_to_cpu_times[i],
+                            ser_ms=prompt_profiler.serialize_times[i],
+                            send_ms=prompt_profiler.tcp_send_times[i],
+                            recv_ms=prompt_profiler.tcp_recv_wait_times[i],
+                            total_ms=prompt_profiler.total_step_times[i],
+                            draft_gen_ms=prompt_profiler.draft_gen_times[i],
+                            accepted=prompt_profiler.accepted_per_round[i],
+                            drafted=prompt_profiler.drafted_per_round[i],
+                            is_spec=prompt_profiler.is_spec_step[i],
+                        )
+
+                prompt_profiler.print_breakdown()
+
+            if tps_results:
+                print("\n" + "=" * 70)
+                print("[BEST] FINAL BENCHMARK SUMMARY (ShardFlow v2 over Direct TCP Relay)")
+                print(f"  Model:                 {model_path}")
+                print(f"  Avg Decode Throughput: {statistics.mean(tps_results):.2f} tokens/sec ")
+                print(f"  Max Decode Throughput: {max(tps_results):.2f} tokens/sec")
+                print(f"  Avg TTFT:              {statistics.mean(ttft_results)*1000:.1f} ms")
+                print(f"  Transport:             Direct TCP Relay ({args.relay_host}:{args.relay_port})")
+                print("=" * 70)
+                global_profiler.print_breakdown()
+
+        elif args.cli or (gr is None and not args.web_ui):
+            # Mode C: Interactive Terminal CLI
+            run_interactive_cli(
+                tokenizer=tokenizer,
+                node=node,
+                sock=sock,
+                args=args,
+                eos_id=eos_id,
+                receiver=receiver,
+                ngram_sampler=ngram_sampler,
+            )
+
+        else:
+            # Mode D: Interactive Gradio Chat Web UI (Default)
+            launch_gradio_ui(
+                tokenizer=tokenizer,
+                node=node,
+                sock=sock,
+                args=args,
+                eos_id=eos_id,
+                receiver=receiver,
+                ngram_sampler=ngram_sampler,
+                model_path=model_path,
+                layer_start=layer_start,
+                layer_end=layer_end,
+                total_layers=total_layers,
+            )
 
     finally:
         if receiver is not None:
