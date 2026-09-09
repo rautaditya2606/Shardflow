@@ -18,7 +18,7 @@ import time
 import socket
 import argparse
 import logging
-from typing import Optional, Tuple, List, Dict, Union
+from typing import Optional, Tuple, List, Dict, Union, Set
 from pathlib import Path
 
 # Add project root to sys.path
@@ -32,7 +32,7 @@ if os.path.exists("/kaggle"):
     os.environ["HF_HUB_CACHE"] = "/kaggle/working/hf_home"
 
 import torch
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoTokenizer
 
 from shardflow.node.layer_loader import load_layer_slice, get_num_hidden_layers
 from shardflow.node.node import PipelineNode
@@ -55,6 +55,30 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("node1")
+
+
+def get_eos_token_ids(tokenizer=None, custom_eos: Optional[int] = None) -> Set[int]:
+    """Return all stop token IDs including chat turn endings (<|im_end|>, <|eot_id|>, </s>, etc.)."""
+    ids = set()
+    if tokenizer is not None:
+        if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
+            if isinstance(tokenizer.eos_token_id, (list, tuple, set)):
+                ids.update(tokenizer.eos_token_id)
+            else:
+                ids.add(tokenizer.eos_token_id)
+        if hasattr(tokenizer, "all_special_ids") and tokenizer.all_special_ids:
+            for name in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>", "</s>", "<eos>"]:
+                try:
+                    tok_id = tokenizer.convert_tokens_to_ids(name)
+                    if tok_id is not None and isinstance(tok_id, int) and tok_id > 0 and tok_id != getattr(tokenizer, "unk_token_id", None):
+                        ids.add(tok_id)
+                except Exception:
+                    pass
+    if custom_eos is not None:
+        ids.add(custom_eos)
+    # Common end-of-turn / end-of-text IDs across Qwen, LLaMA-3, Mistral
+    ids.update({151643, 151645, 128001, 128009, 2})
+    return ids
 
 
 class Node1Profiler:
@@ -126,6 +150,12 @@ def main():
     model_path = args.model if os.path.exists(args.model) else args.model
     config = AutoConfig.from_pretrained(model_path)
     total_layers = get_num_hidden_layers(config, default=48)
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+    except Exception:
+        tokenizer = None
+    eos_token_ids = get_eos_token_ids(tokenizer, args.eos_token_id)
 
     layer_start = args.layer_start if args.layer_start is not None else (total_layers // 2)
     layer_end = args.layer_end if args.layer_end is not None else total_layers
@@ -258,6 +288,7 @@ def main():
                     t_head_0 = time.perf_counter()
                     accepted_tokens = []
                     next_token = None
+                    is_eos = False
                     for i in range(len(drafts)):
                         cand = sample_next_token(
                             output[0, i, :],
@@ -265,6 +296,11 @@ def main():
                             top_k=args.top_k,
                             top_p=args.top_p,
                         )
+                        if cand in eos_token_ids:
+                            accepted_tokens.append(cand)
+                            next_token = cand
+                            is_eos = True
+                            break
                         if cand == drafts[i]:
                             accepted_tokens.append(drafts[i])
                         else:
@@ -280,7 +316,10 @@ def main():
                             top_p=args.top_p,
                         )
 
-                    accepted_count = len(accepted_tokens) + 1
+                    if next_token in eos_token_ids:
+                        is_eos = True
+
+                    accepted_count = len(accepted_tokens) + (0 if (is_eos and accepted_tokens and accepted_tokens[-1] == next_token) else 1)
 
                     # Rewind KV cache to exact accepted sequence length
                     cache = node.kv_store.get(session_id)
@@ -294,7 +333,6 @@ def main():
                     else:
                         last_verified_round_id = 0
 
-                    is_eos = (next_token == args.eos_token_id)
                     t_head_1 = time.perf_counter()
                     node1_compute_ms = (t_head_1 - t_c2g_0) * 1000.0
 
@@ -354,7 +392,7 @@ def main():
                     )
                     t_smpl_1 = time.perf_counter()
 
-                    is_eos = (token_id == args.eos_token_id)
+                    is_eos = (token_id in eos_token_ids)
                     node1_compute_ms = (t_smpl_1 - t_c2g_0) * 1000.0
                     send_stats = send_token_timed(
                         sock,

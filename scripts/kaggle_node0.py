@@ -18,7 +18,7 @@ import logging
 import statistics
 import queue
 import threading
-from typing import Optional, Tuple, List, Dict, Union, Callable
+from typing import Optional, Tuple, List, Dict, Union, Callable, Set
 from pathlib import Path
 
 try:
@@ -61,6 +61,30 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("node0")
+
+
+def get_eos_token_ids(tokenizer=None, custom_eos: Optional[int] = None) -> Set[int]:
+    """Return all stop token IDs including chat turn endings (<|im_end|>, <|eot_id|>, </s>, etc.)."""
+    ids = set()
+    if tokenizer is not None:
+        if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
+            if isinstance(tokenizer.eos_token_id, (list, tuple, set)):
+                ids.update(tokenizer.eos_token_id)
+            else:
+                ids.add(tokenizer.eos_token_id)
+        if hasattr(tokenizer, "all_special_ids") and tokenizer.all_special_ids:
+            for name in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>", "</s>", "<eos>"]:
+                try:
+                    tok_id = tokenizer.convert_tokens_to_ids(name)
+                    if tok_id is not None and isinstance(tok_id, int) and tok_id > 0 and tok_id != getattr(tokenizer, "unk_token_id", None):
+                        ids.add(tok_id)
+                except Exception:
+                    pass
+    if custom_eos is not None:
+        ids.add(custom_eos)
+    # Common end-of-turn / end-of-text IDs across Qwen, LLaMA-3, Mistral
+    ids.update({151643, 151645, 128001, 128009, 2})
+    return ids
 
 
 class Node0Profiler:
@@ -232,6 +256,7 @@ def generate(
     print_output: bool = True,
 ) -> dict:
     """Generate tokens for a prompt through the distributed relay pipeline with error handling."""
+    eos_token_ids = get_eos_token_ids(tokenizer, eos_token_id)
     session_id = f"relay_session_{int(time.time()*1000)}"
     prompt_tokens = tokenizer.encode(prompt)
     prompt_len = len(prompt_tokens)
@@ -280,25 +305,28 @@ def generate(
             next_token, _, is_eos = recv_token(sock)
 
         t_first_token = time.perf_counter()
-        generated_tokens.append(next_token)
-        token_history.append(next_token)
+        if next_token in eos_token_ids or is_eos:
+            is_eos = True
+        else:
+            generated_tokens.append(next_token)
+            token_history.append(next_token)
 
-        word = tokenizer.decode([next_token], skip_special_tokens=True)
-        if print_output:
-            print(word, end="", flush=True)
+            word = tokenizer.decode([next_token], skip_special_tokens=True)
+            if print_output and word:
+                print(word, end="", flush=True)
 
-        if token_callback is not None:
-            token_callback(word, {
-                "tokens": 1,
-                "ttft_ms": (t_first_token - t_start) * 1000.0,
-                "tps": 0.0,
-                "total_drafted": 0,
-                "total_accepted": 0,
-            })
+            if token_callback is not None and word:
+                token_callback(word, {
+                    "tokens": 1,
+                    "ttft_ms": (t_first_token - t_start) * 1000.0,
+                    "tps": 0.0,
+                    "total_drafted": 0,
+                    "total_accepted": 0,
+                })
 
         # Kick off first background draft job on cuda:1 immediately
         pending_draft_job = None
-        if async_drafter and spec_k > 0:
+        if async_drafter and spec_k > 0 and not is_eos:
             pending_draft_job = async_drafter.submit(next_token, k=spec_k, temperature=temperature, top_k=top_k, top_p=top_p)
 
         # 2. Autoregressive Decode Loop
@@ -323,7 +351,7 @@ def generate(
             return res
 
         while step < max_tokens and not is_eos:
-            if next_token == eos_token_id:
+            if next_token in eos_token_ids:
                 break
 
             if spec_k > 0:
@@ -383,15 +411,20 @@ def generate(
                 if draft_sampler is not None:
                     draft_sampler.rewind(committed_len)
 
+                hit_eos = False
                 if drafts and accepted_count > 1:
                     for d_idx in range(accepted_count - 1):
                         tok = drafts[d_idx]
+                        if tok in eos_token_ids:
+                            hit_eos = True
+                            is_eos = True
+                            break
                         generated_tokens.append(tok)
                         token_history.append(tok)
                         w = tokenizer.decode([tok], skip_special_tokens=True)
-                        if print_output:
+                        if print_output and w:
                             print(w, end="", flush=True)
-                        if token_callback is not None:
+                        if token_callback is not None and w:
                             cur_time = time.perf_counter()
                             cur_decode = (cur_time - t_first_token) if t_first_token else 0.0
                             cur_count = len(generated_tokens)
@@ -404,23 +437,27 @@ def generate(
                                 "total_accepted": total_accepted,
                             })
 
-                generated_tokens.append(next_token)
-                token_history.append(next_token)
-                w = tokenizer.decode([next_token], skip_special_tokens=True)
-                if print_output:
-                    print(w, end="", flush=True)
-                if token_callback is not None:
-                    cur_time = time.perf_counter()
-                    cur_decode = (cur_time - t_first_token) if t_first_token else 0.0
-                    cur_count = len(generated_tokens)
-                    cur_tps = (cur_count - 1) / cur_decode if (cur_decode > 0 and cur_count > 1) else 0.0
-                    token_callback(w, {
-                        "tokens": cur_count,
-                        "ttft_ms": (t_first_token - t_start) * 1000.0 if t_first_token else 0.0,
-                        "tps": cur_tps,
-                        "total_drafted": total_drafted,
-                        "total_accepted": total_accepted,
-                    })
+                if not hit_eos:
+                    if next_token in eos_token_ids or is_eos:
+                        is_eos = True
+                    else:
+                        generated_tokens.append(next_token)
+                        token_history.append(next_token)
+                        w = tokenizer.decode([next_token], skip_special_tokens=True)
+                        if print_output and w:
+                            print(w, end="", flush=True)
+                        if token_callback is not None and w:
+                            cur_time = time.perf_counter()
+                            cur_decode = (cur_time - t_first_token) if t_first_token else 0.0
+                            cur_count = len(generated_tokens)
+                            cur_tps = (cur_count - 1) / cur_decode if (cur_decode > 0 and cur_count > 1) else 0.0
+                            token_callback(w, {
+                                "tokens": cur_count,
+                                "ttft_ms": (t_first_token - t_start) * 1000.0 if t_first_token else 0.0,
+                                "tps": cur_tps,
+                                "total_drafted": total_drafted,
+                                "total_accepted": total_accepted,
+                            })
 
                 step += accepted_count
                 t_step_1 = time.perf_counter()
@@ -446,6 +483,8 @@ def generate(
                         drafted=len(drafts),
                         is_spec=True,
                     )
+                if is_eos:
+                    break
 
             else:
                 # Standard 1-token decode with precise phase timing
@@ -467,12 +506,16 @@ def generate(
                 send_stats = send_tensor_timed(sock, output, round_id=current_round_counter, parent_round_id=0)
                 next_token, _, is_eos, recv_stats = fetch_response(current_round_counter)
                 
+                if is_eos or next_token in eos_token_ids:
+                    is_eos = True
+                    break
+
                 generated_tokens.append(next_token)
                 token_history.append(next_token)
                 w = tokenizer.decode([next_token], skip_special_tokens=True)
-                if print_output:
+                if print_output and w:
                     print(w, end="", flush=True)
-                if token_callback is not None:
+                if token_callback is not None and w:
                     cur_time = time.perf_counter()
                     cur_decode = (cur_time - t_first_token) if t_first_token else 0.0
                     cur_count = len(generated_tokens)

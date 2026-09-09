@@ -34,7 +34,7 @@ if not torch.cuda.is_available():
         "Please enable GPU acceleration via: Runtime -> Change runtime type -> T4 GPU."
     )
 
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoTokenizer
 from shardflow.node.layer_loader import load_layer_slice
 from shardflow.node.node import PipelineNode
 from shardflow.node.draft_model import rewind_kv_cache
@@ -48,7 +48,7 @@ from shardflow.transport.relay import (
     recv_tensor_timed,
     send_token_timed,
 )
-from scripts.kaggle_node1 import Node1Profiler
+from scripts.kaggle_node1 import Node1Profiler, get_eos_token_ids
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,7 +75,14 @@ def main():
 
     config = AutoConfig.from_pretrained(args.model)
     total_layers = getattr(config, "num_hidden_layers", 28)
-    layer_start = args.layer_start
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+    except Exception:
+        tokenizer = None
+    eos_token_ids = get_eos_token_ids(tokenizer, args.eos_token_id)
+
+    layer_start = args.layer_start if args.layer_start is not None else (total_layers // 2)
     layer_end = args.layer_end if args.layer_end is not None else total_layers
 
     target_dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
@@ -186,6 +193,7 @@ def main():
                     t_head_0 = time.perf_counter()
                     accepted_tokens = []
                     next_token = None
+                    is_eos = False
                     for i in range(len(drafts)):
                         cand = sample_next_token(
                             output[0, i, :],
@@ -193,6 +201,11 @@ def main():
                             top_k=args.top_k,
                             top_p=args.top_p,
                         )
+                        if cand in eos_token_ids:
+                            accepted_tokens.append(cand)
+                            next_token = cand
+                            is_eos = True
+                            break
                         if cand == drafts[i]:
                             accepted_tokens.append(drafts[i])
                         else:
@@ -208,7 +221,10 @@ def main():
                             top_p=args.top_p,
                         )
 
-                    accepted_count = len(accepted_tokens) + 1
+                    if next_token in eos_token_ids:
+                        is_eos = True
+
+                    accepted_count = len(accepted_tokens) + (0 if (is_eos and accepted_tokens and accepted_tokens[-1] == next_token) else 1)
 
                     # Rewind KV cache to exact accepted sequence length
                     cache = node.kv_store.get(session_id)
@@ -222,7 +238,6 @@ def main():
                     else:
                         last_verified_round_id = 0
 
-                    is_eos = (next_token == args.eos_token_id)
                     t_head_1 = time.perf_counter()
                     node1_compute_ms = (t_head_1 - t_c2g_0) * 1000.0
 
