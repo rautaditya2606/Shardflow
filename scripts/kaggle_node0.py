@@ -573,6 +573,18 @@ def generate(
     tok_count = len(generated_tokens)
     tps = (tok_count - 1) / decode_time if (decode_time > 0 and tok_count > 1) else (tok_count / decode_time if decode_time > 0 else 0)
 
+    final_stats = {
+        "tokens": tok_count,
+        "ttft_ms": ttft * 1000.0,
+        "decode_time_s": decode_time,
+        "total_time_s": total_time,
+        "tps": tps,
+        "total_drafted": total_drafted,
+        "total_accepted": total_accepted,
+    }
+    if token_callback is not None:
+        token_callback("", final_stats)
+
     if print_output:
         print("\n" + "-" * 55, flush=True)
         stats_str = f" Tokens: {tok_count} | TTFT: {ttft*1000:.1f} ms | Decode Time: {decode_time:.2f} s | Speed: {tps:.2f} TPS "
@@ -697,15 +709,40 @@ def launch_gradio_ui(
         worker_thread.start()
 
         accumulated_text = ""
+        last_stats = {}
         while not done_event.is_set() or not token_q.empty():
             try:
                 token_str, stats = token_q.get(timeout=0.03)
-                accumulated_text += token_str
-                yield accumulated_text
+                if stats:
+                    last_stats.update(stats)
+                if token_str:
+                    accumulated_text += token_str
+                    yield accumulated_text
             except queue.Empty:
                 continue
 
         worker_thread.join(timeout=1.0)
+
+        # Append telemetry performance footer to the message
+        if last_stats and last_stats.get("tokens", 0) > 0:
+            tps = last_stats.get("tps", 0.0)
+            ttft = last_stats.get("ttft_ms", 0.0)
+            toks = last_stats.get("tokens", 0)
+            dec_time = last_stats.get("decode_time_s", 0.0)
+            drafted = last_stats.get("total_drafted", 0)
+            accepted = last_stats.get("total_accepted", 0)
+
+            footer_items = [
+                f"⚡ **Speed:** `{tps:.2f} TPS`",
+                f"⏱️ **TTFT:** `{ttft:.1f} ms`",
+                f"📊 **Tokens:** `{toks}` in `{dec_time:.2f}s`" if dec_time > 0 else f"📊 **Tokens:** `{toks}`",
+            ]
+            if drafted > 0:
+                acc_rate = (accepted / drafted) * 100.0
+                footer_items.append(f"🎯 **Draft Hit:** `{acc_rate:.1f}%` ({accepted}/{drafted})")
+
+            footer_str = "\n\n---\n" + " • ".join(footer_items)
+            yield accumulated_text + footer_str
 
     # Styling
     custom_theme = gr.themes.Soft(
