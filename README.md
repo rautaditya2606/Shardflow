@@ -1,4 +1,4 @@
-# ShardFlow ⚡
+# ShardFlow
 
 <p align="center">
   <a href="https://github.com/rautaditya2606/Shardflow"><img src="https://img.shields.io/badge/ShardFlow-Distributed%20LLM%20Inference-7c3aed?style=for-the-badge&logo=pytorch&logoColor=white" alt="ShardFlow Banner"></a>
@@ -16,32 +16,32 @@
 
 ---
 
-## 🌟 Why ShardFlow?
+## Why ShardFlow?
 
 Standard distributed inference breaks down over the public internet because wide-area network (WAN) latency (~80–150ms round-trip) creates massive communication bubbles. 
 
 **ShardFlow solves this** by combining:
-- 🚀 **Neural Speculative Decoding ($K=4..8$)**: Proposes multiple tokens in advance on secondary GPUs, multiplying tokens delivered per network round-trip.
-- ⚡ **Zero-Copy TCP Relay**: Bridges NAT firewalls and notebooks with framed raw binary float16 tensor transport (<1.5ms overhead).
-- 💬 **Instant Web Chat UI**: Built-in Gradio chat interface with public link sharing, multi-turn memory, and live TPS/TTFT telemetry.
-- 📉 **4-bit NF4 Quantization & Zero-RAM Loading**: Run 32B models on free 16GB T4/P100 GPUs without CPU RAM bottlenecks.
+- **Neural Speculative Decoding ($K=4..8$)**: Proposes multiple tokens in advance on secondary GPUs, multiplying tokens delivered per network round-trip.
+- **Zero-Copy TCP Relay**: Bridges NAT firewalls and notebooks with framed raw binary float16 tensor transport (<1.5ms overhead).
+- **Instant Web Chat UI**: Built-in Gradio chat interface with public link sharing, multi-turn memory, and live TPS/TTFT telemetry.
+- **4-bit NF4 Quantization & Zero-RAM Loading**: Run 32B models on free 16GB T4/P100 GPUs without CPU RAM bottlenecks.
 
 ```
 +---------------------------------------------------------------------------------------------+
-|  Benchmark: Qwen2.5-7B (FP16) across 2 Kaggle T4s (Iowa ↔ Oregon via Ohio Relay, 86ms RTT)  |
+|  Benchmark: Qwen2.5-7B (FP16) across 2 Kaggle T4s (Iowa <-> Oregon via Ohio Relay, 86ms RTT) |
 |                                                                                             |
 |  Non-Speculative Baseline:  4.92 TPS  (1.00 token / round)                                  |
-|  ShardFlow Speculative:    28.10 TPS  (4.07 tokens / round)  ===>  🚀 5.71x FASTER          |
+|  ShardFlow Speculative:    28.10 TPS  (4.07 tokens / round)  ===>  5.71x FASTER             |
 +---------------------------------------------------------------------------------------------+
 ```
 
 ---
 
-## ⚡ Quickstart: Run in 2 Minutes on Free Kaggle / Colab
+## Quickstart: Run in 2 Minutes on Free Kaggle / Colab
 
 You need two free notebook instances (e.g. **Kaggle Instance A** and **Kaggle Instance B**).
 
-### Step 1: Start Node 1 (Instance B — Terminal Slice & Verifier)
+### Step 1: Start Node 1 (Instance B -- Terminal Slice & Verifier)
 Run this cell first. It loads layers 14..28 + LM Head and waits for Node 0:
 
 ```python
@@ -65,7 +65,7 @@ os.environ["SHARDFLOW_RELAY_PORT"] = "9500"
 
 ---
 
-### Step 2: Start Node 0 (Instance A — Initiator + Drafter + Web UI)
+### Step 2: Start Node 0 (Instance A -- Initiator + Drafter + Web UI)
 Run this cell second. It loads layers 0..14 + `Qwen2.5-0.5B` drafter on `cuda:1`, pairs with Node 1, and launches the interactive Chat UI:
 
 ```python
@@ -93,11 +93,11 @@ os.environ["SHARDFLOW_RELAY_PORT"] = "9500"
     --share
 ```
 
-🎉 **That's it!** Open the generated `https://<id>.gradio.live` link or use the inline notebook widget to chat in real-time.
+**That's it!** Open the generated `https://<id>.gradio.live` link or use the inline notebook widget to chat in real-time.
 
 ---
 
-## 💬 Interactive Web Chat UI & Live Telemetry
+## Interactive Web Chat UI & Live Telemetry
 
 When Node 0 launches, it serves an interactive streaming chat interface with live telemetry badges on every response:
 
@@ -105,19 +105,19 @@ When Node 0 launches, it serves an interactive streaming chat interface with liv
 Hello Aditya! Nice to meet you. How can I assist you with your project today?
 
 ---
-⚡ Speed: 28.10 TPS • ⏱️ TTFT: 183.4 ms • 📊 Tokens: 63 in 2.21s • 🎯 Draft Hit: 65.0% (52/80)
+Speed: 28.10 TPS | TTFT: 183.4 ms | Tokens: 63 in 2.21s | Draft Hit: 65.0% (52/80)
 ```
 
 ### UI Features:
-- 🚀 **Real-Time Token Streaming**: Watch tokens appear as they are verified on Node 1.
-- 💬 **Multi-Turn Memory**: Automatic chat template formatting preserves full conversation history.
-- ⚙️ **Interactive Controls**: Sliders for Temperature, Top-P, Max Tokens, System Prompt, and Speculative Lookahead Depth ($K$).
-- 🖥️ **Alternative CLI Mode**: Prefer terminal? Add `--cli` to chat in a continuous terminal loop.
-- ⏱️ **Benchmark Mode**: Add `--benchmark` to run the automated 3-prompt throughput evaluation.
+- **Real-Time Token Streaming**: Watch tokens appear as they are verified on Node 1.
+- **Multi-Turn Memory**: Automatic chat template formatting preserves full conversation history.
+- **Interactive Controls**: Sliders for Temperature, Top-P, Max Tokens, System Prompt, and Speculative Lookahead Depth ($K$).
+- **Alternative CLI Mode**: Prefer terminal? Add `--cli` to chat in a continuous terminal loop.
+- **Benchmark Mode**: Add `--benchmark` to run the automated 3-prompt throughput evaluation.
 
 ---
 
-## 🎯 Model Scaling Recipes
+## Model Scaling Recipes
 
 | Model | Size | Precision | Node 0 Layers | Node 1 Layers | Drafter | Memory / Node |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -130,9 +130,9 @@ Hello Aditya! Nice to meet you. How can I assist you with your project today?
 
 ---
 
-## 📊 Performance Benchmarks
+## Performance Benchmarks
 
-### Live WAN Test (Iowa ↔ Oregon via Ohio Relay, 86ms RTT)
+### Live WAN Test (Iowa <-> Oregon via Ohio Relay, 86ms RTT)
 
 Evaluating **Qwen2.5-7B-Instruct** across two separate Google Cloud regions:
 
@@ -144,7 +144,7 @@ Evaluating **Qwen2.5-7B-Instruct** across two separate Google Cloud regions:
 | *Non-Speculative Baseline (K=0)* | *None* | *N/A* | *63 tokens* | *4.92 TPS* | *1.00x* |
 
 <details>
-<summary>🔍 <strong>Click to view 14.7B Parameter Scaling Benchmark (Qwen2.5-14B)</strong></summary>
+<summary><strong>Click to view 14.7B Parameter Scaling Benchmark (Qwen2.5-14B)</strong></summary>
 
 ```
 ===================================================================================================================
@@ -160,7 +160,7 @@ Even with a **29.4x parameter discrepancy** between drafter (0.5B) and target (1
 </details>
 
 <details>
-<summary>📈 <strong>Click to view ShardFlow Architecture Evolution (v1 to v2.1)</strong></summary>
+<summary><strong>Click to view ShardFlow Architecture Evolution (v1 to v2.1)</strong></summary>
 
 | Version | Transport / Pipeline Architecture | Draft Engine | Speculative K | Tok/Round | Quantum TPS | Speedup |
 |---|---|---|:---:|:---:|:---:|:---:|
@@ -174,7 +174,7 @@ Even with a **29.4x parameter discrepancy** between drafter (0.5B) and target (1
 
 ---
 
-## 🏗️ Architecture & How It Works
+## Architecture & How It Works
 
 ```mermaid
 graph LR
@@ -212,7 +212,7 @@ graph LR
 
 ---
 
-## 💻 OpenAI-Compatible API Usage
+## OpenAI-Compatible API Usage
 
 ShardFlow includes an OpenAI-compatible FastAPI Gateway (`/v1/chat/completions`):
 
@@ -239,7 +239,7 @@ print()
 
 ---
 
-## 🛠️ Local Development & Testing
+## Local Development & Testing
 
 ```bash
 # Clone and install with dev dependencies
@@ -253,6 +253,6 @@ python -m pytest -p no:opik tests/
 
 ---
 
-## 📄 License
+## License
 
 Distributed under the [MIT License](LICENSE).

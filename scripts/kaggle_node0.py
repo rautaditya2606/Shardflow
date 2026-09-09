@@ -733,15 +733,15 @@ def launch_gradio_ui(
             accepted = last_stats.get("total_accepted", 0)
 
             footer_items = [
-                f"⚡ **Speed:** `{tps:.2f} TPS`",
-                f"⏱️ **TTFT:** `{ttft:.1f} ms`",
-                f"📊 **Tokens:** `{toks}` in `{dec_time:.2f}s`" if dec_time > 0 else f"📊 **Tokens:** `{toks}`",
+                f"**Speed:** `{tps:.2f} TPS`",
+                f"**TTFT:** `{ttft:.1f} ms`",
+                f"**Tokens:** `{toks}` in `{dec_time:.2f}s`" if dec_time > 0 else f"**Tokens:** `{toks}`",
             ]
             if drafted > 0:
                 acc_rate = (accepted / drafted) * 100.0
-                footer_items.append(f"🎯 **Draft Hit:** `{acc_rate:.1f}%` ({accepted}/{drafted})")
+                footer_items.append(f"**Draft Hit:** `{acc_rate:.1f}%` ({accepted}/{drafted})")
 
-            footer_str = "\n\n---\n" + " • ".join(footer_items)
+            footer_str = "\n\n---\n" + " | ".join(footer_items)
             yield accumulated_text + footer_str
 
     # Styling
@@ -750,7 +750,7 @@ def launch_gradio_ui(
         neutral_hue="slate",
     )
 
-    title = "⚡ ShardFlow Distributed LLM Chat"
+    title = "ShardFlow Distributed LLM Chat"
     description = f"""
 **Distributed Topology Active:**
 - **Model:** `{model_path}` ({total_layers} total layers)
@@ -800,12 +800,12 @@ def launch_gradio_ui(
         title=title,
         description=description,
         additional_inputs=additional_inputs,
-        additional_inputs_accordion=gr.Accordion("⚙️ Inference & Speculative Settings", open=False),
+        additional_inputs_accordion=gr.Accordion("Inference & Speculative Settings", open=False),
         theme=custom_theme,
     )
 
     print("\n" + "=" * 70)
-    print("🚀 Launching ShardFlow Gradio Chat Web UI...")
+    print("Launching ShardFlow Gradio Chat Web UI...")
     print("=" * 70, flush=True)
 
     demo.queue().launch(
@@ -827,7 +827,7 @@ def run_interactive_cli(
 ):
     """Run interactive continuous prompt CLI loop in terminal."""
     print("\n" + "=" * 70)
-    print("💬 SHARDFLOW INTERACTIVE CHAT CONSOLE")
+    print("SHARDFLOW INTERACTIVE CHAT CONSOLE")
     print("Type your prompt and press Enter. Commands: /clear, /chat, /tokens <N>, /temp <T>, /spec <K>, /stats, /exit")
     print("=" * 70 + "\n", flush=True)
 

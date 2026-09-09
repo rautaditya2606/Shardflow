@@ -113,7 +113,7 @@ class Node1Profiler:
 
         avg_total = avg(self.total_step_times)
         print("\n" + "=" * 70, flush=True)
-        print(f"⏱️ NODE 1 PER-TOKEN LATENCY PROFILER BREAKDOWN ({n} decode steps)", flush=True)
+        print(f"NODE 1 PER-TOKEN LATENCY PROFILER BREAKDOWN ({n} decode steps)", flush=True)
         print("=" * 70, flush=True)
         print(f"  1. TCP Recv Wait (from Relay):{avg(self.tcp_recv_times):6.2f} ms  (p95: {p95(self.tcp_recv_times):6.2f} ms)")
         print(f"  2. Tensor Deserialization:    {avg(self.deserialize_times):6.2f} ms  (p95: {p95(self.deserialize_times):6.2f} ms)")
