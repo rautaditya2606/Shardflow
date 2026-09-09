@@ -37,27 +37,30 @@ ShardFlow combines **neural speculative decoding (K=8 on dual-GPU nodes)**, **ze
    - [Prompt-by-Prompt Breakdown](#prompt-by-prompt-breakdown)
    - [ShardFlow System Evolution (v1 to v2.1)](#shardflow-system-evolution)
    - [14.7B Parameter Model Scaling](#147b-parameter-model-scaling-qwen25-14b-instruct-48-layers)
-2. [System Architecture](#2-system-architecture)
+2. [Interactive Web Chat UI & Continuous Streaming](#2-interactive-web-chat-ui--continuous-streaming)
+3. [System Architecture](#3-system-architecture)
    - [Data Flow Diagram](#data-flow-diagram)
    - [Cluster Node Roles](#cluster-node-roles)
    - [Control Plane vs Data Plane Separation](#control-plane-vs-data-plane-separation)
-3. [Key Technical Innovations](#3-key-technical-innovations)
+4. [Key Technical Innovations](#4-key-technical-innovations)
    - [Dual-GPU Pipelined Draft Generation](#1-dual-gpu-pipelined-draft-generation)
    - [Exact KV Cache Synchronization and Rollback](#2-exact-kv-cache-synchronization--rollback)
    - [AWS EC2 Zero-Copy TCP Relay Transport](#3-aws-ec2-tcp-relay-transport-t3micro-us-east-2-ohio)
-   - [Zero-RAM Meta-Device Model Slicing](#4-zero-ram-meta-device-model-slicing)
-   - [Auto-Partitioning and Dynamic Topology Registry](#5-auto-partitioning-and-dynamic-topology-registry)
-4. [Supported Model Architectures & Quantization](#4-supported-model-architectures--quantization)
-5. [Quickstart Guides](#5-quickstart-guides)
-   - [Live Cross-Kaggle Benchmark](#reproduce-live-cross-kaggle-benchmark-2x-free-t4s)
+   - [Dynamic Stop-Token Discovery & ChatML EOS Support](#4-dynamic-stop-token-discovery--chatml-eos-support)
+   - [Zero-RAM Meta-Device Model Slicing](#5-zero-ram-meta-device-model-slicing)
+   - [Auto-Partitioning and Dynamic Topology Registry](#6-auto-partitioning-and-dynamic-topology-registry)
+5. [Supported Model Architectures & Quantization](#5-supported-model-architectures--quantization)
+6. [Quickstart Guides (Kaggle & Colab)](#6-quickstart-guides)
+   - [Running Qwen2.5-7B (FP16 + Async Spec + Web Chat UI)](#option-a-running-qwen25-7b-fp16--interactive-chat-ui)
+   - [Running Qwen2.5-14B / 32B (4-bit NF4 Quantization)](#option-b-running-qwen25-14b--32b-4-bit-nf4)
    - [Local Multi-Node Demo (Single Machine)](#run-local-multi-node-demo-single-machine)
    - [Command-Line Entrypoints](#command-line-entrypoints)
-6. [OpenAI-Compatible API Usage](#6-openai-compatible-api-usage)
+7. [OpenAI-Compatible API Usage](#7-openai-compatible-api-usage)
    - [Python Client (Streaming & Non-Streaming)](#python-client-streaming--non-streaming)
    - [cURL Examples](#curl-examples)
-7. [Repository Structure](#7-repository-structure)
-8. [Local Development & Test Suite](#8-local-development--test-suite)
-9. [License](#9-license)
+8. [Repository Structure](#8-repository-structure)
+9. [Local Development & Test Suite](#9-local-development--test-suite)
+10. [License](#10-license)
 
 ---
 
@@ -122,7 +125,43 @@ Window |    TPS | TTFT (ms) | Tok/Round | Full Hit % | Bubble (ms) | N0 Fwd (ms)
 
 ---
 
-## 2. System Architecture
+## 2. Interactive Web Chat UI & Continuous Streaming
+
+ShardFlow includes an out-of-the-box **Interactive Gradio Web Chat UI** on Node 0 with real-time token streaming and public link sharing (`--share`). You can run multi-turn conversations directly from your browser with full speculative acceleration across the distributed cluster.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/gradio-app/gradio/main/readme_files/gradio_logo.png" width="160" alt="Gradio Logo"/>
+</p>
+
+### Key Features of the Interactive UI:
+- 🚀 **Real-Time Token Streaming**: Tokens stream directly to the chat interface as soon as they are sampled on Node 1.
+- 💬 **Multi-Turn Context Memory**: Automatic ChatML / Jinja chat template formatting preserves conversation history across turns.
+- 🔗 **Instant Public Link**: Automatically creates a secure, publicly accessible `https://<id>.gradio.live` link and renders inline in Kaggle/Colab notebook cells.
+- ⚙️ **Live Tuning Controls**:
+  - **Temperature & Top-P**: Switch between deterministic greedy sampling (0.0) and creative nucleus sampling.
+  - **Max Tokens**: Customize generation length from 16 to 2048 tokens.
+  - **Speculative Draft Depth ($K$)**: Dynamically adjust the speculative lookahead window on the fly.
+  - **System Prompt**: Customize assistant persona and instructions.
+
+```bash
+# Start Node 0 with the interactive streaming Web UI (default)
+python scripts/kaggle_node0.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --draft-model Qwen/Qwen2.5-0.5B-Instruct \
+    --draft-device cuda:1 \
+    --spec-k 4 \
+    --async-spec \
+    --share
+```
+
+> **Alternative Modes**:
+> - **Interactive Terminal CLI**: Add `--cli` to chat directly in your terminal/SSH console.
+> - **Single-Shot Prompt**: Add `--prompt "Your prompt here"` to run a one-off generation.
+> - **Automated Benchmark**: Add `--benchmark` to run the 3-prompt throughput evaluation suite.
+
+---
+
+## 3. System Architecture
 
 ### Data Flow Diagram
 
@@ -134,10 +173,10 @@ graph TD
     classDef relay fill:#181825,stroke:#89b4fa,stroke-width:2px,color:#cdd6f4
 
     subgraph UserSpace["User / Client Layer"]
-        C["OpenAI SDK / Python Client / cURL"]:::client
+        C["Gradio Web Chat UI / OpenAI SDK / Python Client"]:::client
     end
 
-    subgraph Node0Instance["Kaggle Node 0 (Iowa, GCP)"]
+    subgraph Node0Instance["Kaggle / Colab Node 0 (Iowa, GCP)"]
         subgraph GPU0["cuda:0 — Target Slice"]
             N0_EMB["Embedding Layer"]:::node0
             N0_LAYERS["Qwen2.5-7B (Layers 0..14)<br/>FP16 • 7.64 GB VRAM"]:::node0
@@ -153,7 +192,7 @@ graph TD
         RELAY["Zero-Copy Rust TCP Relay Bridge<br/>AWS EC2 t3.micro (us-east-2, Ohio)<br/>Length-Prefixed Framing (>Q)<br/>TCP_NODELAY • 8-Byte Magic Handshake"]:::relay
     end
 
-    subgraph Node1Instance["Kaggle Node 1 (Oregon, GCP)"]
+    subgraph Node1Instance["Kaggle / Colab Node 1 (Oregon, GCP)"]
         subgraph GPU_N1["cuda:0 — Terminal Slice & Verifier"]
             N1_LAYERS["Qwen2.5-7B (Layers 14..28)<br/>FP16 • 7.64 GB VRAM"]:::node1
             N1_HEAD["RMSNorm & LM Head"]:::node1
@@ -179,12 +218,12 @@ graph TD
 
 ### Cluster Node Roles
 
-- **Kaggle Node 0 (Iowa, GCP)**:
+- **Node 0 (Iowa, GCP / Kaggle Instance A)**:
   - `cuda:0`: Computes initial prompt embeddings and target model layers [0, 14) in FP16 (7.64 GB VRAM).
-  - `cuda:1`: Dedicated to `DraftSampler` (`Qwen2.5-0.5B-Instruct`) in FP16 (0.98 GB VRAM), generating K=8 candidate tokens per step with zero VRAM contention.
+  - `cuda:1`: Dedicated to `DraftSampler` (`Qwen2.5-0.5B-Instruct`) in FP16 (0.98 GB VRAM), generating candidate tokens per step with zero VRAM contention.
 - **AWS EC2 TCP Relay (`t3.micro`, `us-east-2` Ohio)**:
   - Low-latency socket forwarder that pairs Node 0 and Node 1 across NAT firewalls with zero packet payload copies.
-- **Kaggle Node 1 (Oregon, GCP)**:
+- **Node 1 (Oregon, GCP / Kaggle Instance B)**:
   - `cuda:0`: Computes terminal target layers [14, 28) + RMSNorm + LM Head in FP16 (7.64 GB VRAM).
   - Causal Verifier: Verifies all K candidates in parallel via single-pass argmax and rolls back rejected KV states.
 
@@ -196,12 +235,12 @@ ShardFlow separates control plane orchestration from data plane token execution:
 
 ---
 
-## 3. Key Technical Innovations
+## 4. Key Technical Innovations
 
 ### 1. Dual-GPU Pipelined Draft Generation
 On Node 0 (which has 2x T4 GPUs on Kaggle), we place the 7B target model slice on `cuda:0` and the 0.5B draft model (`Qwen2.5-0.5B-Instruct`) on `cuda:1`.
 - **Zero VRAM Contention**: The 7B slice occupies 7.64 GB on GPU 0, while the 0.5B drafter occupies 0.98 GB on GPU 1.
-- **Direct Transformer Bypass**: We extract `model.model` and `model.lm_head` directly, bypassing the standard Hugging Face generation loop to eliminate CPU Python wrapper overhead.
+- **Direct Transformer Bypass**: We extract `model.model` and `model.lm_head` directly, bypassing standard Hugging Face loops to eliminate CPU Python wrapper overhead.
 - **Vectorized Token Transfer**: Collects candidate token IDs directly on GPU into a single tensor and extracts via `.tolist()`, executing zero per-token CPU-GPU synchronizations.
 - **Prompt-Lookup N-Gram Drafter**: Includes a zero-parameter `NGramDraftSampler` for fast continuation extraction when running on single-GPU nodes.
 
@@ -223,17 +262,22 @@ Cloud notebooks (Kaggle/Colab) do not expose public IP addresses or open inbound
 - **Socket Optimizations**: Sockets are configured with `TCP_NODELAY`, `SO_KEEPALIVE`, `TCP_QUICKACK`, and 4 MB buffer allocations.
 - **Initiator-Listener Magic Handshake**: Nodes exchange an exact 8-byte handshake token (`b"SF_READY"`) using an initiator/listener protocol that prevents socket buffer pollution and race conditions upon startup.
 
-### 4. Zero-RAM Meta-Device Model Slicing
+### 4. Dynamic Stop-Token Discovery & ChatML EOS Support
+- Auto-extracts tokenizer special tokens and stop IDs (`<|im_end|>`, `<|endoftext|>`, `<|eot_id|>`, `</s>`).
+- In speculative decoding on Node 1, generation immediately terminates when any draft candidate hits a stop token, preventing runaway hallucinations.
+- Automatic multi-turn session handling evicts previous turn KV states upon receiving new turn prefill tensors.
+
+### 5. Zero-RAM Meta-Device Model Slicing
 - Instantiates model architectures on PyTorch's `meta` device in 0.00s with 0 MB CPU RAM overhead.
 - Safetensors layers are streamed directly into target GPU VRAM without loading the full 15 GB model into system memory.
 
-### 5. Auto-Partitioning and Dynamic Topology Registry
+### 6. Auto-Partitioning and Dynamic Topology Registry
 - **Auto-Partition Engine**: Dynamically calculates layer distribution across heterogeneous nodes based on reported VRAM and LM head memory overhead.
 - **Fast Offline Metadata**: Registry looks up layer counts and hidden dimensions from a local table without network stalls during node registration.
 
 ---
 
-## 4. Supported Model Architectures & Quantization
+## 5. Supported Model Architectures & Quantization
 
 ShardFlow supports any Hugging Face causal language model family:
 
@@ -248,56 +292,87 @@ ShardFlow supports any Hugging Face causal language model family:
 
 ---
 
-## 5. Quickstart Guides
+## 6. Quickstart Guides (Kaggle & Colab)
 
-### Reproduce Live Cross-Kaggle Benchmark (2x Free T4s)
+### Option A: Running Qwen2.5-7B (FP16 + Interactive Chat UI)
 
-Run a 7B parameter model in native FP16 across two separate Kaggle notebook instances using the AWS EC2 TCP relay:
+Partition **Qwen2.5-7B-Instruct** (28 layers: 14 layers per node in full `float16` precision) across two Kaggle notebook instances communicating via the AWS EC2 TCP Relay:
 
-#### Step 1: On Kaggle Instance B (Terminal Node 1)
-```bash
-# In Kaggle Notebook B
-%cd /kaggle/working
-!git clone https://github.com/rautaditya2606/Shardflow.git
-%cd /kaggle/working/Shardflow
-
+#### 1. On Kaggle Instance B (Node 1 - Terminal Slice & Verifier):
+```python
+# CELL: Start Node 1 (Instance B) - Qwen 7B (FP16)
 import os
 os.environ["HF_HOME"] = "/kaggle/working/hf_home"
+os.environ["SHARDFLOW_RELAY_HOST"] = "<YOUR_RELAY_IP>" # e.g. 3.23.174.207
+os.environ["SHARDFLOW_RELAY_PORT"] = "9500"
+
+%cd /kaggle/working
+!git clone https://github.com/rautaditya2606/Shardflow.git 2>/dev/null || true
+%cd /kaggle/working/Shardflow
+!git pull
 
 !python scripts/kaggle_node1.py \
-    --model /kaggle/working/models/Qwen2.5-7B-Instruct \
+    --model Qwen/Qwen2.5-7B-Instruct \
     --layer-start 14 \
-    --device cuda \
-    --relay-host <your-relay-ip> \
-    --relay-port 9500 \
-    --dtype float16
+    --layer-end 28 \
+    --device cuda:0
 ```
-*(Wait until you see `[INFO] Connected to relay. Waiting for Node 0 to connect...`)*
+*(Node 1 loads layers 14..28 + LM Head and waits for Node 0 to connect)*
+
+#### 2. On Kaggle Instance A (Node 0 - Initiator + Drafter + Chat UI):
+```python
+# CELL: Start Node 0 (Instance A) - Qwen 7B (FP16 + Async Spec + Web Chat UI)
+import os
+os.environ["HF_HOME"] = "/kaggle/working/hf_home"
+os.environ["SHARDFLOW_RELAY_HOST"] = "<YOUR_RELAY_IP>" # e.g. 3.23.174.207
+os.environ["SHARDFLOW_RELAY_PORT"] = "9500"
+
+%cd /kaggle/working
+!git clone https://github.com/rautaditya2606/Shardflow.git 2>/dev/null || true
+%cd /kaggle/working/Shardflow
+!git pull
+!pip install -q gradio
+
+!python scripts/kaggle_node0.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --draft-model Qwen/Qwen2.5-0.5B-Instruct \
+    --draft-device cuda:1 \
+    --spec-k 4 \
+    --async-spec \
+    --spec-window 1 \
+    --layer-start 0 \
+    --layer-end 14 \
+    --share
+```
+*(Node 0 connects, completes the handshake, launches the streaming Chat UI, and provides a public `https://<id>.gradio.live` link).*
 
 ---
 
-#### Step 2: On Kaggle Instance A (Initiator Node 0 + 0.5B Drafter)
+### Option B: Running Qwen2.5-14B / 32B (4-bit NF4)
+
+To run larger models (e.g. 14B with 48 layers, or 32B with 64 layers) on 16GB GPUs, enable the `--4bit` flag:
+
+#### On Node 1 (Instance B):
 ```bash
-# In Kaggle Notebook A
-%cd /kaggle/working
-!git clone https://github.com/rautaditya2606/Shardflow.git
-%cd /kaggle/working/Shardflow
+python scripts/kaggle_node1.py \
+    --model Qwen/Qwen2.5-32B-Instruct \
+    --layer-start 32 \
+    --layer-end 64 \
+    --device cuda:0 \
+    --4bit
+```
 
-import os
-os.environ["HF_HOME"] = "/kaggle/working/hf_home"
-
-!python scripts/benchmark_window_sweep.py \
-    --model /kaggle/working/models/Qwen2.5-7B-Instruct \
+#### On Node 0 (Instance A):
+```bash
+python scripts/kaggle_node0.py \
+    --model Qwen/Qwen2.5-32B-Instruct \
     --draft-model Qwen/Qwen2.5-0.5B-Instruct \
     --draft-device cuda:1 \
-    --layer-start 0 \
-    --layer-end 14 \
-    --device cuda:0 \
     --spec-k 8 \
-    --windows 1 \
-    --relay-host <your-relay-ip> \
-    --relay-port 9500 \
-    --dtype float16
+    --layer-start 0 \
+    --layer-end 32 \
+    --4bit \
+    --share
 ```
 
 ---
@@ -312,7 +387,7 @@ git clone https://github.com/rautaditya2606/Shardflow.git
 cd Shardflow
 
 # Install dependencies
-pip install -e ".[dev]"
+pip install -e ".[dev,ui]"
 
 # Run the local 2-node pipeline demo
 python run_demo.py
@@ -349,7 +424,7 @@ shardflow-orchestrator \
 
 ---
 
-## 6. OpenAI-Compatible API Usage
+## 7. OpenAI-Compatible API Usage
 
 ### Python Client (Streaming & Non-Streaming)
 
@@ -414,7 +489,7 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 
 ---
 
-## 7. Repository Structure
+## 8. Repository Structure
 
 ```
 Shardflow/
@@ -450,12 +525,13 @@ Shardflow/
 │       ├── http_node.py        # HTTP fallback node client & server
 │       └── tailscale.py        # Tailscale mesh VPN integration
 ├── scripts/                    # Benchmarking & deployment runners
-│   ├── kaggle_node0.py         # Kaggle Node 0 initiator runner
+│   ├── kaggle_node0.py         # Kaggle Node 0 initiator + Gradio Web Chat UI
 │   ├── kaggle_node1.py         # Kaggle Node 1 terminal verifier runner
+│   ├── colab_node0.py          # Google Colab Node 0 initiator + Gradio UI
+│   ├── colab_node1.py          # Google Colab Node 1 terminal verifier runner
 │   ├── benchmark_window_sweep.py # In-flight speculative window benchmark
-│   ├── benchmark_k_sweep.py    # Speculative depth K benchmark
-│   └── colab_runner.py         # Google Colab automation script
-├── tests/                      # Comprehensive test suite
+│   └── benchmark_k_sweep.py    # Speculative depth K benchmark
+├── tests/                      # Comprehensive test suite (47 passed)
 │   ├── unit/                   # Unit tests (partition, framing, drafting, rewind)
 │   ├── integration/            # Integration tests (P2P data plane, registry)
 │   └── e2e/                    # End-to-end model output parity tests
@@ -467,7 +543,7 @@ Shardflow/
 
 ---
 
-## 8. Local Development & Test Suite
+## 9. Local Development & Test Suite
 
 ### Environment Setup
 
@@ -481,7 +557,7 @@ python -m venv venv
 source venv/bin/activate
 
 # Install in editable mode with development dependencies
-pip install -e ".[dev,quantization]"
+pip install -e ".[dev,quantization,ui]"
 ```
 
 ### Running the Test Suite
@@ -501,6 +577,6 @@ python -m pytest -p no:opik tests/integration/
 
 ---
 
-## 9. License
+## 10. License
 
 Distributed under the [MIT License](LICENSE).
